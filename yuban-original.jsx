@@ -4272,8 +4272,11 @@ const splitExampleSegmentsPreservingParens = (rawText = "") => {
     const out = [];
     let buf = "";
     let depth = 0;
-    for (const ch of text) {
+    let hasTranslation = false;
+    for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
         if (ch === '（' || ch === '(') {
+            if (/^[（(]\s*中[譯译]\s*[:：]\s*/iu.test(text.slice(i))) hasTranslation = true;
             depth += 1;
             buf += ch;
             continue;
@@ -4281,6 +4284,18 @@ const splitExampleSegmentsPreservingParens = (rawText = "") => {
         if (ch === '）' || ch === ')') {
             depth = Math.max(0, depth - 1);
             buf += ch;
+            // Gemini 有時會把兩個例句直接以空白相接，而非使用「/」。
+            // 中譯的外層括號結束後若緊接新的英文句，這裡才是例句邊界。
+            if (depth === 0 && hasTranslation) {
+                const nextSentence = text.slice(i + 1).match(/^\s+([A-ZÀ-ÖØ-Þ"“‘])/u);
+                if (nextSentence) {
+                    const part = cleanQuizDisplayText(buf);
+                    if (part) out.push(part);
+                    buf = "";
+                    hasTranslation = false;
+                    i += nextSentence[0].length - 1;
+                }
+            }
             continue;
         }
         if ((ch === '/' || ch === '／') && depth === 0) {
@@ -4837,6 +4852,40 @@ const QuickSpeakBtn = ({ text, size = 16, className = "", rate = 1.0, mode = 'na
             if (/[0-9]/.test(t)) return false;
             return /[ˈˌː]/u.test(t) || /[\u0250-\u02af]/u.test(t);
         };
+        // Chrome/Safari 的 speechSynthesis 對過長單一 utterance 可能無聲中斷。
+        // 優先在句末或子句標點切開；只有沒有安全標點時才在單字邊界切開。
+        const chunkForNativeUtterance = (value, maxLength = 180) => {
+            const text = String(value || "").trim();
+            if (text.length <= maxLength) return text ? [text] : [];
+            const clauses = text.match(/[^.!?;:。！？；：]+[.!?;:。！？；：]*\s*/gu) || [text];
+            const chunks = [];
+            let current = "";
+            const flush = () => {
+                const part = current.trim();
+                if (part) chunks.push(part);
+                current = "";
+            };
+            for (const clause of clauses) {
+                const trimmed = clause.trim();
+                if (!trimmed) continue;
+                if (trimmed.length > maxLength) {
+                    flush();
+                    const words = trimmed.split(/\s+/u);
+                    for (const word of words) {
+                        if (current && `${current} ${word}`.length > maxLength) flush();
+                        current = current ? `${current} ${word}` : word;
+                    }
+                    flush();
+                } else if (current && `${current} ${trimmed}`.length > maxLength) {
+                    flush();
+                    current = trimmed;
+                } else {
+                    current = current ? `${current} ${trimmed}` : trimmed;
+                }
+            }
+            flush();
+            return chunks;
+        };
         let s = String(rawText || "")
             .replace(/\r/g, '\n')
             .replace(/<br\s*\/?>/gi, '\n')
@@ -4887,7 +4936,7 @@ const QuickSpeakBtn = ({ text, size = 16, className = "", rate = 1.0, mode = 'na
             );
             if (!normalizedRow) continue;
             if (isIpaOnlySegment(normalizedRow)) continue;
-            expanded.push(normalizedRow);
+            expanded.push(...chunkForNativeUtterance(normalizedRow));
         }
 
         return expanded;
