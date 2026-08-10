@@ -16951,17 +16951,27 @@ ${userQ}`;
                                         className="hidden"
                                         onChange={(e) => handleManualKnowledgeTxtFileForEmbedded(e.target.files && e.target.files[0])}
                                     />
-                                    <div className="flex items-center gap-1 bg-gray-100 px-2 py-1 rounded-md border border-gray-200 shrink-0"><span className="text-[10px] font-bold text-gray-500">LV</span><input type="range" min="1" max="10" value={learnerLevel} onChange={e => setLearnerLevel(parseInt(e.target.value))} className="w-12 h-1 bg-gray-300 rounded-lg accent-blue-600" /><span className="text-xs font-bold w-4 text-center">{learnerLevel}</span></div>
+                                    <div className="flex items-center gap-1 bg-gray-100 px-2 py-1 rounded-md border border-gray-200 shrink-0" title="Learner level">
+                                        <span className="text-[10px] font-bold text-gray-500">LV</span>
+                                        <button type="button" onClick={() => setLearnerLevel(Math.max(1, learnerLevel - 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="降低學習等級"><Minus size={14} /></button>
+                                        <input type="range" min="1" max="10" value={learnerLevel} onChange={e => setLearnerLevel(parseInt(e.target.value, 10))} className="w-14 sm:w-16 h-6 bg-gray-300 rounded-lg accent-blue-600 cursor-pointer" />
+                                        <button type="button" onClick={() => setLearnerLevel(Math.min(10, learnerLevel + 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="提高學習等級"><Plus size={14} /></button>
+                                        <span className="text-xs font-bold w-4 text-center">{learnerLevel}</span>
+                                    </div>
                                     {/* Speed Slider */}
                                     <div className="flex items-center gap-1 bg-gray-100 px-2 py-1 rounded-md border border-gray-200 shrink-0" title="Playback Speed">
                                         <Gauge size={14} className="text-gray-500" />
-                                        <input type="range" min="0.5" max="2.0" step="0.05" value={playbackRate} onChange={(e) => setPlaybackRate(parseFloat(e.target.value))} className="w-24 h-1 bg-gray-300 rounded-lg accent-green-600" />
+                                        <button type="button" onClick={() => setPlaybackRate(Math.max(0.5, Number((playbackRate - 0.05).toFixed(2))))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="降低播放速度"><Minus size={14} /></button>
+                                        <input type="range" min="0.5" max="2.0" step="0.05" value={playbackRate} onChange={(e) => setPlaybackRate(parseFloat(e.target.value))} className="w-16 sm:w-24 h-6 bg-gray-300 rounded-lg accent-green-600 cursor-pointer" />
+                                        <button type="button" onClick={() => setPlaybackRate(Math.min(2, Number((playbackRate + 0.05).toFixed(2))))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="提高播放速度"><Plus size={14} /></button>
                                         <span className="text-[10px] font-bold w-8 text-center">{playbackRate.toFixed(2)}x</span>
                                     </div>
                                     {/* Subtitle Font Size Control */}
                                     <div className="flex items-center gap-1 bg-gray-100 px-2 py-1 rounded-md border border-gray-200 shrink-0" title="Subtitle Font Size">
                                         <Type size={14} className="text-gray-500" />
-                                        <input type="range" min="16" max="40" value={subtitleFontSize} onChange={(e) => setSubtitleFontSize(parseInt(e.target.value))} className="w-16 h-1 bg-gray-300 rounded-lg accent-gray-600" />
+                                        <button type="button" onClick={() => setSubtitleFontSize(Math.max(16, subtitleFontSize - 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="縮小字幕與知識文件字體"><Minus size={14} /></button>
+                                        <input type="range" min="16" max="40" value={subtitleFontSize} onChange={(e) => setSubtitleFontSize(parseInt(e.target.value, 10))} className="w-14 sm:w-16 h-6 bg-gray-300 rounded-lg accent-gray-600 cursor-pointer" />
+                                        <button type="button" onClick={() => setSubtitleFontSize(Math.min(40, subtitleFontSize + 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="放大字幕與知識文件字體"><Plus size={14} /></button>
                                         <span className="text-[10px] font-bold w-4 text-center">{subtitleFontSize}</span>
                                     </div>
                                     <button onClick={toggleSmartMode} className={`flex items-center gap-1 px-3 py-1.5 rounded-md border text-xs font-medium shrink-0 transition-colors ${isSmartMode ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-gray-50 text-gray-600 border-gray-200'}`}><Puzzle size={14} /><span>智能斷句</span></button>
@@ -17159,7 +17169,7 @@ ${userQ}`;
                                         ) : (
                                             <MarkdownView
                                                 content={embeddedKnowledgeText || "（文件內容為空）"}
-                                                fontSize={Math.max(14, globalFontSize - 1)}
+                                                fontSize={Math.max(14, effectiveSubtitleFontSize - 1)}
                                                 trackLanguage={trackLanguage}
                                                 speakerLanguage={String(embeddedKnowledgeFileInfo?.targetLanguage || trackLanguage || "").trim()}
                                                 enableKnowledgeTermLinks={true}
