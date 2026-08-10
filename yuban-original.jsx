@@ -5269,7 +5269,7 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
     for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
         const raw = String(lines[sourceLine] || "");
         const trimmed = raw.trim();
-        if (/^\[\s*原文\s*\]$/i.test(trimmed)) { inOriginal = true; continue; }
+        if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(trimmed) || /^\[\s*(?:原文|original)(?:\s*\/\s*(?:原文|original))?\s*\]$/i.test(trimmed) || /^@ORIG@\s*$/i.test(trimmed)) { inOriginal = true; continue; }
         if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
         // 僅能以使用者提供的原文 scaffold 對位；不能把 LRC 猜測配到 AI 例句或說明。
         if (!inOriginal || !trimmed) continue;
