@@ -5227,6 +5227,65 @@ const QuickSpeakBtn = ({ text, size = 16, className = "", rate = 1.0, mode = 'na
     );
 };
 
+const normalizeKnowledgeAlignmentText = (value = "") => String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\{\{(.*?)\}\}/g, "$1")
+    .replace(/\*+/g, "")
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\u3400-\u9fff]+/gu, " ")
+    .trim();
+
+const getKnowledgeAlignmentWordScore = (needle = "", haystack = "") => {
+    const targetWords = normalizeKnowledgeAlignmentText(needle).match(/[\p{L}\p{N}]+/gu) || [];
+    const sourceWords = normalizeKnowledgeAlignmentText(haystack).match(/[\p{L}\p{N}]+/gu) || [];
+    if (targetWords.length === 0 || sourceWords.length === 0) return 0;
+    const closeEnough = (target, source) => {
+        if (target === source) return true;
+        if (target.length < 5 || source.length < 5) return false;
+        if (target[0] !== source[0] || Math.abs(target.length - source.length) > 1) return false;
+        let mismatches = 0;
+        for (let i = 0; i < Math.min(target.length, source.length); i += 1) {
+            if (target[i] !== source[i]) mismatches += 1;
+            if (mismatches > 1) return false;
+        }
+        return true;
+    };
+    let matched = 0;
+    for (const word of targetWords) {
+        if (word.length < 2) continue;
+        if (sourceWords.some(candidate => closeEnough(word, candidate))) matched += 1;
+    }
+    return matched / Math.max(1, targetWords.filter(word => word.length >= 2).length);
+};
+
+const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
+    const target = normalizeKnowledgeAlignmentText(subtitleText);
+    if (!target || target.length < 6) return null;
+    const lines = String(content || "").replace(/\r/g, "").split("\n");
+    let inOriginal = false;
+    let best = null;
+    for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
+        const raw = String(lines[sourceLine] || "");
+        const trimmed = raw.trim();
+        if (/^\[\s*原文\s*\]$/i.test(trimmed)) { inOriginal = true; continue; }
+        if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
+        // 僅能以使用者提供的原文 scaffold 對位；不能把 LRC 猜測配到 AI 例句或說明。
+        if (!inOriginal || !trimmed) continue;
+        const candidate = normalizeKnowledgeAlignmentText(raw);
+        if (candidate.length < 6) continue;
+        const exact = candidate.includes(target) || target.includes(candidate);
+        const wordScore = getKnowledgeAlignmentWordScore(target, candidate);
+        const score = exact ? 1 : wordScore;
+        const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
+        const minimum = targetWords.length >= 5 ? 0.55 : 0.8;
+        if (score < minimum) continue;
+        if (!best || score > best.score) best = { sourceLine, score };
+    }
+    return best;
+};
+
 const MarkdownView = ({
     content,
     fontSize = 16,
@@ -5234,7 +5293,8 @@ const MarkdownView = ({
     speakerLanguage = "",
     enableKnowledgeTermLinks = false,
     knowledgeTermEntries = [],
-    onKnowledgeTermClick = null
+    onKnowledgeTermClick = null,
+    activeKnowledgeSourceLine = -1
 }) => {
     if (!content || typeof content !== 'string') return null;
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
@@ -5727,7 +5787,7 @@ const MarkdownView = ({
             segments.push({ type: 'table', lines: currentTable });
             currentTable = [];
         }
-        segments.push({ type: 'text', content: line, inOriginal: lineInOriginal });
+        segments.push({ type: 'text', content: line, inOriginal: lineInOriginal, sourceLine: idx });
     }
     if (currentTable.length > 0) segments.push({ type: 'table', lines: currentTable });
 
@@ -5826,7 +5886,11 @@ const MarkdownView = ({
                             .replace(/^#{2,6}\s+/, '');
 
                         return (
-                            <div key={i} className={`flex items-start gap-1 ${wrapClass}`}>
+                            <div
+                                key={i}
+                                data-knowledge-source-line={seg.sourceLine}
+                                className={`flex items-start gap-1 ${wrapClass} ${seg.sourceLine === activeKnowledgeSourceLine ? 'rounded-md bg-amber-100 ring-1 ring-amber-300 px-1 -mx-1' : ''}`}
+                            >
                                 {shouldLinkKnowledgeTerms ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
                                         {buildKnowledgeLinkedNodes(plainTextForLink, `mdk-${i}`)}
@@ -6274,6 +6338,7 @@ export default function GeminiPlayer() {
     const knowledgeTxtPickerPanelRef = useRef(null);
     const manualKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeTxtInputRef = useRef(null);
+    const embeddedKnowledgeContentRef = useRef(null);
     const knowledgePreviewPopupPanelRef = useRef(null);
     const knowledgePreviewPopupDragRef = useRef(null);
     const knowledgePreviewSplitDragRef = useRef(null);
@@ -15465,6 +15530,20 @@ ${userQ}`;
     const embeddedKnowledgeTermEntries = useMemo(() => {
         return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
+    const embeddedKnowledgeSubtitleMatch = useMemo(() => {
+        const subtitleText = subtitles[currentIndex]?.text || "";
+        return findKnowledgeSubtitleMatch(embeddedKnowledgeText, subtitleText);
+    }, [embeddedKnowledgeText, subtitles, currentIndex]);
+    useEffect(() => {
+        if (topPanelMode !== 'document' || !embeddedKnowledgeSubtitleMatch || !embeddedKnowledgeContentRef.current) return;
+        const timer = setTimeout(() => {
+            const container = embeddedKnowledgeContentRef.current;
+            const target = container?.querySelector?.(`[data-knowledge-source-line="${embeddedKnowledgeSubtitleMatch.sourceLine}"]`);
+            if (!container || !target) return;
+            container.scrollTo({ top: Math.max(0, target.offsetTop - container.clientHeight * 0.28), behavior: 'smooth' });
+        }, 0);
+        return () => clearTimeout(timer);
+    }, [topPanelMode, currentIndex, embeddedKnowledgeSubtitleMatch]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
         const source = String(text || "");
@@ -17159,7 +17238,7 @@ ${userQ}`;
                                     </div>
                                 )}
                                 <div className="flex-1 flex overflow-hidden">
-                                    <div className="flex-1 overflow-y-auto px-4 py-3">
+                                    <div ref={embeddedKnowledgeContentRef} className="flex-1 overflow-y-auto px-4 py-3">
                                         {embeddedKnowledgeLoading ? (
                                             <div className="h-full flex items-center justify-center text-sm text-gray-400">載入文件中...</div>
                                         ) : embeddedKnowledgeError ? (
@@ -17182,6 +17261,7 @@ ${userQ}`;
                                                 enableKnowledgeTermLinks={true}
                                                 knowledgeTermEntries={embeddedKnowledgeTermEntries}
                                                 onKnowledgeTermClick={handleKnowledgePreviewTermClick}
+                                                activeKnowledgeSourceLine={embeddedKnowledgeSubtitleMatch?.sourceLine ?? -1}
                                             />
                                         )}
                                     </div>
