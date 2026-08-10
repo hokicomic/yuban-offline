@@ -6024,6 +6024,7 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
     const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(45);
+    const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
     const [isHeaderVisible, setIsHeaderVisible] = useState(true);
@@ -17109,7 +17110,7 @@ ${userQ}`;
                         )}
                         {!isVideoMasked && isTopPanelDocumentMode && (
                             <div className="w-full h-full flex flex-col bg-white">
-                                <div className="flex items-center gap-3 px-3 py-2 border-b border-gray-200 bg-gray-50 shrink-0">
+                                <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-gray-200 bg-gray-50 shrink-0">
                                     <div className="min-w-0 flex-1">
                                         <div className="text-xs font-bold text-gray-700">文件對照</div>
                                         <div className="text-[11px] text-gray-500 truncate">{embeddedKnowledgeFileInfo?.filename || '文字檔'}</div>
@@ -17144,6 +17145,12 @@ ${userQ}`;
                                         />
                                         <span className="text-[11px] text-gray-500 w-10 text-right">{embeddedKnowledgePanelHeight}vh</span>
                                     </div>
+                                    <div className="flex items-center gap-1 shrink-0" title="知識文件字體大小">
+                                        <span className="text-[11px] text-gray-500">字體</span>
+                                        <button type="button" onClick={() => setEmbeddedKnowledgeFontSize(Math.max(14, embeddedKnowledgeFontSize - 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="縮小知識文件字體"><Minus size={14} /></button>
+                                        <span className="text-[11px] font-bold text-gray-700 w-6 text-center">{embeddedKnowledgeFontSize}</span>
+                                        <button type="button" onClick={() => setEmbeddedKnowledgeFontSize(Math.min(40, embeddedKnowledgeFontSize + 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="放大知識文件字體"><Plus size={14} /></button>
+                                    </div>
                                     <button onClick={handleToggleMediaPanel} className="p-1.5 bg-gray-200 text-gray-700 rounded-full hover:bg-gray-300 z-20"><Minimize2 size={16} /></button>
                                 </div>
                                 {trackKnowledgeTabEntries.length > 1 && (
@@ -17169,7 +17176,7 @@ ${userQ}`;
                                         ) : (
                                             <MarkdownView
                                                 content={embeddedKnowledgeText || "（文件內容為空）"}
-                                                fontSize={Math.max(14, effectiveSubtitleFontSize - 1)}
+                                                fontSize={embeddedKnowledgeFontSize}
                                                 trackLanguage={trackLanguage}
                                                 speakerLanguage={String(embeddedKnowledgeFileInfo?.targetLanguage || trackLanguage || "").trim()}
                                                 enableKnowledgeTermLinks={true}
