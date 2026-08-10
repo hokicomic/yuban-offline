@@ -6087,7 +6087,7 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
-    const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(45);
+    const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(60);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
@@ -17224,7 +17224,7 @@ ${userQ}`;
                                             min="28"
                                             max="72"
                                             value={embeddedKnowledgePanelHeight}
-                                            onChange={(e) => setEmbeddedKnowledgePanelHeight(Math.max(28, Math.min(72, parseInt(e.target.value, 10) || 45)))}
+                                            onChange={(e) => setEmbeddedKnowledgePanelHeight(Math.max(28, Math.min(72, parseInt(e.target.value, 10) || 60)))}
                                             className="w-24 h-1 bg-gray-300 rounded-lg accent-blue-600"
                                         />
                                         <span className="text-[11px] text-gray-500 w-10 text-right">{embeddedKnowledgePanelHeight}vh</span>
