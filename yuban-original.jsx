@@ -6339,6 +6339,7 @@ export default function GeminiPlayer() {
     const manualKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeContentRef = useRef(null);
+    const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const knowledgePreviewPopupPanelRef = useRef(null);
     const knowledgePreviewPopupDragRef = useRef(null);
     const knowledgePreviewSplitDragRef = useRef(null);
@@ -16968,10 +16969,22 @@ ${userQ}`;
     }, []);
 
     const showTopPanelDocument = useCallback(async () => {
+        // 將舊版執行中仍保留的 45vh 預設值遷移為新預設；只做一次，
+        // 之後使用者手動選擇 45vh 仍會被尊重。
+        if (!embeddedKnowledgeHeightMigrationRef.current) {
+            embeddedKnowledgeHeightMigrationRef.current = true;
+            setEmbeddedKnowledgePanelHeight(prev => prev === 45 ? 60 : prev);
+        }
         setTopPanelMode('document');
         await loadEmbeddedKnowledgePanel();
         setIsVideoMasked(false);
     }, [loadEmbeddedKnowledgePanel]);
+
+    useEffect(() => {
+        if (topPanelMode !== 'document' || embeddedKnowledgeHeightMigrationRef.current) return;
+        embeddedKnowledgeHeightMigrationRef.current = true;
+        setEmbeddedKnowledgePanelHeight(prev => prev === 45 ? 60 : prev);
+    }, [topPanelMode]);
 
     useEffect(() => {
         setIsVideoMasked(true);
