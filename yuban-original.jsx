@@ -5286,6 +5286,33 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
     return best;
 };
 
+const getKnowledgeOriginalLinesForSync = (content = "") => {
+    let inOriginal = false;
+    return String(content || "").replace(/\r/g, "").split("\n").flatMap((raw, sourceLine) => {
+        const line = String(raw || "").trim();
+        if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(line) || /^@ORIG@\s*$/i.test(line)) { inOriginal = true; return []; }
+        if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(line)) inOriginal = false;
+        if (!inOriginal || !line || /^#{1,6}\s|^(?:chapter|part|book)\b/i.test(line)) return [];
+        const words = normalizeKnowledgeAlignmentText(line).match(/[\p{L}\p{N}]+/gu) || [];
+        return words.length >= 4 ? [{ text: line, sourceLine }] : [];
+    });
+};
+
+const findLrcStartForKnowledgeText = (content = "", subtitles = []) => {
+    const candidates = getKnowledgeOriginalLinesForSync(content).slice(0, 8);
+    for (const candidate of candidates) {
+        let best = { index: -1, score: 0 };
+        for (let index = 0; index < subtitles.length; index += 1) {
+            const subtitleText = String(subtitles[index]?.text || "");
+            const match = findKnowledgeSubtitleMatch(`[原文]\n${candidate.text}\n@K_HEADER@`, subtitleText);
+            const score = match?.score || 0;
+            if (score > best.score) best = { index, score };
+        }
+        if (best.index >= 0 && best.score >= 0.72) return best.index;
+    }
+    return -1;
+};
+
 const MarkdownView = ({
     content,
     fontSize = 16,
@@ -6340,6 +6367,7 @@ export default function GeminiPlayer() {
     const embeddedKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeContentRef = useRef(null);
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
+    const embeddedKnowledgeTabSearchRef = useRef("");
     const knowledgePreviewPopupPanelRef = useRef(null);
     const knowledgePreviewPopupDragRef = useRef(null);
     const knowledgePreviewSplitDragRef = useRef(null);
@@ -6705,7 +6733,7 @@ export default function GeminiPlayer() {
                     });
                 }
             }
-            return true;
+            return { rawTxt };
         } catch (e) {
             console.warn('[FlashCard] WakeLock request failed:', e);
             return false;
@@ -16833,12 +16861,14 @@ ${userQ}`;
     const handleManualKnowledgeTxtFileForEmbedded = useCallback(async (file) => {
         if (!file) return;
         try {
-            await loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
+            const result = await loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
             setIsVideoMasked(false);
+            const startIndex = findLrcStartForKnowledgeText(result?.rawTxt || "", subtitles);
+            if (startIndex >= 0) jumpToSubtitle(startIndex);
         } catch (err) {
             setEmbeddedKnowledgeError(String(err?.message || err || "開啟文字檔失敗。"));
         }
-    }, [loadEmbeddedKnowledgeTxtFile]);
+    }, [jumpToSubtitle, loadEmbeddedKnowledgeTxtFile, subtitles]);
 
     const loadEmbeddedKnowledgePanel = useCallback(async () => {
         if (!canShowEmbeddedKnowledgePanel) return false;
@@ -16922,6 +16952,28 @@ ${userQ}`;
             setKnowledgeTxtPickerError(String(err?.message || err || "切換知識點失敗。"));
         }
     }, [openEmbeddedKnowledgeTxtByName, openKnowledgeTxtInModal]);
+    useEffect(() => {
+        const subtitleText = subtitles[currentIndex]?.text || "";
+        const searchKey = `${currentIndex}:${activeTrackKnowledgeTabName}:${subtitleText}`;
+        if (topPanelMode !== 'document' || embeddedKnowledgeLoading || embeddedKnowledgeSubtitleMatch || trackKnowledgeTabEntries.length < 2 || embeddedKnowledgeTabSearchRef.current === searchKey) return;
+        embeddedKnowledgeTabSearchRef.current = searchKey;
+        let cancelled = false;
+        (async () => {
+            for (const entry of trackKnowledgeTabEntries) {
+                const name = String(entry?.name || "");
+                if (!name || name === activeTrackKnowledgeTabName) continue;
+                const file = getKnowledgeTxtFileByName(name);
+                if (!file) continue;
+                const rawTxt = String(await readManualDocumentText(file) || "").trim();
+                if (!rawTxt || !findKnowledgeSubtitleMatch(rawTxt, subtitleText) || cancelled) continue;
+                setActiveTrackKnowledgeTabName(name);
+                setSelectedKnowledgeTxtName(name);
+                await loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
+                break;
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [activeTrackKnowledgeTabName, currentIndex, embeddedKnowledgeLoading, embeddedKnowledgeSubtitleMatch, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile, subtitles, topPanelMode, trackKnowledgeTabEntries]);
     const renderTrackKnowledgeTabs = (target = "modal") => {
         if (!Array.isArray(trackKnowledgeTabEntries) || trackKnowledgeTabEntries.length <= 1) return null;
         const activeName = String(activeTrackKnowledgeTabName || "").trim();
@@ -17034,6 +17086,7 @@ ${userQ}`;
                                         </select>
                                     )}
                                     <button onClick={handlePickFolder} className="cursor-pointer bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0"><FolderOpen size={14} /><span className="hidden sm:inline">授權影音資料夾</span></button>
+                                    <button onClick={openManualKnowledgeTxtPickerForEmbedded} className="cursor-pointer bg-cyan-50 hover:bg-cyan-100 text-cyan-700 border border-cyan-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0" title="選擇任意文字檔作為知識文件"><BookOpen size={14} /><span className="hidden sm:inline">知識檔</span></button>
                                     <input type="file" ref={folderInputRef} webkitdirectory="true" directory="true" multiple className="hidden" onChange={handleFolderSelect} />
                                     <input
                                         type="file"
