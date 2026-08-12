@@ -5267,8 +5267,10 @@ const KNOWLEDGE_ALIGNMENT_STOP_WORDS = new Set([
 ]);
 
 const getKnowledgeAlignmentContentEvidence = (needle = "", haystack = "") => {
-    const getWords = (value) => (normalizeKnowledgeAlignmentText(value).match(/[\p{L}\p{N}]+/gu) || [])
-        .filter(word => /^\d+$/.test(word) || (word.length >= 3 && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word)));
+    const getWords = (value) => Array.from(new Set(
+        (normalizeKnowledgeAlignmentText(value).match(/[\p{L}\p{N}]+/gu) || [])
+            .filter(word => /^\d+$/.test(word) || (word.length >= 3 && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word)))
+    ));
     const targetWords = getWords(needle);
     const sourceWords = getWords(haystack);
     if (targetWords.length === 0 || sourceWords.length === 0) return { matched: 0, total: targetWords.length, score: 0 };
