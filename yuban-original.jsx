@@ -6380,6 +6380,7 @@ export default function GeminiPlayer() {
     const embeddedKnowledgeContentRef = useRef(null);
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
+    const embeddedKnowledgePlaybackProgressRef = useRef({ documentText: "", subtitleIndex: -1, maxSourceLine: -1 });
     const knowledgePreviewPopupPanelRef = useRef(null);
     const knowledgePreviewPopupDragRef = useRef(null);
     const knowledgePreviewSplitDragRef = useRef(null);
@@ -15573,7 +15574,24 @@ ${userQ}`;
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
-        return findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText);
+        const rawMatches = findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText);
+        const progress = embeddedKnowledgePlaybackProgressRef.current;
+        if (progress.documentText !== embeddedKnowledgeText) {
+            progress.documentText = embeddedKnowledgeText;
+            progress.subtitleIndex = -1;
+            progress.maxSourceLine = -1;
+        }
+        // 正常往後播放時，不能因為模糊匹配回頭標記已讀原文。
+        // LRC 索引倒退才視為使用者回播，重新允許較前面的原文行。
+        if (currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
+        const matches = currentIndex > progress.subtitleIndex && progress.maxSourceLine >= 0
+            ? rawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
+            : rawMatches;
+        if (matches.length > 0) {
+            progress.maxSourceLine = Math.max(...matches.map(match => match.sourceLine));
+        }
+        progress.subtitleIndex = currentIndex;
+        return matches;
     }, [embeddedKnowledgeText, subtitles, currentIndex]);
     useEffect(() => {
         if (topPanelMode !== 'document' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
