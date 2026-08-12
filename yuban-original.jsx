@@ -5261,11 +5261,16 @@ const getKnowledgeAlignmentWordScore = (needle = "", haystack = "") => {
 };
 
 const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
+    return findKnowledgeSubtitleMatches(content, subtitleText)[0] || null;
+};
+
+const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
     const target = normalizeKnowledgeAlignmentText(subtitleText);
-    if (!target || target.length < 6) return null;
+    if (!target || target.length < 6) return [];
     const lines = String(content || "").replace(/\r/g, "").split("\n");
     let inOriginal = false;
-    let best = null;
+    const matches = [];
+    const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
     for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
         const raw = String(lines[sourceLine] || "");
         const trimmed = raw.trim();
@@ -5276,14 +5281,19 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
         const candidate = normalizeKnowledgeAlignmentText(raw);
         if (candidate.length < 6) continue;
         const exact = candidate.includes(target) || target.includes(candidate);
-        const wordScore = getKnowledgeAlignmentWordScore(target, candidate);
-        const score = exact ? 1 : wordScore;
-        const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
+        // 智能斷句可能把多個原文句合併成一段：同時檢查「字幕涵蓋原文句」
+        // 與「原文句涵蓋字幕」兩個方向，才能取得整個對應範圍。
+        const subtitleCoverage = getKnowledgeAlignmentWordScore(target, candidate);
+        const sourceCoverage = getKnowledgeAlignmentWordScore(candidate, target);
+        const candidateWords = candidate.match(/[\p{L}\p{N}]+/gu) || [];
+        const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
         const minimum = targetWords.length >= 5 ? 0.55 : 0.8;
-        if (score < minimum) continue;
-        if (!best || score > best.score) best = { sourceLine, score };
+        const sourceMinimum = candidateWords.length >= 5 ? 0.72 : 0.9;
+        const passes = exact || subtitleCoverage >= minimum || sourceCoverage >= sourceMinimum;
+        if (!passes) continue;
+        matches.push({ sourceLine, score });
     }
-    return best;
+    return matches.sort((a, b) => a.sourceLine - b.sourceLine);
 };
 
 const getKnowledgeOriginalLinesForSync = (content = "") => {
@@ -5321,7 +5331,8 @@ const MarkdownView = ({
     enableKnowledgeTermLinks = false,
     knowledgeTermEntries = [],
     onKnowledgeTermClick = null,
-    activeKnowledgeSourceLine = -1
+    activeKnowledgeSourceLine = -1,
+    activeKnowledgeSourceLines = []
 }) => {
     if (!content || typeof content !== 'string') return null;
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
@@ -5912,11 +5923,12 @@ const MarkdownView = ({
                             .replace(/\*(?!\*)([^*<>]+)\*/g, '$1')
                             .replace(/^#{2,6}\s+/, '');
 
+                        const isActiveKnowledgeLine = seg.sourceLine === activeKnowledgeSourceLine || activeKnowledgeSourceLines.includes(seg.sourceLine);
                         return (
                             <div
                                 key={i}
                                 data-knowledge-source-line={seg.sourceLine}
-                                className={`flex items-start gap-1 ${wrapClass} ${seg.sourceLine === activeKnowledgeSourceLine ? 'rounded-md bg-amber-100 ring-1 ring-amber-300 px-1 -mx-1' : ''}`}
+                                className={`flex items-start gap-1 ${wrapClass} ${isActiveKnowledgeLine ? 'rounded-md bg-amber-100 ring-1 ring-amber-300 px-1 -mx-1' : ''}`}
                             >
                                 {shouldLinkKnowledgeTerms ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
@@ -15559,15 +15571,16 @@ ${userQ}`;
     const embeddedKnowledgeTermEntries = useMemo(() => {
         return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
-    const embeddedKnowledgeSubtitleMatch = useMemo(() => {
+    const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
-        return findKnowledgeSubtitleMatch(embeddedKnowledgeText, subtitleText);
+        return findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText);
     }, [embeddedKnowledgeText, subtitles, currentIndex]);
     useEffect(() => {
-        if (topPanelMode !== 'document' || !embeddedKnowledgeSubtitleMatch || !embeddedKnowledgeContentRef.current) return;
+        if (topPanelMode !== 'document' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
         const timer = setTimeout(() => {
             const container = embeddedKnowledgeContentRef.current;
-            const target = container?.querySelector?.(`[data-knowledge-source-line="${embeddedKnowledgeSubtitleMatch.sourceLine}"]`);
+            const firstLine = embeddedKnowledgeSubtitleMatches[0]?.sourceLine;
+            const target = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
             if (!container || !target) return;
             const containerRect = container.getBoundingClientRect();
             const targetRect = target.getBoundingClientRect();
@@ -15577,7 +15590,7 @@ ${userQ}`;
             container.scrollTo({ top: Math.max(0, Math.min(maxTop, desiredTop)), behavior: 'smooth' });
         }, 0);
         return () => clearTimeout(timer);
-    }, [topPanelMode, currentIndex, embeddedKnowledgeSubtitleMatch]);
+    }, [topPanelMode, currentIndex, embeddedKnowledgeSubtitleMatches]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
         const source = String(text || "");
@@ -16955,7 +16968,7 @@ ${userQ}`;
     useEffect(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
         const searchKey = `${currentIndex}:${activeTrackKnowledgeTabName}:${subtitleText}`;
-        if (topPanelMode !== 'document' || embeddedKnowledgeLoading || embeddedKnowledgeSubtitleMatch || trackKnowledgeTabEntries.length < 2 || embeddedKnowledgeTabSearchRef.current === searchKey) return;
+        if (topPanelMode !== 'document' || embeddedKnowledgeLoading || embeddedKnowledgeSubtitleMatches.length > 0 || trackKnowledgeTabEntries.length < 2 || embeddedKnowledgeTabSearchRef.current === searchKey) return;
         embeddedKnowledgeTabSearchRef.current = searchKey;
         let cancelled = false;
         (async () => {
@@ -16973,7 +16986,7 @@ ${userQ}`;
             }
         })();
         return () => { cancelled = true; };
-    }, [activeTrackKnowledgeTabName, currentIndex, embeddedKnowledgeLoading, embeddedKnowledgeSubtitleMatch, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile, subtitles, topPanelMode, trackKnowledgeTabEntries]);
+    }, [activeTrackKnowledgeTabName, currentIndex, embeddedKnowledgeLoading, embeddedKnowledgeSubtitleMatches, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile, subtitles, topPanelMode, trackKnowledgeTabEntries]);
     const renderTrackKnowledgeTabs = (target = "modal") => {
         if (!Array.isArray(trackKnowledgeTabEntries) || trackKnowledgeTabEntries.length <= 1) return null;
         const activeName = String(activeTrackKnowledgeTabName || "").trim();
@@ -17332,7 +17345,7 @@ ${userQ}`;
                                                 enableKnowledgeTermLinks={true}
                                                 knowledgeTermEntries={embeddedKnowledgeTermEntries}
                                                 onKnowledgeTermClick={handleKnowledgePreviewTermClick}
-                                                activeKnowledgeSourceLine={embeddedKnowledgeSubtitleMatch?.sourceLine ?? -1}
+                                                activeKnowledgeSourceLines={embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine)}
                                             />
                                         )}
                                     </div>
