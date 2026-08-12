@@ -5260,6 +5260,22 @@ const getKnowledgeAlignmentWordScore = (needle = "", haystack = "") => {
     return matched / Math.max(1, targetWords.filter(word => word.length >= 2).length);
 };
 
+// 功能詞很容易讓相鄰、實際上不對應的句子得到過高分數；
+// 模糊對位時只把有辨識力的內容詞當作證據。
+const KNOWLEDGE_ALIGNMENT_STOP_WORDS = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for", "from", "had", "has", "have", "he", "her", "his", "i", "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "she", "so", "that", "the", "their", "them", "there", "they", "this", "to", "was", "we", "were", "will", "with", "you", "your"
+]);
+
+const getKnowledgeAlignmentContentEvidence = (needle = "", haystack = "") => {
+    const getWords = (value) => (normalizeKnowledgeAlignmentText(value).match(/[\p{L}\p{N}]+/gu) || [])
+        .filter(word => /^\d+$/.test(word) || (word.length >= 3 && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word)));
+    const targetWords = getWords(needle);
+    const sourceWords = getWords(haystack);
+    if (targetWords.length === 0 || sourceWords.length === 0) return { matched: 0, total: targetWords.length, score: 0 };
+    const matched = targetWords.filter(word => sourceWords.includes(word)).length;
+    return { matched, total: targetWords.length, score: matched / targetWords.length };
+};
+
 const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
     return findKnowledgeSubtitleMatches(content, subtitleText)[0] || null;
 };
@@ -5270,7 +5286,6 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
     const lines = String(content || "").replace(/\r/g, "").split("\n");
     let inOriginal = false;
     const matches = [];
-    const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
     for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
         const raw = String(lines[sourceLine] || "");
         const trimmed = raw.trim();
@@ -5285,11 +5300,12 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
         // 與「原文句涵蓋字幕」兩個方向，才能取得整個對應範圍。
         const subtitleCoverage = getKnowledgeAlignmentWordScore(target, candidate);
         const sourceCoverage = getKnowledgeAlignmentWordScore(candidate, target);
-        const candidateWords = candidate.match(/[\p{L}\p{N}]+/gu) || [];
+        const subtitleEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
+        const sourceEvidence = getKnowledgeAlignmentContentEvidence(candidate, target);
         const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
-        const minimum = targetWords.length >= 5 ? 0.55 : 0.8;
-        const sourceMinimum = candidateWords.length >= 5 ? 0.72 : 0.9;
-        const passes = exact || subtitleCoverage >= minimum || sourceCoverage >= sourceMinimum;
+        const subtitlePasses = subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
+        const sourcePasses = sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
+        const passes = exact || subtitlePasses || sourcePasses;
         if (!passes) continue;
         matches.push({ sourceLine, score });
     }
@@ -6126,7 +6142,7 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
-    const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(60);
+    const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(50);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
@@ -15582,15 +15598,19 @@ ${userQ}`;
             progress.maxSourceLine = -1;
         }
         // 正常往後播放時，不能因為模糊匹配回頭標記已讀原文。
-        // LRC 索引倒退才視為使用者回播，重新允許較前面的原文行。
-        if (currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
-        const matches = currentIndex > progress.subtitleIndex && progress.maxSourceLine >= 0
+        // 只有兩個有效 LRC 索引真的倒退時，才視為使用者回播。播放時短暫的 -1
+        // 不能清掉防回頭保護，否則下一段會重新選中先前原文並把視窗捲上去。
+        const hasCurrentSubtitleIndex = Number.isInteger(currentIndex) && currentIndex >= 0;
+        const hadSubtitleIndex = Number.isInteger(progress.subtitleIndex) && progress.subtitleIndex >= 0;
+        if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
+        const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
+        const matches = isForwardPlayback && progress.maxSourceLine >= 0
             ? rawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
             : rawMatches;
         if (matches.length > 0) {
             progress.maxSourceLine = Math.max(...matches.map(match => match.sourceLine));
         }
-        progress.subtitleIndex = currentIndex;
+        if (hasCurrentSubtitleIndex) progress.subtitleIndex = currentIndex;
         return matches;
     }, [embeddedKnowledgeText, subtitles, currentIndex]);
     useEffect(() => {
@@ -17056,7 +17076,7 @@ ${userQ}`;
         // 之後使用者手動選擇 45vh 仍會被尊重。
         if (!embeddedKnowledgeHeightMigrationRef.current) {
             embeddedKnowledgeHeightMigrationRef.current = true;
-            setEmbeddedKnowledgePanelHeight(prev => prev === 45 ? 60 : prev);
+            setEmbeddedKnowledgePanelHeight(prev => prev === 45 ? 50 : prev);
         }
         setTopPanelMode('document');
         await loadEmbeddedKnowledgePanel();
@@ -17066,7 +17086,7 @@ ${userQ}`;
     useEffect(() => {
         if (topPanelMode !== 'document' || embeddedKnowledgeHeightMigrationRef.current) return;
         embeddedKnowledgeHeightMigrationRef.current = true;
-        setEmbeddedKnowledgePanelHeight(prev => prev === 45 ? 60 : prev);
+        setEmbeddedKnowledgePanelHeight(prev => prev === 45 ? 50 : prev);
     }, [topPanelMode]);
 
     useEffect(() => {
@@ -17321,7 +17341,7 @@ ${userQ}`;
                                             min="28"
                                             max="72"
                                             value={embeddedKnowledgePanelHeight}
-                                            onChange={(e) => setEmbeddedKnowledgePanelHeight(Math.max(28, Math.min(72, parseInt(e.target.value, 10) || 60)))}
+                                            onChange={(e) => setEmbeddedKnowledgePanelHeight(Math.max(28, Math.min(72, parseInt(e.target.value, 10) || 50)))}
                                             className="w-24 h-1 bg-gray-300 rounded-lg accent-blue-600"
                                         />
                                         <span className="text-[11px] text-gray-500 w-10 text-right">{embeddedKnowledgePanelHeight}vh</span>
