@@ -5254,9 +5254,21 @@ const getKnowledgeAlignmentWordScore = (needle = "", haystack = "") => {
     const sourceWords = normalizeKnowledgeAlignmentText(haystack).match(/[\p{L}\p{N}]+/gu) || [];
     if (targetWords.length === 0 || sourceWords.length === 0) return 0;
     let matched = 0;
-    for (const word of targetWords) {
+    for (let targetIndex = 0; targetIndex < targetWords.length; targetIndex += 1) {
+        const word = targetWords[targetIndex];
         if (word.length < 2) continue;
-        if (sourceWords.some(candidate => areKnowledgeAlignmentWordsEquivalent(word, candidate))) matched += 1;
+        if (sourceWords.some(candidate => areKnowledgeAlignmentWordsEquivalent(word, candidate))) {
+            matched += 1;
+            continue;
+        }
+        // Hyphenation and ebook OCR vary: "non-essentials" ↔ "nonessentials".
+        // Count the two original words as covered when their joined form matches.
+        const nextWord = targetWords[targetIndex + 1] || "";
+        if (nextWord.length >= 2 && sourceWords.some(candidate =>
+            areKnowledgeAlignmentWordsEquivalent(`${word}${nextWord}`, candidate))) {
+            matched += 2;
+            targetIndex += 1;
+        }
     }
     return matched / Math.max(1, targetWords.filter(word => word.length >= 2).length);
 };
@@ -5296,18 +5308,35 @@ const getKnowledgeAlignmentDirectionalScore = (subtitleText = "", candidateText 
     for (let targetIndex = 0; targetIndex < targetContent.length; targetIndex += 1) {
         const word = targetContent[targetIndex];
         let foundAt = -1;
+        let matchedTargetWidth = 1;
+        let consumedCandidateWidth = 1;
         for (let i = candidateCursor; i < candidateContent.length; i += 1) {
-            if (areKnowledgeAlignmentWordsEquivalent(word, candidateContent[i])) { foundAt = i; break; }
+            if (areKnowledgeAlignmentWordsEquivalent(word, candidateContent[i])) {
+                foundAt = i;
+                break;
+            }
+            const nextTargetWord = targetContent[targetIndex + 1] || "";
+            if (nextTargetWord && areKnowledgeAlignmentWordsEquivalent(`${word}${nextTargetWord}`, candidateContent[i])) {
+                foundAt = i;
+                matchedTargetWidth = 2;
+                break;
+            }
+            if (candidateContent[i + 1] && areKnowledgeAlignmentWordsEquivalent(word, `${candidateContent[i]}${candidateContent[i + 1]}`)) {
+                foundAt = i;
+                consumedCandidateWidth = 2;
+                break;
+            }
         }
         if (foundAt >= 0) {
-            orderedMatched += 1;
+            orderedMatched += matchedTargetWidth;
             orderedRun = targetIndex === previousTargetIndex + 1 && foundAt === previousCandidateIndex + 1
                 ? orderedRun + 1
                 : 1;
             orderedLongestRun = Math.max(orderedLongestRun, orderedRun);
-            previousTargetIndex = targetIndex;
-            previousCandidateIndex = foundAt;
-            candidateCursor = foundAt + 1;
+            previousTargetIndex = targetIndex + matchedTargetWidth - 1;
+            previousCandidateIndex = foundAt + consumedCandidateWidth - 1;
+            candidateCursor = foundAt + consumedCandidateWidth;
+            targetIndex += matchedTargetWidth - 1;
         }
     }
     const orderedContentCoverage = targetContent.length ? orderedMatched / targetContent.length : targetCoverage;
