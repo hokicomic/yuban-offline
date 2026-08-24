@@ -5414,7 +5414,25 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
 const splitKnowledgeLineIntoSentences = (value = "") => {
     const source = String(value || "");
     const parts = source.match(/[^\n.!?。！？]+(?:[.!?。！？]+(?:[”’"')\]\}]+)?|$)/gu) || [];
-    return parts.map(part => String(part || "")).filter(Boolean);
+    const rawParts = parts.map(part => String(part || "")).filter(Boolean);
+    const wordCount = (part) => (normalizeKnowledgeAlignmentText(part).match(/[\p{L}\p{N}]+/gu) || []).length;
+    const isShortExclamation = (part) => wordCount(part) <= 2 && /[!?][”’"')\]\}]*\s*$/u.test(part);
+    const merged = [];
+    for (let index = 0; index < rawParts.length; index += 1) {
+        const first = rawParts[index];
+        const second = rawParts[index + 1];
+        const attribution = rawParts[index + 2];
+        // “Ah! Sacré!” cried Poirot. is one spoken sentence, not three.  Only
+        // merge this exact dialogue pattern; normal short LRC sentences remain
+        // independently matchable.
+        if (isShortExclamation(first) && isShortExclamation(second) && attribution && /^\s*[a-z]/u.test(attribution)) {
+            merged.push(`${first}${second}${attribution}`);
+            index += 2;
+            continue;
+        }
+        merged.push(first);
+    }
+    return merged;
 };
 
 const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = "") => {
@@ -5433,7 +5451,10 @@ const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = 
     const transcriptionRecoveryPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
         targetWords.length >= 6 && alignment.targetCoverage >= 0.50 &&
         alignment.orderedContentCoverage >= 0.50 && alignment.orderedLongestRun >= 2;
-    return fuzzyPasses || transcriptionRecoveryPasses;
+    const shortDialogueCuePasses = targetWords.length >= 2 && targetWords.length <= 3 &&
+        candidateWords.length >= 4 && candidate.startsWith(target) &&
+        alignment.targetCoverage >= 0.90;
+    return fuzzyPasses || transcriptionRecoveryPasses || shortDialogueCuePasses;
 };
 
 const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") => {
