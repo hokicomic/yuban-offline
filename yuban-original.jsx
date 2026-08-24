@@ -5295,26 +5295,29 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
         if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
         // 僅能以使用者提供的原文 scaffold 對位；不能把 LRC 猜測配到 AI 例句或說明。
         if (!inOriginal || !trimmed) continue;
-        const candidate = normalizeKnowledgeAlignmentText(raw);
-        if (candidate.length < 6) continue;
-        const exact = candidate.includes(target) || target.includes(candidate);
-        // 智能斷句可能把多個原文句合併成一段：同時檢查「字幕涵蓋原文句」
-        // 與「原文句涵蓋字幕」兩個方向，才能取得整個對應範圍。
-        const subtitleCoverage = getKnowledgeAlignmentWordScore(target, candidate);
-        const sourceCoverage = getKnowledgeAlignmentWordScore(candidate, target);
-        const subtitleEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
-        const sourceEvidence = getKnowledgeAlignmentContentEvidence(candidate, target);
-        const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
-        const subtitlePasses = subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
-        const sourcePasses = sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
-        // 短 LRC 很容易只差一個聽寫字（例如 "arises" / "rises"）。
-        // 這時內容詞不足三個，但若整句詞彙覆蓋率高且仍有內容詞對上，
-        // 可維持在同一原文行內定位；不放寬成只靠功能詞的跨段猜測。
-        const targetWordCount = (target.match(/[\p{L}\p{N}]+/gu) || []).length;
-        const shortSubtitlePasses = targetWordCount >= 5 && subtitleCoverage >= 0.78 && subtitleEvidence.matched >= 1;
-        const passes = exact || subtitlePasses || sourcePasses || shortSubtitlePasses;
-        if (!passes) continue;
-        matches.push({ sourceLine, score });
+        // 電子書常把多句放在同一行。逐句評分可避免整段的共同功能詞
+        // 意外命中遠處段落，並讓短 LRC 對到段落內真正的那一句。
+        const candidates = [raw, ...splitKnowledgeLineIntoSentences(raw)];
+        let bestScore = 0;
+        for (const candidateRaw of candidates) {
+            const candidate = normalizeKnowledgeAlignmentText(candidateRaw);
+            if (candidate.length < 4) continue;
+            const exact = candidate.includes(target) || target.includes(candidate);
+            const subtitleCoverage = getKnowledgeAlignmentWordScore(target, candidate);
+            const sourceCoverage = getKnowledgeAlignmentWordScore(candidate, target);
+            const subtitleEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
+            const sourceEvidence = getKnowledgeAlignmentContentEvidence(candidate, target);
+            const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
+            const subtitlePasses = subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
+            const sourcePasses = sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
+            const targetWordCount = (target.match(/[\p{L}\p{N}]+/gu) || []).length;
+            const shortSubtitlePasses = targetWordCount >= 5 && subtitleCoverage >= 0.78 && subtitleEvidence.matched >= 1;
+            if (exact || subtitlePasses || sourcePasses || shortSubtitlePasses) {
+                bestScore = Math.max(bestScore, score);
+            }
+        }
+        if (bestScore <= 0) continue;
+        matches.push({ sourceLine, score: bestScore });
     }
     return matches.sort((a, b) => a.sourceLine - b.sourceLine);
 };
@@ -5338,6 +5341,34 @@ const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") 
     return (evidence.matched >= 2 && evidence.score >= 0.66) ||
         (reverseEvidence.matched >= 2 && reverseEvidence.score >= 0.66) ||
         (candidate.length >= 24 && coverage >= 0.78);
+};
+
+// 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
+// 避免遠處的模糊候選把播放游標推得過後，導致後面的真實句子被防回跳機制排除。
+const selectKnowledgeSubtitleMatchCluster = (matches = []) => {
+    const ordered = Array.isArray(matches) ? [...matches].sort((a, b) => a.sourceLine - b.sourceLine) : [];
+    if (ordered.length <= 1) return ordered;
+    const groups = [];
+    let group = [];
+    for (const match of ordered) {
+        const prev = group[group.length - 1];
+        if (prev && match.sourceLine > prev.sourceLine + 2) {
+            groups.push(group);
+            group = [];
+        }
+        group.push(match);
+    }
+    if (group.length) groups.push(group);
+    groups.sort((a, b) => {
+        const aScore = a.reduce((sum, item) => sum + Number(item.score || 0), 0);
+        const bScore = b.reduce((sum, item) => sum + Number(item.score || 0), 0);
+        if (bScore !== aScore) return bScore - aScore;
+        const aBest = Math.max(...a.map(item => Number(item.score || 0)));
+        const bBest = Math.max(...b.map(item => Number(item.score || 0)));
+        if (bBest !== aBest) return bBest - aBest;
+        return a[0].sourceLine - b[0].sourceLine;
+    });
+    return groups[0] || [];
 };
 
 const getKnowledgeOriginalLinesForSync = (content = "") => {
@@ -15635,7 +15666,7 @@ ${userQ}`;
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
-        const rawMatches = findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText);
+        const rawMatches = selectKnowledgeSubtitleMatchCluster(findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText));
         const progress = embeddedKnowledgePlaybackProgressRef.current;
         if (progress.documentText !== embeddedKnowledgeText) {
             progress.documentText = embeddedKnowledgeText;
