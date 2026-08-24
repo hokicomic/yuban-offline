@@ -5307,7 +5307,12 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
         const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
         const subtitlePasses = subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
         const sourcePasses = sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
-        const passes = exact || subtitlePasses || sourcePasses;
+        // 短 LRC 很容易只差一個聽寫字（例如 "arises" / "rises"）。
+        // 這時內容詞不足三個，但若整句詞彙覆蓋率高且仍有內容詞對上，
+        // 可維持在同一原文行內定位；不放寬成只靠功能詞的跨段猜測。
+        const targetWordCount = (target.match(/[\p{L}\p{N}]+/gu) || []).length;
+        const shortSubtitlePasses = targetWordCount >= 5 && subtitleCoverage >= 0.78 && subtitleEvidence.matched >= 1;
+        const passes = exact || subtitlePasses || sourcePasses || shortSubtitlePasses;
         if (!passes) continue;
         matches.push({ sourceLine, score });
     }
