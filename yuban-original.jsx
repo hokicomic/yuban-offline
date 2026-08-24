@@ -5352,6 +5352,21 @@ const getKnowledgeAlignmentDirectionalScore = (subtitleText = "", candidateText 
     };
 };
 
+// A smart LRC cue can join two grammatical sentences without a full stop.  In
+// that case a source sentence may be a high-fidelity ordered segment of a much
+// longer cue.  This is intentionally stricter than the ordinary fuzzy path so
+// unrelated sentences sharing a name cannot be accepted.
+const getKnowledgeLongCueSourceSegmentMatch = (candidateText = "", subtitleText = "") => {
+    const candidateWords = normalizeKnowledgeAlignmentText(candidateText).match(/[\p{L}\p{N}]+/gu) || [];
+    const subtitleWords = normalizeKnowledgeAlignmentText(subtitleText).match(/[\p{L}\p{N}]+/gu) || [];
+    if (candidateWords.length < 6 || subtitleWords.length < candidateWords.length + 4) return null;
+    const reverseAlignment = getKnowledgeAlignmentDirectionalScore(candidateText, subtitleText);
+    const passes = reverseAlignment.targetCoverage >= 0.84 &&
+        reverseAlignment.orderedContentCoverage >= 0.80 &&
+        reverseAlignment.orderedLongestRun >= 3;
+    return passes ? reverseAlignment : null;
+};
+
 const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
     return findKnowledgeSubtitleMatches(content, subtitleText)[0] || null;
 };
@@ -5398,7 +5413,8 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
                 (Math.min(targetWords.length, candidateWords.length) >= 4 &&
                     (candidate.includes(target) || target.includes(candidate)));
             const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
-            const score = exact ? 1 : alignment.score;
+            const longCueSourceSegment = getKnowledgeLongCueSourceSegmentMatch(candidate, target);
+            const score = exact ? 1 : Math.max(alignment.score, longCueSourceSegment?.score || 0);
             if (score > bestObservedScore) {
                 bestObservedScore = score;
                 bestCandidatePreview = String(candidateRaw || "").trim().slice(0, 220);
@@ -5414,7 +5430,7 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
             const transcriptionRecoveryPasses = canFuzzyMatch && targetWords.length >= 6 &&
                 alignment.targetCoverage >= 0.50 && alignment.orderedContentCoverage >= 0.50 &&
                 alignment.orderedLongestRun >= 2;
-            if (exact || fuzzyPasses || transcriptionRecoveryPasses) {
+            if (exact || fuzzyPasses || transcriptionRecoveryPasses || longCueSourceSegment) {
                 bestScore = Math.max(bestScore, score);
             }
         }
@@ -5473,6 +5489,7 @@ const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = 
     if ((candidate === target && candidateWords.length >= 2) ||
         (Math.min(candidateWords.length, targetWords.length) >= 4 && (candidate.includes(target) || target.includes(candidate)))) return true;
     const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
+    const longCueSourceSegment = getKnowledgeLongCueSourceSegmentMatch(candidate, target);
     const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
     const fuzzyPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
         alignment.targetCoverage >= 0.70 && alignment.orderedMatched >= 2 &&
@@ -5483,7 +5500,7 @@ const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = 
     const shortDialogueCuePasses = targetWords.length >= 2 && targetWords.length <= 3 &&
         candidateWords.length >= 4 && candidate.startsWith(target) &&
         alignment.targetCoverage >= 0.90;
-    return fuzzyPasses || transcriptionRecoveryPasses || shortDialogueCuePasses;
+    return fuzzyPasses || transcriptionRecoveryPasses || shortDialogueCuePasses || Boolean(longCueSourceSegment);
 };
 
 const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") => {
