@@ -30,7 +30,7 @@ const AI_NOTES_CACHE_SCHEMA_VERSION = "20260305.6";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
 const PRESERVE_GEMINI_MARKDOWN_LAYOUT = true; // default: keep Gemini original paragraph/bold layout
 const FLASHCARD_MASTERY_FILE_NAME = "flashcard_mastery.json";
-const FLASHCARD_MASTERY_SCHEMA_VERSION = 1;
+const FLASHCARD_MASTERY_SCHEMA_VERSION = 2;
 const FLASHCARD_MASTERY_LOCAL_STORAGE_KEY = "flashcard_mastery";
 const FLASHCARD_MASTERY_AUTOSAVE_DEBOUNCE_MS = 1500;
 const FLASHCARD_MASTERY_FORCE_FLUSH_EVERY = 5;
@@ -231,6 +231,73 @@ function buildFlashCardId(card) {
     return "card_" + simpleStableHash(front);
 }
 
+const FLASHCARD_MASTERY_SNAPSHOT_MAX_BACK_CHARS = 8000;
+
+function normalizeFlashCardMasterySnapshot(rawSnapshot, fallbackHead = "") {
+    const raw = rawSnapshot && typeof rawSnapshot === "object" ? rawSnapshot : {};
+    const front = String(raw.front || fallbackHead || "").trim();
+    const back = String(raw.back || "").trim().slice(0, FLASHCARD_MASTERY_SNAPSHOT_MAX_BACK_CHARS);
+    if (!front || !back) return null;
+    return {
+        front,
+        back,
+        category: String(raw.category || "vocab").trim() || "vocab",
+        categoryLabel: String(raw.categoryLabel || "").trim(),
+        sourceNames: Array.from(new Set((Array.isArray(raw.sourceNames) ? raw.sourceNames : [raw.sourceName])
+            .map(value => String(value || "").trim())
+            .filter(Boolean))).slice(-3),
+        savedAt: String(raw.savedAt || "")
+    };
+}
+
+function buildFlashCardMasterySnapshot(card, sourceName = "") {
+    return normalizeFlashCardMasterySnapshot({
+        front: getFlashCardFrontText(card),
+        back: getFlashCardBackText(card),
+        category: card?.category,
+        categoryLabel: card?.categoryLabel,
+        sourceName,
+        savedAt: new Date().toISOString()
+    });
+}
+
+function getFlashCardMasterySnapshotQuality(snapshot) {
+    if (!snapshot) return -1;
+    // One canonical explanation per front: favour the more complete usable card,
+    // rather than retaining every AI-generated wording variant.
+    return String(snapshot.back || "").trim().length + (snapshot.categoryLabel ? 24 : 0);
+}
+
+function mergeFlashCardMasterySnapshot(existingSnapshot, incomingSnapshot) {
+    const existing = normalizeFlashCardMasterySnapshot(existingSnapshot);
+    const incoming = normalizeFlashCardMasterySnapshot(incomingSnapshot);
+    if (!existing) return incoming;
+    if (!incoming) return existing;
+    const preferred = getFlashCardMasterySnapshotQuality(incoming) > getFlashCardMasterySnapshotQuality(existing)
+        ? incoming
+        : existing;
+    return {
+        ...preferred,
+        sourceNames: Array.from(new Set([...(existing.sourceNames || []), ...(incoming.sourceNames || [])])).slice(-3),
+        savedAt: incoming.savedAt || existing.savedAt || ""
+    };
+}
+
+function buildFlashCardFromMasterySnapshot(entry, index = 0) {
+    const snapshot = normalizeFlashCardMasterySnapshot(entry?.snapshot, entry?.head);
+    if (!snapshot) return null;
+    return {
+        id: `mastery-${String(entry?.cardId || index)}`,
+        category: snapshot.category,
+        categoryLabel: snapshot.categoryLabel || QUIZ_FOCUS_TYPE_LABELS?.[snapshot.category] || snapshot.category,
+        front: snapshot.front,
+        back: snapshot.back,
+        frontSpeakText: extractFrontTermForSpeech(snapshot.front) || snapshot.front,
+        speakText: "",
+        backZhSpeakText: ""
+    };
+}
+
 function mergeFlashCardMasteryEntry(existing, incoming, options = {}) {
     if (!existing) return incoming;
     if (!incoming) return existing;
@@ -252,7 +319,8 @@ function mergeFlashCardMasteryEntry(existing, incoming, options = {}) {
         reviewCount: countValue("reviewCount"),
         lastResult: latest.lastResult || existing.lastResult || incoming.lastResult || "remembered",
         lastReviewedAt: latest.lastReviewedAt || existing.lastReviewedAt || incoming.lastReviewedAt || "",
-        discardedAt: [existing.discardedAt, incoming.discardedAt].filter(Boolean).sort().slice(-1)[0] || ""
+        discardedAt: [existing.discardedAt, incoming.discardedAt].filter(Boolean).sort().slice(-1)[0] || "",
+        snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, incoming.snapshot)
     };
 }
 
@@ -294,7 +362,8 @@ function normalizeFlashCardMasteryEntry(rawEntry, fallbackKey, nowIso) {
         reviewCount,
         lastResult,
         lastReviewedAt: lastReview ? String(lastReview) : "",
-        discardedAt: entry.discardedAt ? String(entry.discardedAt) : ""
+        discardedAt: entry.discardedAt ? String(entry.discardedAt) : "",
+        snapshot: normalizeFlashCardMasterySnapshot(entry.snapshot || entry.savedCard, head)
     };
 }
 
@@ -302,7 +371,7 @@ function normalizeFlashCardMasteryData(raw) {
     try {
         if (!raw || typeof raw !== "object") return createEmptyFlashCardMasteryData();
         const nowIso = new Date().toISOString();
-        const cardsSource = raw.schemaVersion === FLASHCARD_MASTERY_SCHEMA_VERSION && raw.cards && typeof raw.cards === "object"
+        const cardsSource = raw.cards && typeof raw.cards === "object"
             ? raw.cards
             : raw;
         const normalized = {
@@ -13220,6 +13289,30 @@ ${sourcePromptText}`;
                 throw new Error("知識點格式無法解析成 flash cards。");
             }
 
+            // Legacy mastery exports only contain front/head.  When one of those
+            // known cards appears again in any opened knowledge file, silently
+            // enrich it with the current canonical back; no extra answer click is
+            // required and unrelated unseen cards are not added to the history.
+            const previousMastery = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+            let enrichedCards = previousMastery.cards;
+            let didEnrichMastery = false;
+            for (const card of cards) {
+                const cardId = buildFlashCardId(card);
+                const existing = enrichedCards[cardId];
+                if (!existing) continue;
+                const snapshot = mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(card, sourceName));
+                if (JSON.stringify(snapshot) === JSON.stringify(existing.snapshot || null)) continue;
+                if (!didEnrichMastery) enrichedCards = { ...enrichedCards };
+                enrichedCards[cardId] = { ...existing, snapshot };
+                didEnrichMastery = true;
+            }
+            if (didEnrichMastery) {
+                const enrichedData = { ...previousMastery, updatedAt: new Date().toISOString(), cards: enrichedCards };
+                flashCardMasteryDataRef.current = enrichedData;
+                setFlashCardMasteryData(enrichedData);
+                scheduleFlashCardMasteryAutoSave(enrichedData);
+            }
+
             setFlashCards(cards);
             setFlashCardSourceName(sourceName || "知識點");
             setFlashCardNotice("");
@@ -16542,6 +16635,7 @@ ${userQ}`;
                     cardId,
                     head: String(getFlashCardFrontText(card) || existing.head || ""),
                     headNormalized: normalizeFlashCardText(getFlashCardFrontText(card) || existing.head || ""),
+                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(card, sourceName)),
                     rememberedCount: Math.max(0, Number(existing.rememberedCount || existing.level || 0)) + (remembered ? 1 : 0),
                     forgotCount: Math.max(0, Number(existing.forgotCount || existing.wrongCount || 0)) + (remembered ? 0 : 1),
                     reviewCount: Math.max(0, Number(existing.reviewCount || 0)) + 1,
@@ -16888,6 +16982,25 @@ ${userQ}`;
         setFlashCardIndex(0);
         setFlashCardFlipped(false);
     };
+    const openSavedFlashCardReview = () => {
+        if (flashCardAutoRun) stopFlashCardAutoRun();
+        const cards = Object.values(normalizeFlashCardMasteryData(flashCardMasteryDataRef.current).cards || {})
+            .filter(entry => !entry?.discardedAt)
+            .sort((a, b) => String(b?.lastReviewedAt || "").localeCompare(String(a?.lastReviewedAt || "")))
+            .map((entry, index) => buildFlashCardFromMasterySnapshot(entry, index))
+            .filter(Boolean);
+        if (cards.length === 0) {
+            setFlashCardNotice("目前的學習記錄尚無可重建的卡片內容。之後每次作答的卡片會自動存入；舊記錄需重新開啟來源知識檔後作答一次才能補齊。");
+            return;
+        }
+        setFlashCards(cards);
+        setFlashCardSourceName("已學習卡庫");
+        setFlashCardCategories(["all"]);
+        setFlashCardFilterMode("all");
+        setFlashCardIndex(0);
+        setFlashCardFlipped(false);
+        setFlashCardNotice(`已載入 ${cards.length} 張已學卡片。`);
+    };
 
     const handleFlashCardDiscard = () => {
         if (!currentFlashCard) return;
@@ -16906,6 +17019,7 @@ ${userQ}`;
                     cardId,
                     head: String(getFlashCardFrontText(currentFlashCard) || existing.head || ""),
                     headNormalized: normalizeFlashCardText(getFlashCardFrontText(currentFlashCard) || existing.head || ""),
+                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(currentFlashCard, flashCardSourceName)),
                     discardedAt: now
                 }
             }
@@ -18550,6 +18664,14 @@ ${userQ}`;
                                                                 </div>
                                                             )}
                                                         </div>
+                                                        <button
+                                                            type="button"
+                                                            onClick={openSavedFlashCardReview}
+                                                            className="px-2.5 py-1 rounded-full border border-violet-200 bg-violet-50 text-[11px] text-violet-700 font-bold hover:bg-violet-100"
+                                                            title="從學習記錄中直接載入已保存的 canonical cards"
+                                                        >
+                                                            歷史複習
+                                                        </button>
                                                         <div className="relative">
                                                             <button
                                                                 type="button"
