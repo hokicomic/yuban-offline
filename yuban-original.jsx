@@ -5314,6 +5314,27 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
     return matches.sort((a, b) => a.sourceLine - b.sourceLine);
 };
 
+// 電子書轉出的 TXT 常把整段文字放在同一行。行號只用來定位捲動；
+// 實際反白必須再依當前 LRC 拆成句子，避免整段一起反白。
+const splitKnowledgeLineIntoSentences = (value = "") => {
+    const source = String(value || "");
+    const parts = source.match(/[^\n.!?。！？]+(?:[.!?。！？]+(?:[”’"')\]\}]+)?|$)/gu) || [];
+    return parts.map(part => String(part || "")).filter(Boolean);
+};
+
+const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") => {
+    const candidate = normalizeKnowledgeAlignmentText(sentence);
+    const target = normalizeKnowledgeAlignmentText(subtitleText);
+    if (!candidate || !target || candidate.length < 4) return false;
+    if (candidate.includes(target) || target.includes(candidate)) return true;
+    const evidence = getKnowledgeAlignmentContentEvidence(candidate, target);
+    const reverseEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
+    const coverage = getKnowledgeAlignmentWordScore(candidate, target);
+    return (evidence.matched >= 2 && evidence.score >= 0.66) ||
+        (reverseEvidence.matched >= 2 && reverseEvidence.score >= 0.66) ||
+        (candidate.length >= 24 && coverage >= 0.78);
+};
+
 const getKnowledgeOriginalLinesForSync = (content = "") => {
     let inOriginal = false;
     return String(content || "").replace(/\r/g, "").split("\n").flatMap((raw, sourceLine) => {
@@ -5350,7 +5371,8 @@ const MarkdownView = ({
     knowledgeTermEntries = [],
     onKnowledgeTermClick = null,
     activeKnowledgeSourceLine = -1,
-    activeKnowledgeSourceLines = []
+    activeKnowledgeSourceLines = [],
+    activeKnowledgeSubtitleText = ""
 }) => {
     if (!content || typeof content !== 'string') return null;
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
@@ -5785,6 +5807,19 @@ const MarkdownView = ({
         return nodes.length > 0 ? nodes : source;
     };
 
+    const buildSentenceHighlightedKnowledgeNodes = (text, subtitleText, keyPrefix = "mdk-active") => {
+        const source = String(text || "");
+        const sentences = splitKnowledgeLineIntoSentences(source);
+        if (!sentences.length) return buildKnowledgeLinkedNodes(source, keyPrefix);
+        return sentences.map((sentence, index) => {
+            const children = buildKnowledgeLinkedNodes(sentence, `${keyPrefix}-${index}`);
+            if (!isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText)) {
+                return <React.Fragment key={`${keyPrefix}-${index}`}>{children}</React.Fragment>;
+            }
+            return <mark key={`${keyPrefix}-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{children}</mark>;
+        });
+    };
+
     const getSpeakMode = (text) => {
         const clean = text.trim();
         if (/(?:\n|<br\s*\/?>|例句?|例如|example|examples?)\s*[:：]/i.test(clean) || /\s+[\/／]\s+/.test(clean)) {
@@ -5942,15 +5977,18 @@ const MarkdownView = ({
                             .replace(/^#{2,6}\s+/, '');
 
                         const isActiveKnowledgeLine = seg.sourceLine === activeKnowledgeSourceLine || activeKnowledgeSourceLines.includes(seg.sourceLine);
+                        const useSentenceLevelHighlight = isActiveKnowledgeLine && String(activeKnowledgeSubtitleText || "").trim();
                         return (
                             <div
                                 key={i}
                                 data-knowledge-source-line={seg.sourceLine}
-                                className={`flex items-start gap-1 ${wrapClass} ${isActiveKnowledgeLine ? 'rounded-md bg-amber-100 ring-1 ring-amber-300 px-1 -mx-1' : ''}`}
+                                className={`flex items-start gap-1 ${wrapClass}`}
                             >
-                                {shouldLinkKnowledgeTerms ? (
+                                {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
-                                        {buildKnowledgeLinkedNodes(plainTextForLink, `mdk-${i}`)}
+                                        {useSentenceLevelHighlight
+                                            ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, activeKnowledgeSubtitleText, `mdk-active-${i}`)
+                                            : buildKnowledgeLinkedNodes(plainTextForLink, `mdk-${i}`)}
                                     </div>
                                 ) : (
                                     <div dangerouslySetInnerHTML={{ __html: html }} />
@@ -17386,6 +17424,7 @@ ${userQ}`;
                                                 knowledgeTermEntries={embeddedKnowledgeTermEntries}
                                                 onKnowledgeTermClick={handleKnowledgePreviewTermClick}
                                                 activeKnowledgeSourceLines={embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine)}
+                                                activeKnowledgeSubtitleText={subtitles[currentIndex]?.text || ""}
                                             />
                                         )}
                                     </div>
