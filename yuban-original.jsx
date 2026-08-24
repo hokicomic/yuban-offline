@@ -6298,6 +6298,9 @@ export default function GeminiPlayer() {
 
     // [NEW] Subtitle Font Size (Independent of Modal)
     const [subtitleFontSize, setSubtitleFontSize] = useState(24);
+    // The card has a deliberately compact fixed height.  This tracks a temporary
+    // smaller size only when the current subtitle would otherwise be clipped.
+    const [fittedSubtitleFontSize, setFittedSubtitleFontSize] = useState(16);
 
     // UI States
     const [isVideoMasked, setIsVideoMasked] = useState(true);
@@ -6518,6 +6521,8 @@ export default function GeminiPlayer() {
 
     const subtitlesRef = useRef(subtitles);
     useEffect(() => { subtitlesRef.current = subtitles; }, [subtitles]);
+    const subtitleCardRef = useRef(null);
+    const subtitleTextRef = useRef(null);
 
     const aiCacheRef = useRef(aiCache);
     useEffect(() => { aiCacheRef.current = aiCache; }, [aiCache]);
@@ -17071,6 +17076,34 @@ ${userQ}`;
     const isTopPanelDocumentMode = topPanelMode === 'document';
     const isTopPanelMediaMode = topPanelMode === 'media';
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
+    const subtitleDisplayText = subtitles[currentIndex]?.text || "Load File...";
+
+    // Reset to the user-selected size for a new subtitle, then reduce one pixel at
+    // a time only when the rendered text exceeds the compact card's usable height.
+    // Measuring the actual DOM handles different screen widths and CJK/Latin mixes.
+    useEffect(() => {
+        setFittedSubtitleFontSize(effectiveSubtitleFontSize);
+    }, [subtitleDisplayText, effectiveSubtitleFontSize]);
+    useEffect(() => {
+        const card = subtitleCardRef.current;
+        const text = subtitleTextRef.current;
+        if (!card || !text) return undefined;
+        const fitIfNeeded = () => {
+            const usableHeight = Math.max(0, card.clientHeight - 32); // p-4 top + bottom
+            if (text.scrollHeight > usableHeight + 1) {
+                setFittedSubtitleFontSize(previous => Math.max(12, previous - 1));
+            }
+        };
+        const frame = requestAnimationFrame(fitIfNeeded);
+        const observer = typeof ResizeObserver !== 'undefined'
+            ? new ResizeObserver(() => setFittedSubtitleFontSize(effectiveSubtitleFontSize))
+            : null;
+        observer?.observe(card);
+        return () => {
+            cancelAnimationFrame(frame);
+            observer?.disconnect();
+        };
+    }, [subtitleDisplayText, effectiveSubtitleFontSize, fittedSubtitleFontSize]);
 
     const loadEmbeddedKnowledgeTxtFile = useCallback(async (file, { markSelected = true } = {}) => {
         if (!file) throw new Error("找不到指定的文字檔。");
@@ -17641,8 +17674,8 @@ ${userQ}`;
                     <div className={`w-full flex flex-col gap-4 ${!mediaSrc ? 'opacity-50 pointer-events-none' : ''}`}>
                         {/* LARGE SUBTITLE CARD */}
                         <div className="relative group cursor-pointer" onClick={() => setIsSubtitleHidden(!isSubtitleHidden)}>
-                            <div className={`w-full rounded-xl p-4 text-center flex flex-col items-center justify-center select-none transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm' : 'bg-white border-gray-200 shadow-sm'} ${!isVideoMasked ? 'min-h-[10rem]' : 'min-h-[16rem]'}`}>
-                                <p className="font-bold text-gray-900 my-2 leading-snug" style={{ fontSize: `${effectiveSubtitleFontSize}px` }}>{subtitles[currentIndex]?.text || "Load File..."}</p>
+                            <div ref={subtitleCardRef} className={`w-full h-[7.5rem] sm:h-32 rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-hidden select-none transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm' : 'bg-white border-gray-200 shadow-sm'}`}>
+                                <p ref={subtitleTextRef} className="w-full font-bold text-gray-900 leading-snug" style={{ fontSize: `${fittedSubtitleFontSize}px` }}>{subtitleDisplayText}</p>
                             </div>
 
                             {/* SHADOWING PROGRESS BAR */}
