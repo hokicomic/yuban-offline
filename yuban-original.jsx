@@ -5381,7 +5381,7 @@ const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") 
 
 // 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
 // 避免遠處的模糊候選把播放游標推得過後，導致後面的真實句子被防回跳機制排除。
-const selectKnowledgeSubtitleMatchCluster = (matches = []) => {
+const selectKnowledgeSubtitleMatchCluster = (matches = [], expectedSourceLine = -1) => {
     const ordered = Array.isArray(matches) ? [...matches].sort((a, b) => a.sourceLine - b.sourceLine) : [];
     if (ordered.length <= 1) return ordered;
     const groups = [];
@@ -5395,7 +5395,7 @@ const selectKnowledgeSubtitleMatchCluster = (matches = []) => {
         group.push(match);
     }
     if (group.length) groups.push(group);
-    groups.sort((a, b) => {
+    const scoreGroup = (a, b) => {
         const aScore = a.reduce((sum, item) => sum + Number(item.score || 0), 0);
         const bScore = b.reduce((sum, item) => sum + Number(item.score || 0), 0);
         if (bScore !== aScore) return bScore - aScore;
@@ -5403,7 +5403,24 @@ const selectKnowledgeSubtitleMatchCluster = (matches = []) => {
         const bBest = Math.max(...b.map(item => Number(item.score || 0)));
         if (bBest !== aBest) return bBest - aBest;
         return a[0].sourceLine - b[0].sourceLine;
-    });
+    };
+    // 音檔與 LRC 是順序播放：已有游標時，不能用全文最高分的遠處重複句
+    // 蓋過目前段落。優先找游標所在或剛往後的高可信群組。
+    if (Number.isInteger(expectedSourceLine) && expectedSourceLine >= 0) {
+        const forwardGroups = groups.filter(group => group.some(match => match.sourceLine >= expectedSourceLine));
+        const strongForwardGroups = forwardGroups.filter(group => Math.max(...group.map(match => Number(match.score || 0))) >= 0.78);
+        const candidates = strongForwardGroups.length ? strongForwardGroups : forwardGroups;
+        if (candidates.length) {
+            candidates.sort((a, b) => {
+                const aLine = a.find(match => match.sourceLine >= expectedSourceLine)?.sourceLine ?? Infinity;
+                const bLine = b.find(match => match.sourceLine >= expectedSourceLine)?.sourceLine ?? Infinity;
+                if (aLine !== bLine) return aLine - bLine;
+                return scoreGroup(a, b);
+            });
+            return candidates[0];
+        }
+    }
+    groups.sort(scoreGroup);
     return groups[0] || [];
 };
 
@@ -15705,9 +15722,6 @@ ${userQ}`;
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
-        const diagnostics = {};
-        const allRawMatches = findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics);
-        const rawMatches = selectKnowledgeSubtitleMatchCluster(allRawMatches);
         const progress = embeddedKnowledgePlaybackProgressRef.current;
         let documentReset = false;
         if (progress.documentText !== embeddedKnowledgeText) {
@@ -15726,6 +15740,12 @@ ${userQ}`;
         const progressBefore = { subtitleIndex: progress.subtitleIndex, maxSourceLine: progress.maxSourceLine };
         if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
         const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
+        const diagnostics = {};
+        const allRawMatches = findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics);
+        const rawMatches = selectKnowledgeSubtitleMatchCluster(
+            allRawMatches,
+            isForwardPlayback ? progress.maxSourceLine : -1
+        );
         const matches = isForwardPlayback && progress.maxSourceLine >= 0
             ? rawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
             : rawMatches;
