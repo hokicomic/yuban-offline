@@ -5282,23 +5282,32 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
     return findKnowledgeSubtitleMatches(content, subtitleText)[0] || null;
 };
 
-const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
+const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnostics = null) => {
     const target = normalizeKnowledgeAlignmentText(subtitleText);
-    if (!target || target.length < 6) return [];
+    if (!target || target.length < 6) {
+        if (diagnostics) Object.assign(diagnostics, { target, skipped: "subtitle_too_short", matchedLines: [], nearLines: [] });
+        return [];
+    }
     const lines = String(content || "").replace(/\r/g, "").split("\n");
     let inOriginal = false;
     const matches = [];
+    const nearLines = [];
+    let originalMarkerCount = 0;
+    let eligibleLineCount = 0;
     for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
         const raw = String(lines[sourceLine] || "");
         const trimmed = raw.trim();
-        if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(trimmed) || /^\[\s*(?:原文|original)(?:\s*\/\s*(?:原文|original))?\s*\]$/i.test(trimmed) || /^@ORIG@\s*$/i.test(trimmed)) { inOriginal = true; continue; }
+        if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(trimmed) || /^\[\s*(?:原文|original)(?:\s*\/\s*(?:原文|original))?\s*\]$/i.test(trimmed) || /^@ORIG@\s*$/i.test(trimmed)) { originalMarkerCount += 1; inOriginal = true; continue; }
         if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
         // 僅能以使用者提供的原文 scaffold 對位；不能把 LRC 猜測配到 AI 例句或說明。
         if (!inOriginal || !trimmed) continue;
         // 電子書常把多句放在同一行。逐句評分可避免整段的共同功能詞
         // 意外命中遠處段落，並讓短 LRC 對到段落內真正的那一句。
+        eligibleLineCount += 1;
         const candidates = [raw, ...splitKnowledgeLineIntoSentences(raw)];
         let bestScore = 0;
+        let bestObservedScore = 0;
+        let bestCandidatePreview = "";
         for (const candidateRaw of candidates) {
             const candidate = normalizeKnowledgeAlignmentText(candidateRaw);
             if (candidate.length < 4) continue;
@@ -5308,6 +5317,10 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
             const subtitleEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
             const sourceEvidence = getKnowledgeAlignmentContentEvidence(candidate, target);
             const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
+            if (score > bestObservedScore) {
+                bestObservedScore = score;
+                bestCandidatePreview = String(candidateRaw || "").trim().slice(0, 220);
+            }
             const subtitlePasses = subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
             const sourcePasses = sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
             const targetWordCount = (target.match(/[\p{L}\p{N}]+/gu) || []).length;
@@ -5316,10 +5329,24 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "") => {
                 bestScore = Math.max(bestScore, score);
             }
         }
+        if (bestScore > 0 || bestObservedScore >= 0.45) {
+            nearLines.push({ sourceLine, accepted: bestScore > 0, acceptedScore: bestScore, observedScore: bestObservedScore, preview: bestCandidatePreview });
+        }
         if (bestScore <= 0) continue;
         matches.push({ sourceLine, score: bestScore });
     }
-    return matches.sort((a, b) => a.sourceLine - b.sourceLine);
+    const sortedMatches = matches.sort((a, b) => a.sourceLine - b.sourceLine);
+    if (diagnostics) {
+        Object.assign(diagnostics, {
+            target,
+            lineCount: lines.length,
+            originalMarkerCount,
+            eligibleLineCount,
+            matchedLines: sortedMatches,
+            nearLines: nearLines.sort((a, b) => b.observedScore - a.observedScore).slice(0, 16)
+        });
+    }
+    return sortedMatches;
 };
 
 // 電子書轉出的 TXT 常把整段文字放在同一行。行號只用來定位捲動；
@@ -6220,6 +6247,7 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
     const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(50);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
+    const [embeddedKnowledgeAlignmentLogNotice, setEmbeddedKnowledgeAlignmentLogNotice] = useState("");
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
     const [isHeaderVisible, setIsHeaderVisible] = useState(true);
@@ -6473,6 +6501,8 @@ export default function GeminiPlayer() {
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
     const embeddedKnowledgePlaybackProgressRef = useRef({ documentText: "", subtitleIndex: -1, maxSourceLine: -1 });
+    const embeddedKnowledgeAlignmentLogRef = useRef([]);
+    const embeddedKnowledgeAlignmentLogSignatureRef = useRef("");
     const knowledgePreviewPopupPanelRef = useRef(null);
     const knowledgePreviewPopupDragRef = useRef(null);
     const knowledgePreviewSplitDragRef = useRef(null);
@@ -15666,29 +15696,80 @@ ${userQ}`;
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
-        const rawMatches = selectKnowledgeSubtitleMatchCluster(findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText));
+        const diagnostics = {};
+        const allRawMatches = findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics);
+        const rawMatches = selectKnowledgeSubtitleMatchCluster(allRawMatches);
         const progress = embeddedKnowledgePlaybackProgressRef.current;
+        let documentReset = false;
         if (progress.documentText !== embeddedKnowledgeText) {
             progress.documentText = embeddedKnowledgeText;
             progress.subtitleIndex = -1;
             progress.maxSourceLine = -1;
+            embeddedKnowledgeAlignmentLogRef.current = [];
+            embeddedKnowledgeAlignmentLogSignatureRef.current = "";
+            documentReset = true;
         }
         // 正常往後播放時，不能因為模糊匹配回頭標記已讀原文。
         // 只有兩個有效 LRC 索引真的倒退時，才視為使用者回播。播放時短暫的 -1
         // 不能清掉防回頭保護，否則下一段會重新選中先前原文並把視窗捲上去。
         const hasCurrentSubtitleIndex = Number.isInteger(currentIndex) && currentIndex >= 0;
         const hadSubtitleIndex = Number.isInteger(progress.subtitleIndex) && progress.subtitleIndex >= 0;
+        const progressBefore = { subtitleIndex: progress.subtitleIndex, maxSourceLine: progress.maxSourceLine };
         if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
         const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
         const matches = isForwardPlayback && progress.maxSourceLine >= 0
             ? rawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
             : rawMatches;
+        const rejectedByCursor = rawMatches.filter(match => !matches.some(kept => kept.sourceLine === match.sourceLine));
         if (matches.length > 0) {
             progress.maxSourceLine = Math.max(...matches.map(match => match.sourceLine));
         }
         if (hasCurrentSubtitleIndex) progress.subtitleIndex = currentIndex;
+        if (hasCurrentSubtitleIndex) {
+            const signature = `${embeddedKnowledgeText.length}:${currentIndex}:${subtitleText}`;
+            if (embeddedKnowledgeAlignmentLogSignatureRef.current !== signature) {
+                embeddedKnowledgeAlignmentLogSignatureRef.current = signature;
+                const entry = {
+                    at: new Date().toISOString(),
+                    subtitleIndex: currentIndex,
+                    subtitleText: String(subtitleText || ""),
+                    documentReset,
+                    progressBefore,
+                    isForwardPlayback,
+                    allRawMatches,
+                    selectedCluster: rawMatches,
+                    rejectedByCursor,
+                    finalMatches: matches,
+                    progressAfter: { subtitleIndex: progress.subtitleIndex, maxSourceLine: progress.maxSourceLine },
+                    diagnostics
+                };
+                embeddedKnowledgeAlignmentLogRef.current = [...embeddedKnowledgeAlignmentLogRef.current, entry].slice(-120);
+                console.info("[Yuban alignment]", entry);
+            }
+        }
         return matches;
     }, [embeddedKnowledgeText, subtitles, currentIndex]);
+    const copyEmbeddedKnowledgeAlignmentLog = useCallback(async () => {
+        const entries = embeddedKnowledgeAlignmentLogRef.current || [];
+        const text = JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
+        if (!entries.length) {
+            setEmbeddedKnowledgeAlignmentLogNotice("尚未播放到可記錄的 LRC 句子");
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            setEmbeddedKnowledgeAlignmentLogNotice(`已複製 ${entries.length} 筆對位紀錄`);
+        } catch (_err) {
+            const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "yuban-alignment-debug.json";
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setEmbeddedKnowledgeAlignmentLogNotice("已下載對位紀錄 JSON");
+        }
+        setTimeout(() => setEmbeddedKnowledgeAlignmentLogNotice(""), 5000);
+    }, []);
     useEffect(() => {
         if (topPanelMode !== 'document' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
         const timer = setTimeout(() => {
@@ -17410,6 +17491,15 @@ ${userQ}`;
                                     >
                                         另選文件
                                     </button>
+                                    <button
+                                        type="button"
+                                        onClick={copyEmbeddedKnowledgeAlignmentLog}
+                                        className="px-2.5 py-1.5 text-xs rounded-full border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 shrink-0"
+                                        title="複製目前文件與 LRC 的逐句對位診斷；若剪貼簿不可用則下載 JSON"
+                                    >
+                                        對位Log
+                                    </button>
+                                    {embeddedKnowledgeAlignmentLogNotice && <span className="text-[10px] text-violet-700 shrink-0">{embeddedKnowledgeAlignmentLogNotice}</span>}
                                     <div className="flex items-center gap-2 shrink-0">
                                         <span className="text-[11px] text-gray-500">高度</span>
                                         <input
