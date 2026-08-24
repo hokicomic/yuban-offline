@@ -5289,13 +5289,24 @@ const getKnowledgeAlignmentDirectionalScore = (subtitleText = "", candidateText 
     const candidateContent = contentWords(candidateText);
     let candidateCursor = 0;
     let orderedMatched = 0;
-    for (const word of targetContent) {
+    let orderedLongestRun = 0;
+    let orderedRun = 0;
+    let previousTargetIndex = -2;
+    let previousCandidateIndex = -2;
+    for (let targetIndex = 0; targetIndex < targetContent.length; targetIndex += 1) {
+        const word = targetContent[targetIndex];
         let foundAt = -1;
         for (let i = candidateCursor; i < candidateContent.length; i += 1) {
             if (areKnowledgeAlignmentWordsEquivalent(word, candidateContent[i])) { foundAt = i; break; }
         }
         if (foundAt >= 0) {
             orderedMatched += 1;
+            orderedRun = targetIndex === previousTargetIndex + 1 && foundAt === previousCandidateIndex + 1
+                ? orderedRun + 1
+                : 1;
+            orderedLongestRun = Math.max(orderedLongestRun, orderedRun);
+            previousTargetIndex = targetIndex;
+            previousCandidateIndex = foundAt;
             candidateCursor = foundAt + 1;
         }
     }
@@ -5305,6 +5316,7 @@ const getKnowledgeAlignmentDirectionalScore = (subtitleText = "", candidateText 
         candidateWordCount: candidateWords.length,
         targetCoverage,
         orderedMatched,
+        orderedLongestRun,
         orderedContentTotal: targetContent.length,
         orderedContentCoverage,
         score: (targetCoverage * 0.35) + (orderedContentCoverage * 0.65)
@@ -5367,7 +5379,13 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
             const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
             const fuzzyPasses = canFuzzyMatch && alignment.targetCoverage >= 0.70 &&
                 alignment.orderedMatched >= 2 && alignment.orderedContentCoverage >= orderThreshold;
-            if (exact || fuzzyPasses) {
+            // ASR occasionally mangles a name or a verb, but a consecutive
+            // two-word content phrase (for example "following facts") remains
+            // strong evidence of the next spoken sentence.
+            const transcriptionRecoveryPasses = canFuzzyMatch && targetWords.length >= 6 &&
+                alignment.targetCoverage >= 0.50 && alignment.orderedContentCoverage >= 0.50 &&
+                alignment.orderedLongestRun >= 2;
+            if (exact || fuzzyPasses || transcriptionRecoveryPasses) {
                 bestScore = Math.max(bestScore, score);
             }
         }
@@ -5399,9 +5417,9 @@ const splitKnowledgeLineIntoSentences = (value = "") => {
     return parts.map(part => String(part || "")).filter(Boolean);
 };
 
-const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") => {
+const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = "") => {
     const candidate = normalizeKnowledgeAlignmentText(sentence);
-    const target = normalizeKnowledgeAlignmentText(subtitleText);
+    const target = normalizeKnowledgeAlignmentText(subtitlePart);
     if (!candidate || !target || candidate.length < 4) return false;
     const candidateWords = candidate.match(/[\p{L}\p{N}]+/gu) || [];
     const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
@@ -5409,9 +5427,24 @@ const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") 
         (Math.min(candidateWords.length, targetWords.length) >= 4 && (candidate.includes(target) || target.includes(candidate)))) return true;
     const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
     const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
-    return Math.min(candidateWords.length, targetWords.length) >= 4 &&
+    const fuzzyPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
         alignment.targetCoverage >= 0.70 && alignment.orderedMatched >= 2 &&
         alignment.orderedContentCoverage >= orderThreshold;
+    const transcriptionRecoveryPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
+        targetWords.length >= 6 && alignment.targetCoverage >= 0.50 &&
+        alignment.orderedContentCoverage >= 0.50 && alignment.orderedLongestRun >= 2;
+    return fuzzyPasses || transcriptionRecoveryPasses;
+};
+
+const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") => {
+    // Smart LRC can contain several spoken sentences in one cue.  Compare each
+    // source sentence to each cue sentence separately: using the entire cue here
+    // made a short final sentence dominate and left its earlier neighbours plain.
+    const subtitleParts = splitKnowledgeLineIntoSentences(subtitleText)
+        .map(part => String(part || "").trim())
+        .filter(Boolean);
+    const candidates = subtitleParts.length ? subtitleParts : [subtitleText];
+    return candidates.some(part => isKnowledgeSentenceMatchedBySubtitlePart(sentence, part));
 };
 
 // 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
