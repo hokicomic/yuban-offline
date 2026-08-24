@@ -5284,6 +5284,7 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
 
 const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnostics = null) => {
     const target = normalizeKnowledgeAlignmentText(subtitleText);
+    const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
     if (!target || target.length < 6) {
         if (diagnostics) Object.assign(diagnostics, { target, skipped: "subtitle_too_short", matchedLines: [], nearLines: [] });
         return [];
@@ -5311,7 +5312,12 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
         for (const candidateRaw of candidates) {
             const candidate = normalizeKnowledgeAlignmentText(candidateRaw);
             if (candidate.length < 4) continue;
-            const exact = candidate.includes(target) || target.includes(candidate);
+            const candidateWords = candidate.match(/[\p{L}\p{N}]+/gu) || [];
+            // 名稱或短片語（例如 "Miss Mary Marvell"）常會出現在遠處段落。
+            // 短句只可完全相等；至少四個詞才允許一方包含另一方。
+            const exact = (candidate === target && candidateWords.length >= 2) ||
+                (Math.min(targetWords.length, candidateWords.length) >= 4 &&
+                    (candidate.includes(target) || target.includes(candidate)));
             const subtitleCoverage = getKnowledgeAlignmentWordScore(target, candidate);
             const sourceCoverage = getKnowledgeAlignmentWordScore(candidate, target);
             const subtitleEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
@@ -5321,10 +5327,10 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
                 bestObservedScore = score;
                 bestCandidatePreview = String(candidateRaw || "").trim().slice(0, 220);
             }
-            const subtitlePasses = subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
-            const sourcePasses = sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
-            const targetWordCount = (target.match(/[\p{L}\p{N}]+/gu) || []).length;
-            const shortSubtitlePasses = targetWordCount >= 5 && subtitleCoverage >= 0.78 && subtitleEvidence.matched >= 1;
+            const canFuzzyMatch = Math.min(targetWords.length, candidateWords.length) >= 4;
+            const subtitlePasses = canFuzzyMatch && subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
+            const sourcePasses = canFuzzyMatch && sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
+            const shortSubtitlePasses = canFuzzyMatch && targetWords.length >= 5 && subtitleCoverage >= 0.78 && subtitleEvidence.matched >= 1;
             if (exact || subtitlePasses || sourcePasses || shortSubtitlePasses) {
                 bestScore = Math.max(bestScore, score);
             }
@@ -5361,7 +5367,10 @@ const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") 
     const candidate = normalizeKnowledgeAlignmentText(sentence);
     const target = normalizeKnowledgeAlignmentText(subtitleText);
     if (!candidate || !target || candidate.length < 4) return false;
-    if (candidate.includes(target) || target.includes(candidate)) return true;
+    const candidateWords = candidate.match(/[\p{L}\p{N}]+/gu) || [];
+    const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
+    if ((candidate === target && candidateWords.length >= 2) ||
+        (Math.min(candidateWords.length, targetWords.length) >= 4 && (candidate.includes(target) || target.includes(candidate)))) return true;
     const evidence = getKnowledgeAlignmentContentEvidence(candidate, target);
     const reverseEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
     const coverage = getKnowledgeAlignmentWordScore(candidate, target);
