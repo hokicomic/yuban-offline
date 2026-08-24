@@ -5237,25 +5237,26 @@ const normalizeKnowledgeAlignmentText = (value = "") => String(value || "")
     .replace(/[^\p{L}\p{N}\u3400-\u9fff]+/gu, " ")
     .trim();
 
+const areKnowledgeAlignmentWordsEquivalent = (target = "", source = "") => {
+    if (target === source) return true;
+    if (target.length < 5 || source.length < 5) return false;
+    if (target[0] !== source[0] || Math.abs(target.length - source.length) > 1) return false;
+    let mismatches = 0;
+    for (let i = 0; i < Math.min(target.length, source.length); i += 1) {
+        if (target[i] !== source[i]) mismatches += 1;
+        if (mismatches > 1) return false;
+    }
+    return true;
+};
+
 const getKnowledgeAlignmentWordScore = (needle = "", haystack = "") => {
     const targetWords = normalizeKnowledgeAlignmentText(needle).match(/[\p{L}\p{N}]+/gu) || [];
     const sourceWords = normalizeKnowledgeAlignmentText(haystack).match(/[\p{L}\p{N}]+/gu) || [];
     if (targetWords.length === 0 || sourceWords.length === 0) return 0;
-    const closeEnough = (target, source) => {
-        if (target === source) return true;
-        if (target.length < 5 || source.length < 5) return false;
-        if (target[0] !== source[0] || Math.abs(target.length - source.length) > 1) return false;
-        let mismatches = 0;
-        for (let i = 0; i < Math.min(target.length, source.length); i += 1) {
-            if (target[i] !== source[i]) mismatches += 1;
-            if (mismatches > 1) return false;
-        }
-        return true;
-    };
     let matched = 0;
     for (const word of targetWords) {
         if (word.length < 2) continue;
-        if (sourceWords.some(candidate => closeEnough(word, candidate))) matched += 1;
+        if (sourceWords.some(candidate => areKnowledgeAlignmentWordsEquivalent(word, candidate))) matched += 1;
     }
     return matched / Math.max(1, targetWords.filter(word => word.length >= 2).length);
 };
@@ -5276,6 +5277,38 @@ const getKnowledgeAlignmentContentEvidence = (needle = "", haystack = "") => {
     if (targetWords.length === 0 || sourceWords.length === 0) return { matched: 0, total: targetWords.length, score: 0 };
     const matched = targetWords.filter(word => sourceWords.includes(word)).length;
     return { matched, total: targetWords.length, score: matched / targetWords.length };
+};
+
+const getKnowledgeAlignmentDirectionalScore = (subtitleText = "", candidateText = "") => {
+    const contentWords = (value) => (normalizeKnowledgeAlignmentText(value).match(/[\p{L}\p{N}]+/gu) || [])
+        .filter(word => /^\d+$/.test(word) || (word.length >= 3 && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word)));
+    const targetWords = normalizeKnowledgeAlignmentText(subtitleText).match(/[\p{L}\p{N}]+/gu) || [];
+    const candidateWords = normalizeKnowledgeAlignmentText(candidateText).match(/[\p{L}\p{N}]+/gu) || [];
+    const targetCoverage = getKnowledgeAlignmentWordScore(subtitleText, candidateText);
+    const targetContent = contentWords(subtitleText);
+    const candidateContent = contentWords(candidateText);
+    let candidateCursor = 0;
+    let orderedMatched = 0;
+    for (const word of targetContent) {
+        let foundAt = -1;
+        for (let i = candidateCursor; i < candidateContent.length; i += 1) {
+            if (areKnowledgeAlignmentWordsEquivalent(word, candidateContent[i])) { foundAt = i; break; }
+        }
+        if (foundAt >= 0) {
+            orderedMatched += 1;
+            candidateCursor = foundAt + 1;
+        }
+    }
+    const orderedContentCoverage = targetContent.length ? orderedMatched / targetContent.length : targetCoverage;
+    return {
+        targetWordCount: targetWords.length,
+        candidateWordCount: candidateWords.length,
+        targetCoverage,
+        orderedMatched,
+        orderedContentTotal: targetContent.length,
+        orderedContentCoverage,
+        score: (targetCoverage * 0.35) + (orderedContentCoverage * 0.65)
+    };
 };
 
 const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
@@ -5305,10 +5338,15 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
         // 電子書常把多句放在同一行。逐句評分可避免整段的共同功能詞
         // 意外命中遠處段落，並讓短 LRC 對到段落內真正的那一句。
         eligibleLineCount += 1;
-        const candidates = [raw, ...splitKnowledgeLineIntoSentences(raw)];
+        const sentenceCandidates = splitKnowledgeLineIntoSentences(raw);
+        // 單句 LRC 必須只和段落內的單句比較；把整段也放進候選會讓遠處句子
+        // 因為「包含」關係被誤判為精確符合。LRC 本身含多句時才保留整段候選。
+        const subtitleSentenceCount = splitKnowledgeLineIntoSentences(subtitleText).filter(Boolean).length;
+        const candidates = subtitleSentenceCount > 1 ? [raw, ...sentenceCandidates] : sentenceCandidates;
         let bestScore = 0;
         let bestObservedScore = 0;
         let bestCandidatePreview = "";
+        let bestObservedAlignment = null;
         for (const candidateRaw of candidates) {
             const candidate = normalizeKnowledgeAlignmentText(candidateRaw);
             if (candidate.length < 4) continue;
@@ -5318,25 +5356,23 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
             const exact = (candidate === target && candidateWords.length >= 2) ||
                 (Math.min(targetWords.length, candidateWords.length) >= 4 &&
                     (candidate.includes(target) || target.includes(candidate)));
-            const subtitleCoverage = getKnowledgeAlignmentWordScore(target, candidate);
-            const sourceCoverage = getKnowledgeAlignmentWordScore(candidate, target);
-            const subtitleEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
-            const sourceEvidence = getKnowledgeAlignmentContentEvidence(candidate, target);
-            const score = exact ? 1 : Math.max(subtitleCoverage, sourceCoverage);
+            const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
+            const score = exact ? 1 : alignment.score;
             if (score > bestObservedScore) {
                 bestObservedScore = score;
                 bestCandidatePreview = String(candidateRaw || "").trim().slice(0, 220);
+                bestObservedAlignment = alignment;
             }
             const canFuzzyMatch = Math.min(targetWords.length, candidateWords.length) >= 4;
-            const subtitlePasses = canFuzzyMatch && subtitleEvidence.matched >= 3 && subtitleEvidence.score >= 0.55;
-            const sourcePasses = canFuzzyMatch && sourceEvidence.matched >= 3 && sourceEvidence.score >= 0.60;
-            const shortSubtitlePasses = canFuzzyMatch && targetWords.length >= 5 && subtitleCoverage >= 0.78 && subtitleEvidence.matched >= 1;
-            if (exact || subtitlePasses || sourcePasses || shortSubtitlePasses) {
+            const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
+            const fuzzyPasses = canFuzzyMatch && alignment.targetCoverage >= 0.70 &&
+                alignment.orderedMatched >= 2 && alignment.orderedContentCoverage >= orderThreshold;
+            if (exact || fuzzyPasses) {
                 bestScore = Math.max(bestScore, score);
             }
         }
         if (bestScore > 0 || bestObservedScore >= 0.45) {
-            nearLines.push({ sourceLine, accepted: bestScore > 0, acceptedScore: bestScore, observedScore: bestObservedScore, preview: bestCandidatePreview });
+            nearLines.push({ sourceLine, accepted: bestScore > 0, acceptedScore: bestScore, observedScore: bestObservedScore, preview: bestCandidatePreview, alignment: bestObservedAlignment });
         }
         if (bestScore <= 0) continue;
         matches.push({ sourceLine, score: bestScore });
@@ -5371,12 +5407,11 @@ const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") 
     const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
     if ((candidate === target && candidateWords.length >= 2) ||
         (Math.min(candidateWords.length, targetWords.length) >= 4 && (candidate.includes(target) || target.includes(candidate)))) return true;
-    const evidence = getKnowledgeAlignmentContentEvidence(candidate, target);
-    const reverseEvidence = getKnowledgeAlignmentContentEvidence(target, candidate);
-    const coverage = getKnowledgeAlignmentWordScore(candidate, target);
-    return (evidence.matched >= 2 && evidence.score >= 0.66) ||
-        (reverseEvidence.matched >= 2 && reverseEvidence.score >= 0.66) ||
-        (candidate.length >= 24 && coverage >= 0.78);
+    const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
+    const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
+    return Math.min(candidateWords.length, targetWords.length) >= 4 &&
+        alignment.targetCoverage >= 0.70 && alignment.orderedMatched >= 2 &&
+        alignment.orderedContentCoverage >= orderThreshold;
 };
 
 // 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
