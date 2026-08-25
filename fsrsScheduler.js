@@ -1,7 +1,7 @@
 import { createEmptyCard, fsrs, Rating, State } from 'ts-fsrs';
 
 export const FSRS_SCHEMA_VERSION = 3;
-export const DEFAULT_FSRS_CONFIG = Object.freeze({ requestRetention: 0.90, maximumInterval: 36500, legacyCalibrationPerDay: 20, newCardsPerDay: 20 });
+export const DEFAULT_FSRS_CONFIG = Object.freeze({ requestRetention: 0.90, maximumInterval: 36500, legacyCalibrationPerDay: 20, newCardsPerDay: 20, remindersEnabled: false });
 export const FSRS_RATINGS = Object.freeze({ Again: Rating.Again, Hard: Rating.Hard, Good: Rating.Good, Easy: Rating.Easy });
 
 const ISO_FIELDS = new Set(['due', 'last_review', 'review']);
@@ -41,7 +41,8 @@ export function normalizeFsrsConfig(raw) {
     requestRetention: Math.min(0.99, Math.max(0.80, Number.isFinite(retention) ? retention : DEFAULT_FSRS_CONFIG.requestRetention)),
     maximumInterval: Math.min(36500, Math.max(1, Math.round(Number.isFinite(maximumInterval) ? maximumInterval : DEFAULT_FSRS_CONFIG.maximumInterval))),
     legacyCalibrationPerDay: Math.min(100, Math.max(0, Math.round(Number(raw?.legacyCalibrationPerDay ?? DEFAULT_FSRS_CONFIG.legacyCalibrationPerDay) || 0))),
-    newCardsPerDay: Math.min(100, Math.max(0, Math.round(Number(raw?.newCardsPerDay ?? DEFAULT_FSRS_CONFIG.newCardsPerDay) || 0)))
+    newCardsPerDay: Math.min(100, Math.max(0, Math.round(Number(raw?.newCardsPerDay ?? DEFAULT_FSRS_CONFIG.newCardsPerDay) || 0))),
+    remindersEnabled: Boolean(raw?.remindersEnabled)
   };
 }
 

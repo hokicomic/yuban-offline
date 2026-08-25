@@ -6603,6 +6603,7 @@ export default function GeminiPlayer() {
     const [flashCardReviewMenuOpen, setFlashCardReviewMenuOpen] = useState(false);
     const [flashCardPlaybackMenuOpen, setFlashCardPlaybackMenuOpen] = useState(false);
     const [flashCardWaitingFeedback, setFlashCardWaitingFeedback] = useState(false);
+    const [fsrsReminderTick, setFsrsReminderTick] = useState(0);
 
     useEffect(() => {
         saveFlashCardMasteryToLocalStorage(flashCardMasteryData);
@@ -6787,6 +6788,7 @@ export default function GeminiPlayer() {
     const flashCardMasterySaveTimerRef = useRef(null);
     const flashCardMasteryDirtyRef = useRef(false);
     const flashCardMasteryFeedbackCountSinceFlushRef = useRef(0);
+    const fsrsReminderLastDueRef = useRef(0);
 
     useEffect(() => { flashCardMasteryDataRef.current = flashCardMasteryData; }, [flashCardMasteryData]);
     useEffect(() => { flashCardMasteryDirHandleRef.current = flashCardMasteryDirHandle; }, [flashCardMasteryDirHandle]);
@@ -15687,7 +15689,21 @@ ${userQ}`;
         });
         (data.reviewLogs || []).forEach(log => { if (new Date(log.reviewedAt || log?.log?.review || 0).getTime() >= startOfToday) { stats.reviewedToday += 1; if (stats[log.rating] !== undefined) stats[log.rating] += 1; } });
         return stats;
-    }, [flashCardMasteryData]);
+    }, [flashCardMasteryData, fsrsReminderTick]);
+    useEffect(() => {
+        if (!flashCardMasteryData?.fsrsConfig?.remindersEnabled) return undefined;
+        const timer = window.setInterval(() => setFsrsReminderTick(Date.now()), 30000);
+        return () => window.clearInterval(timer);
+    }, [flashCardMasteryData?.fsrsConfig?.remindersEnabled]);
+    useEffect(() => {
+        const enabled = Boolean(flashCardMasteryData?.fsrsConfig?.remindersEnabled);
+        const due = fsrsTodayStats.due;
+        if (!enabled || due < 1) { fsrsReminderLastDueRef.current = 0; return; }
+        if (fsrsReminderLastDueRef.current === due) return;
+        fsrsReminderLastDueRef.current = due;
+        setFlashCardNotice(`FSRS 提醒：目前有 ${due} 張卡已到期，可開啟「今日 FSRS 複習」。`);
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') new Notification('語伴 FSRS 複習提醒', { body: `目前有 ${due} 張卡已到期。` });
+    }, [flashCardMasteryData?.fsrsConfig?.remindersEnabled, fsrsTodayStats.due]);
     const flashCardKnowledgeTermEntries = useMemo(() => {
         const normalizeMatchTerm = (rawFront = "") => {
             let s = cleanQuizDisplayText(String(rawFront || ""));
@@ -18770,6 +18786,20 @@ ${userQ}`;
                                                                 {[0, 10, 20, 40, 60, 100].map(value => <option key={value} value={value}>{value}</option>)}
                                                             </select>/日
                                                         </label>
+                                                        <button type="button" onClick={async () => {
+                                                            const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+                                                            let enabled = !current.fsrsConfig.remindersEnabled;
+                                                            if (enabled) {
+                                                                if (typeof Notification === 'undefined') { setFlashCardNotice('此瀏覽器不支援系統通知。'); return; }
+                                                                const permission = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission();
+                                                                if (permission !== 'granted') { setFlashCardNotice('尚未授權通知；可在瀏覽器網站設定中允許通知後再試。'); return; }
+                                                            }
+                                                            const next = { ...current, updatedAt: new Date().toISOString(), fsrsConfig: normalizeFsrsConfig({ ...current.fsrsConfig, remindersEnabled: enabled }) };
+                                                            flashCardMasteryDataRef.current = next; setFlashCardMasteryData(next); scheduleFlashCardMasteryAutoSave(next);
+                                                            setFlashCardNotice(enabled ? '已開啟 FSRS 到期提醒（頁面必須保持開啟）。' : '已關閉 FSRS 到期提醒。');
+                                                        }} className={`px-2 py-1 rounded-full border text-[11px] font-semibold ${flashCardMasteryData?.fsrsConfig?.remindersEnabled ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-gray-200 bg-white text-gray-600'}`}>
+                                                            {flashCardMasteryData?.fsrsConfig?.remindersEnabled ? '到期提醒：開' : '到期提醒：關'}
+                                                        </button>
                                                         <div className="relative">
                                                             <button
                                                                 type="button"
