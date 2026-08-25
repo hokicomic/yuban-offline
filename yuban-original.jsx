@@ -32,8 +32,6 @@ const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stabl
 const PRESERVE_GEMINI_MARKDOWN_LAYOUT = true; // default: keep Gemini original paragraph/bold layout
 const FLASHCARD_MASTERY_FILE_NAME = "flashcard_mastery.json";
 const FLASHCARD_MASTERY_SCHEMA_VERSION = FSRS_SCHEMA_VERSION;
-const FLASHCARD_LEGACY_CALIBRATION_DAILY_LIMIT = 20;
-const FLASHCARD_NEW_DAILY_LIMIT = 20;
 const FLASHCARD_MASTERY_LOCAL_STORAGE_KEY = "flashcard_mastery";
 const FLASHCARD_MASTERY_AUTOSAVE_DEBOUNCE_MS = 1500;
 const FLASHCARD_MASTERY_FORCE_FLUSH_EVERY = 5;
@@ -17060,10 +17058,10 @@ ${userQ}`;
             .filter(item => !isFsrsScheduled(item.entry) && Number(item.entry.reviewCount || 0) > 0)
             .sort((a, b) => Number(b.entry.forgotCount || 0) - Number(a.entry.forgotCount || 0)
                 || String(a.entry.lastReviewedAt || '').localeCompare(String(b.entry.lastReviewedAt || '')))
-            .slice(0, FLASHCARD_LEGACY_CALIBRATION_DAILY_LIMIT);
+            .slice(0, data.fsrsConfig.legacyCalibrationPerDay);
         const newCards = usable
             .filter(item => !isFsrsScheduled(item.entry) && Number(item.entry.reviewCount || 0) === 0)
-            .slice(0, FLASHCARD_NEW_DAILY_LIMIT);
+            .slice(0, data.fsrsConfig.newCardsPerDay);
         const cards = [...learningDue, ...reviewDue, ...legacy, ...newCards].map(item => item.card);
         if (cards.length === 0) {
             setFlashCardNotice("今日沒有到期卡，且沒有可校準或未學的新卡。");
@@ -18750,7 +18748,7 @@ ${userQ}`;
                                                             今日 FSRS 複習
                                                         </button>
                                                         <span className="px-2 py-1 rounded-full border border-violet-100 bg-violet-50 text-[11px] font-semibold text-violet-700" title={`到期 ${fsrsTodayStats.due}｜Learning ${fsrsTodayStats.learning}｜Relearning ${fsrsTodayStats.relearning}｜待校準 ${fsrsTodayStats.legacy}｜新卡 ${fsrsTodayStats.fresh}｜缺快照 ${fsrsTodayStats.missingSnapshot}｜未到期 ${fsrsTodayStats.future}｜今日評分 ${fsrsTodayStats.reviewedToday}`}>
-                                                            到期 {fsrsTodayStats.due} ・校準 {Math.min(fsrsTodayStats.legacy, FLASHCARD_LEGACY_CALIBRATION_DAILY_LIMIT)} ・新卡 {Math.min(fsrsTodayStats.fresh, FLASHCARD_NEW_DAILY_LIMIT)}
+                                                            到期 {fsrsTodayStats.due} ・校準 {Math.min(fsrsTodayStats.legacy, flashCardMasteryData?.fsrsConfig?.legacyCalibrationPerDay ?? 20)} ・新卡 {Math.min(fsrsTodayStats.fresh, flashCardMasteryData?.fsrsConfig?.newCardsPerDay ?? 20)}
                                                         </span>
                                                         <label className="flex items-center gap-1 px-2 py-1 rounded-full border border-violet-100 bg-white text-[11px] text-violet-700 font-semibold" title="越高，複習越頻繁；設定會寫入 mastery JSON">
                                                             記憶率
@@ -18761,6 +18759,16 @@ ${userQ}`;
                                                             }} className="bg-transparent outline-none">
                                                                 {[85, 90, 92, 95, 97].map(value => <option key={value} value={value}>{value}%</option>)}
                                                             </select>
+                                                        </label>
+                                                        <label className="flex items-center gap-1 px-2 py-1 rounded-full border border-violet-100 bg-white text-[11px] text-violet-700 font-semibold" title="不是 FSRS 的限制；只限制每天納入多少待校準舊卡與新卡，可隨時提高後開下一組。">
+                                                            校準/新卡
+                                                            <select value={String(flashCardMasteryData?.fsrsConfig?.legacyCalibrationPerDay ?? 20)} onChange={(e) => {
+                                                                const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current); const limit = Number(e.target.value);
+                                                                const next = { ...current, updatedAt: new Date().toISOString(), fsrsConfig: normalizeFsrsConfig({ ...current.fsrsConfig, legacyCalibrationPerDay: limit, newCardsPerDay: limit }) };
+                                                                flashCardMasteryDataRef.current = next; setFlashCardMasteryData(next); scheduleFlashCardMasteryAutoSave(next);
+                                                            }} className="bg-transparent outline-none">
+                                                                {[0, 10, 20, 40, 60, 100].map(value => <option key={value} value={value}>{value}</option>)}
+                                                            </select>/日
                                                         </label>
                                                         <div className="relative">
                                                             <button

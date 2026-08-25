@@ -27,5 +27,5 @@ test('future scheduled card is not due and Again produces a real lapse transitio
 });
 
 test('configuration is constrained to supported retention and interval bounds', () => {
-  assert.deepEqual(normalizeFsrsConfig({ requestRetention: 2, maximumInterval: 999999 }), { requestRetention: 0.99, maximumInterval: 36500 });
+  assert.deepEqual(normalizeFsrsConfig({ requestRetention: 2, maximumInterval: 999999 }), { requestRetention: 0.99, maximumInterval: 36500, legacyCalibrationPerDay: 20, newCardsPerDay: 20 });
 });
