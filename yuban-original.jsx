@@ -19,6 +19,7 @@ import {
     Hand, Languages, Search, Globe, MessageCircle, Phone, PhoneOff, MicOff, Maximize2, Minimize2, FilePlus, MoveRight,
     Gauge, Clock, Trophy, Activity, Zap, Wand2, Ear, Ban, Brain, StopCircle, Trash2, Copy
 } from 'lucide-react';
+import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, getFsrsPreview, getFsrsStateLabel, getRetrievability, isDue, isFsrsScheduled, normalizeFsrsConfig } from './fsrsScheduler.js';
 
 // ============================================================================
 // [CONFIG] API KEY
@@ -30,7 +31,9 @@ const AI_NOTES_CACHE_SCHEMA_VERSION = "20260305.6";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
 const PRESERVE_GEMINI_MARKDOWN_LAYOUT = true; // default: keep Gemini original paragraph/bold layout
 const FLASHCARD_MASTERY_FILE_NAME = "flashcard_mastery.json";
-const FLASHCARD_MASTERY_SCHEMA_VERSION = 2;
+const FLASHCARD_MASTERY_SCHEMA_VERSION = FSRS_SCHEMA_VERSION;
+const FLASHCARD_LEGACY_CALIBRATION_DAILY_LIMIT = 20;
+const FLASHCARD_NEW_DAILY_LIMIT = 20;
 const FLASHCARD_MASTERY_LOCAL_STORAGE_KEY = "flashcard_mastery";
 const FLASHCARD_MASTERY_AUTOSAVE_DEBOUNCE_MS = 1500;
 const FLASHCARD_MASTERY_FORCE_FLUSH_EVERY = 5;
@@ -320,6 +323,9 @@ function mergeFlashCardMasteryEntry(existing, incoming, options = {}) {
         lastResult: latest.lastResult || existing.lastResult || incoming.lastResult || "remembered",
         lastReviewedAt: latest.lastReviewedAt || existing.lastReviewedAt || incoming.lastReviewedAt || "",
         discardedAt: [existing.discardedAt, incoming.discardedAt].filter(Boolean).sort().slice(-1)[0] || "",
+        // FSRS becomes the source of truth for future scheduling.  The newest
+        // real FSRS state wins; legacy counters remain historical only.
+        fsrs: latest.fsrs || existing.fsrs || incoming.fsrs || null,
         snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, incoming.snapshot)
     };
 }
@@ -328,6 +334,8 @@ function createEmptyFlashCardMasteryData() {
     return {
         schemaVersion: FLASHCARD_MASTERY_SCHEMA_VERSION,
         updatedAt: new Date().toISOString(),
+        fsrsConfig: { ...DEFAULT_FSRS_CONFIG },
+        reviewLogs: [],
         cards: {}
     };
 }
@@ -363,6 +371,7 @@ function normalizeFlashCardMasteryEntry(rawEntry, fallbackKey, nowIso) {
         lastResult,
         lastReviewedAt: lastReview ? String(lastReview) : "",
         discardedAt: entry.discardedAt ? String(entry.discardedAt) : "",
+        fsrs: entry.fsrs && typeof entry.fsrs === "object" ? entry.fsrs : null,
         snapshot: normalizeFlashCardMasterySnapshot(entry.snapshot || entry.savedCard, head)
     };
 }
@@ -377,6 +386,9 @@ function normalizeFlashCardMasteryData(raw) {
         const normalized = {
             schemaVersion: FLASHCARD_MASTERY_SCHEMA_VERSION,
             updatedAt: String(raw.updatedAt || nowIso),
+            fsrsConfig: normalizeFsrsConfig(raw.fsrsConfig),
+            // Never synthesize past FSRS reviews from aggregate legacy counts.
+            reviewLogs: Array.isArray(raw.reviewLogs) ? raw.reviewLogs.filter(log => log && typeof log === "object") : [],
             cards: {}
         };
         Object.entries(cardsSource || {}).forEach(([key, value]) => {
@@ -404,6 +416,8 @@ function mergeFlashCardMasteryData(baseData, incomingData) {
         ...base,
         schemaVersion: FLASHCARD_MASTERY_SCHEMA_VERSION,
         updatedAt: new Date().toISOString(),
+        fsrsConfig: normalizeFsrsConfig(incoming.fsrsConfig || base.fsrsConfig),
+        reviewLogs: [...(base.reviewLogs || []), ...(incoming.reviewLogs || [])].slice(-10000),
         cards: { ...base.cards }
     };
     Object.entries(incoming.cards || {}).forEach(([rawCardId, incomingEntry]) => {
@@ -6538,6 +6552,7 @@ export default function GeminiPlayer() {
     const [quizSelectedKnowledgeBatch, setQuizSelectedKnowledgeBatch] = useState([]);
     const [quizKnowledgeFileInfo, setQuizKnowledgeFileInfo] = useState(null);
     const [flashCards, setFlashCards] = useState([]);
+    const [flashCardReviewMode, setFlashCardReviewMode] = useState('browse');
     const [flashCardCategories, setFlashCardCategories] = useState(["all"]);
     const [flashCardToolbarExpanded, setFlashCardToolbarExpanded] = useState(true);
     const [flashCardIndex, setFlashCardIndex] = useState(0);
@@ -13152,6 +13167,7 @@ ${sourcePromptText}`;
 
     const openKnowledgeFlashCards = async () => {
         if (playerRef.current) { playerRef.current.pause(); setIsPlaying(false); }
+        setFlashCardReviewMode('browse');
         const currentModalKnowledgeText = isKnowledgePreviewModalState(
             aiMode,
             modalTitle,
@@ -15655,6 +15671,25 @@ ${userQ}`;
         }
         return { total, reviewed, remembered, forgot, clean, unseen, discarded };
     }, [flashCards, getFlashCardMasteryForCard]);
+    const fsrsTodayStats = useMemo(() => {
+        const now = new Date();
+        const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+        const data = normalizeFlashCardMasteryData(flashCardMasteryData);
+        const stats = { due: 0, learning: 0, relearning: 0, legacy: 0, fresh: 0, future: 0, missingSnapshot: 0, discarded: 0, reviewedToday: 0, Again: 0, Hard: 0, Good: 0, Easy: 0 };
+        Object.values(data.cards || {}).forEach(entry => {
+            if (entry?.discardedAt) { stats.discarded += 1; return; }
+            if (!normalizeFlashCardMasterySnapshot(entry?.snapshot, entry?.head)) { stats.missingSnapshot += 1; return; }
+            if (!isFsrsScheduled(entry)) {
+                if (Number(entry.reviewCount || 0) > 0) stats.legacy += 1;
+                else stats.fresh += 1;
+                return;
+            }
+            if (isDue(entry, now)) { stats.due += 1; const state = getFsrsStateLabel(entry); if (state === 'Learning') stats.learning += 1; if (state === 'Relearning') stats.relearning += 1; }
+            else stats.future += 1;
+        });
+        (data.reviewLogs || []).forEach(log => { if (new Date(log.reviewedAt || log?.log?.review || 0).getTime() >= startOfToday) { stats.reviewedToday += 1; if (stats[log.rating] !== undefined) stats[log.rating] += 1; } });
+        return stats;
+    }, [flashCardMasteryData]);
     const flashCardKnowledgeTermEntries = useMemo(() => {
         const normalizeMatchTerm = (rawFront = "") => {
             let s = cleanQuizDisplayText(String(rawFront || ""));
@@ -16620,14 +16655,33 @@ ${userQ}`;
 
     const updateFlashCardMasteryForFeedback = useCallback((card, result, sourceName) => {
         if (!card) return;
-        const now = new Date().toISOString();
+        const reviewedAt = new Date();
+        const now = reviewedAt.toISOString();
         const cardId = buildFlashCardId(card);
         const normalizedPrev = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
         const existing = normalizedPrev.cards[cardId] || {};
-        const remembered = result === "remembered";
+        const rating = ["Again", "Hard", "Good", "Easy"].includes(result)
+            ? result
+            : (result === "remembered" ? "Good" : "Again");
+        const remembered = rating !== "Again";
+        // Old binary controls remain compatible, but every intentional answer
+        // now enters the one FSRS scheduler (Forgot→Again, Remembered→Good).
+        const fsrsResult = applyFsrsRating(existing, rating, normalizedPrev.fsrsConfig, reviewedAt);
+        const reviewLog = {
+            cardId,
+            reviewedAt: now,
+            rating,
+            elapsedDays: fsrsResult.log.elapsed_days,
+            scheduledDays: fsrsResult.log.scheduled_days,
+            stateBefore: fsrsResult.log.state,
+            stateAfter: fsrsResult.card.state,
+            dueAfter: fsrsResult.card.due,
+            log: fsrsResult.log
+        };
         const next = {
             ...normalizedPrev,
             updatedAt: now,
+            reviewLogs: [...(normalizedPrev.reviewLogs || []), reviewLog].slice(-10000),
             cards: {
                 ...normalizedPrev.cards,
                 [cardId]: {
@@ -16640,7 +16694,8 @@ ${userQ}`;
                     forgotCount: Math.max(0, Number(existing.forgotCount || existing.wrongCount || 0)) + (remembered ? 0 : 1),
                     reviewCount: Math.max(0, Number(existing.reviewCount || 0)) + 1,
                     lastResult: remembered ? "remembered" : "forgot",
-                    lastReviewedAt: now
+                    lastReviewedAt: now,
+                    fsrs: fsrsResult.card
                 }
             }
         };
@@ -16654,20 +16709,28 @@ ${userQ}`;
         }
     }, [flushFlashCardMasteryToFolder, scheduleFlashCardMasteryAutoSave]);
 
-    const handleFeedback = useCallback((isCorrect) => {
+    const handleFeedback = useCallback((outcome) => {
         if (!currentFlashCard || !currentFlashCard.front) return;
-        updateFlashCardMasteryForFeedback(currentFlashCard, isCorrect ? "remembered" : "forgot", flashCardSourceName);
+        const result = typeof outcome === "boolean" ? (outcome ? "remembered" : "forgot") : outcome;
+        updateFlashCardMasteryForFeedback(currentFlashCard, result, flashCardSourceName);
 
         if (flashCardAutoRun) {
             setFlashCardWaitingFeedback(false);
             executeFlashCardAdvance(flashCardAutoSessionRef.current, normalizedFlashCardIndex);
         } else {
             if (filteredFlashCards.length < 1) return;
+            if (flashCardReviewMode === 'fsrs' && normalizedFlashCardIndex >= filteredFlashCards.length - 1) {
+                setFlashCards([]);
+                setFlashCardIndex(0);
+                setFlashCardFlipped(false);
+                setFlashCardNotice('今日複習完成。短期 Learning / Relearning 卡會在下一個到期時間再出現。');
+                return;
+            }
             const nextIdx = (normalizedFlashCardIndex + 1) % filteredFlashCards.length;
             setFlashCardIndex(nextIdx);
             setFlashCardFlipped(false);
         }
-    }, [currentFlashCard, flashCardAutoRun, normalizedFlashCardIndex, executeFlashCardAdvance, filteredFlashCards.length, flashCardSourceName, updateFlashCardMasteryForFeedback]);
+    }, [currentFlashCard, flashCardAutoRun, flashCardReviewMode, normalizedFlashCardIndex, executeFlashCardAdvance, filteredFlashCards.length, flashCardSourceName, updateFlashCardMasteryForFeedback]);
 
     const scheduleFlashCardAutoAdvance = useCallback((session, side, cardIndex) => {
         if (side === 'back') {
@@ -16984,22 +17047,36 @@ ${userQ}`;
     };
     const openSavedFlashCardReview = () => {
         if (flashCardAutoRun) stopFlashCardAutoRun();
-        const cards = Object.values(normalizeFlashCardMasteryData(flashCardMasteryDataRef.current).cards || {})
+        const data = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+        const now = new Date();
+        const usable = Object.values(data.cards || {})
             .filter(entry => !entry?.discardedAt)
-            .sort((a, b) => String(b?.lastReviewedAt || "").localeCompare(String(a?.lastReviewedAt || "")))
-            .map((entry, index) => buildFlashCardFromMasterySnapshot(entry, index))
-            .filter(Boolean);
+            .map((entry, index) => ({ entry, card: buildFlashCardFromMasterySnapshot(entry, index) }))
+            .filter(item => item.card);
+        const due = usable.filter(item => isFsrsScheduled(item.entry) && isDue(item.entry, now));
+        const learningDue = due.filter(item => ['Learning', 'Relearning'].includes(getFsrsStateLabel(item.entry)));
+        const reviewDue = due.filter(item => getFsrsStateLabel(item.entry) === 'Review');
+        const legacy = usable
+            .filter(item => !isFsrsScheduled(item.entry) && Number(item.entry.reviewCount || 0) > 0)
+            .sort((a, b) => Number(b.entry.forgotCount || 0) - Number(a.entry.forgotCount || 0)
+                || String(a.entry.lastReviewedAt || '').localeCompare(String(b.entry.lastReviewedAt || '')))
+            .slice(0, FLASHCARD_LEGACY_CALIBRATION_DAILY_LIMIT);
+        const newCards = usable
+            .filter(item => !isFsrsScheduled(item.entry) && Number(item.entry.reviewCount || 0) === 0)
+            .slice(0, FLASHCARD_NEW_DAILY_LIMIT);
+        const cards = [...learningDue, ...reviewDue, ...legacy, ...newCards].map(item => item.card);
         if (cards.length === 0) {
-            setFlashCardNotice("目前的學習記錄尚無可重建的卡片內容。之後每次作答的卡片會自動存入；舊記錄需重新開啟來源知識檔後作答一次才能補齊。");
+            setFlashCardNotice("今日沒有到期卡，且沒有可校準或未學的新卡。");
             return;
         }
         setFlashCards(cards);
-        setFlashCardSourceName("已學習卡庫");
+        setFlashCardSourceName("今日 FSRS 複習");
+        setFlashCardReviewMode('fsrs');
         setFlashCardCategories(["all"]);
         setFlashCardFilterMode("all");
         setFlashCardIndex(0);
         setFlashCardFlipped(false);
-        setFlashCardNotice(`已載入 ${cards.length} 張已學卡片。`);
+        setFlashCardNotice(`今日佇列 ${cards.length} 張：到期 ${due.length}｜待校準 ${legacy.length}｜新卡 ${newCards.length}。`);
     };
 
     const handleFlashCardDiscard = () => {
@@ -18668,10 +18745,23 @@ ${userQ}`;
                                                             type="button"
                                                             onClick={openSavedFlashCardReview}
                                                             className="px-2.5 py-1 rounded-full border border-violet-200 bg-violet-50 text-[11px] text-violet-700 font-bold hover:bg-violet-100"
-                                                            title="從學習記錄中直接載入已保存的 canonical cards"
+                                                            title="只載入今日到期、待校準與每日限額內的新卡；使用官方 FSRS 排程"
                                                         >
-                                                            歷史複習
+                                                            今日 FSRS 複習
                                                         </button>
+                                                        <span className="px-2 py-1 rounded-full border border-violet-100 bg-violet-50 text-[11px] font-semibold text-violet-700" title={`到期 ${fsrsTodayStats.due}｜Learning ${fsrsTodayStats.learning}｜Relearning ${fsrsTodayStats.relearning}｜待校準 ${fsrsTodayStats.legacy}｜新卡 ${fsrsTodayStats.fresh}｜缺快照 ${fsrsTodayStats.missingSnapshot}｜未到期 ${fsrsTodayStats.future}｜今日評分 ${fsrsTodayStats.reviewedToday}`}>
+                                                            到期 {fsrsTodayStats.due} ・校準 {Math.min(fsrsTodayStats.legacy, FLASHCARD_LEGACY_CALIBRATION_DAILY_LIMIT)} ・新卡 {Math.min(fsrsTodayStats.fresh, FLASHCARD_NEW_DAILY_LIMIT)}
+                                                        </span>
+                                                        <label className="flex items-center gap-1 px-2 py-1 rounded-full border border-violet-100 bg-white text-[11px] text-violet-700 font-semibold" title="越高，複習越頻繁；設定會寫入 mastery JSON">
+                                                            記憶率
+                                                            <select value={String(Math.round((flashCardMasteryData?.fsrsConfig?.requestRetention || 0.9) * 100))} onChange={(e) => {
+                                                                const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+                                                                const next = { ...current, updatedAt: new Date().toISOString(), fsrsConfig: normalizeFsrsConfig({ ...current.fsrsConfig, requestRetention: Number(e.target.value) / 100 }) };
+                                                                flashCardMasteryDataRef.current = next; setFlashCardMasteryData(next); scheduleFlashCardMasteryAutoSave(next);
+                                                            }} className="bg-transparent outline-none">
+                                                                {[85, 90, 92, 95, 97].map(value => <option key={value} value={value}>{value}%</option>)}
+                                                            </select>
+                                                        </label>
                                                         <div className="relative">
                                                             <button
                                                                 type="button"
@@ -19117,28 +19207,19 @@ ${userQ}`;
                                                                     return (
                                                                         <>
                                                                             {flashCardBackJSX}
-                                                                            <div className="mt-6 flex items-center justify-center gap-4">
-                                                                                <button
-                                                                                    type="button"
-                                                                                    onClick={(e) => {
-                                                                                        e.stopPropagation();
-                                                                                        handleFeedback(false);
-                                                                                    }}
-                                                                                    className="flex-1 max-w-[160px] px-4 py-3 rounded-xl border-2 border-red-200 bg-red-50 text-red-700 text-sm font-bold shadow-sm hover:bg-red-100 hover:border-red-300 transition-colors focus:ring-2 focus:ring-red-300 focus:outline-none"
-                                                                                >
-                                                                                    ✘ Forget
-                                                                                </button>
-                                                                                <button
-                                                                                    type="button"
-                                                                                    onClick={(e) => {
-                                                                                        e.stopPropagation();
-                                                                                        handleFeedback(true);
-                                                                                    }}
-                                                                                    className="flex-1 max-w-[160px] px-4 py-3 rounded-xl border-2 border-emerald-200 bg-emerald-50 text-emerald-700 text-sm font-bold shadow-sm hover:bg-emerald-100 hover:border-emerald-300 transition-colors focus:ring-2 focus:ring-emerald-300 focus:outline-none"
-                                                                                >
-                                                                                    ✔ Recall
-                                                                                </button>
-                                                                            </div>
+                                                                            {flashCardReviewMode === 'fsrs' ? (() => {
+                                                                                const entry = getFlashCardMasteryForCard(currentFlashCard) || {};
+                                                                                const preview = getFsrsPreview(entry, flashCardMasteryDataRef.current?.fsrsConfig, new Date());
+                                                                                const styles = { Again: 'border-red-200 bg-red-50 text-red-700', Hard: 'border-orange-200 bg-orange-50 text-orange-700', Good: 'border-emerald-200 bg-emerald-50 text-emerald-700', Easy: 'border-sky-200 bg-sky-50 text-sky-700' };
+                                                                                return <div className="mt-6 grid grid-cols-2 md:grid-cols-4 gap-2">
+                                                                                    {['Again', 'Hard', 'Good', 'Easy'].map(rating => <button key={rating} type="button" onClick={(e) => { e.stopPropagation(); handleFeedback(rating); }} className={`px-3 py-2 rounded-xl border-2 text-sm font-bold shadow-sm transition-colors ${styles[rating]}`}>
+                                                                                        <span className="block">{rating}</span><span className="block text-[11px] opacity-75">{dueInLabel(preview[rating]?.card?.due)}</span>
+                                                                                    </button>)}
+                                                                                </div>;
+                                                                            })() : <div className="mt-6 flex items-center justify-center gap-4">
+                                                                                <button type="button" onClick={(e) => { e.stopPropagation(); handleFeedback(false); }} className="flex-1 max-w-[160px] px-4 py-3 rounded-xl border-2 border-red-200 bg-red-50 text-red-700 text-sm font-bold shadow-sm hover:bg-red-100">✘ Forget</button>
+                                                                                <button type="button" onClick={(e) => { e.stopPropagation(); handleFeedback(true); }} className="flex-1 max-w-[160px] px-4 py-3 rounded-xl border-2 border-emerald-200 bg-emerald-50 text-emerald-700 text-sm font-bold shadow-sm hover:bg-emerald-100">✔ Recall</button>
+                                                                            </div>}
                                                                         </>
                                                                     );
                                                                 }
