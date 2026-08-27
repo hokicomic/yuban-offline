@@ -18835,9 +18835,10 @@ ${userQ}`;
                                                         }} className={`px-2 py-1 rounded-full border text-[11px] font-semibold ${flashCardMasteryData?.fsrsConfig?.remindersEnabled ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-gray-200 bg-white text-gray-600'}`}>
                                                             {flashCardMasteryData?.fsrsConfig?.remindersEnabled ? '到期提醒：開' : '到期提醒：關'}
                                                         </button>
-                                                        <button type="button" onClick={() => {
+                                                        <label className={`flex items-center gap-1 px-2 py-1 rounded-full border text-[11px] font-semibold ${flashCardMasteryData?.fsrsConfig?.autoExportEnabled ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-gray-200 bg-white text-gray-600'}`} title="每次按 Again / Hard / Good / Easy 都計一次；第一次自動下載時 Chrome 可能要求允許多個下載。">
+                                                            <input type="checkbox" checked={Boolean(flashCardMasteryData?.fsrsConfig?.autoExportEnabled)} onChange={(e) => {
                                                             const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
-                                                            const enabled = !current.fsrsConfig.autoExportEnabled;
+                                                            const enabled = e.target.checked;
                                                             const next = {
                                                                 ...current,
                                                                 updatedAt: new Date().toISOString(),
@@ -18845,10 +18846,8 @@ ${userQ}`;
                                                             };
                                                             flashCardMasteryDataRef.current = next; setFlashCardMasteryData(next); scheduleFlashCardMasteryAutoSave(next);
                                                             setFlashCardNotice(enabled ? `已開啟：每 ${next.fsrsConfig.autoExportEvery} 次正式作答自動匯出 JSON。` : '已關閉自動匯出 JSON。');
-                                                        }} className={`px-2 py-1 rounded-full border text-[11px] font-semibold ${flashCardMasteryData?.fsrsConfig?.autoExportEnabled ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-gray-200 bg-white text-gray-600'}`} title="每次按 Again / Hard / Good / Easy 都計一次；第一次自動下載時 Chrome 可能要求允許多個下載。">
-                                                            {flashCardMasteryData?.fsrsConfig?.autoExportEnabled ? '自動 JSON：開' : '自動 JSON：關'}
-                                                        </button>
-                                                        <label className="flex items-center gap-1 px-2 py-1 rounded-full border border-sky-100 bg-white text-[11px] text-sky-700 font-semibold" title="啟用自動 JSON 後，每累積這個數量的正式作答便匯出一份；已累積次數會在 JSON 中保存。">
+                                                        }} className="accent-sky-600" />
+                                                            自動 JSON
                                                             每
                                                             <select value={String(flashCardMasteryData?.fsrsConfig?.autoExportEvery ?? 30)} onChange={(e) => {
                                                                 const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
