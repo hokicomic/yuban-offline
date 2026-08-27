@@ -6891,9 +6891,18 @@ export default function GeminiPlayer() {
         }
     }, [connectFlashCardMasteryFolder]);
 
-    const exportFlashCardMasteryJson = useCallback(async () => {
+    const exportFlashCardMasteryJson = useCallback(async (dataOverride = null, { automatic = false, resetAutoExportCounter = false } = {}) => {
         try {
-            const data = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+            const sourceData = normalizeFlashCardMasteryData(dataOverride || flashCardMasteryDataRef.current);
+            // A manual export is a deliberate backup checkpoint, so make the
+            // exported copy and the in-app state agree on the next 30-card cycle.
+            const data = resetAutoExportCounter
+                ? {
+                    ...sourceData,
+                    updatedAt: new Date().toISOString(),
+                    fsrsConfig: normalizeFsrsConfig({ ...sourceData.fsrsConfig, autoExportSinceLastDownload: 0 })
+                }
+                : sourceData;
             const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
             const baseFileName = buildFlashCardMasteryExportFileName();
             const dirHandle = flashCardMasteryDirHandleRef.current;
@@ -6905,7 +6914,14 @@ export default function GeminiPlayer() {
                 await writable.close();
                 setFlashCardMasteryLastSaveError("");
                 setFlashCardMasterySyncStatus("synced");
-                return;
+                if (automatic) setFlashCardNotice(`已自動匯出第 ${data.fsrsConfig.autoExportEvery} 次作答的 JSON。`);
+                if (resetAutoExportCounter) {
+                    flashCardMasteryDataRef.current = data;
+                    setFlashCardMasteryData(data);
+                    scheduleFlashCardMasteryAutoSave(data);
+                    setFlashCardNotice('已手動匯出 JSON；自動匯出計數已歸零。');
+                }
+                return true;
             }
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
@@ -6915,10 +6931,20 @@ export default function GeminiPlayer() {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
+            if (automatic) setFlashCardNotice(`已自動下載第 ${data.fsrsConfig.autoExportEvery} 次作答的 JSON；若 Chrome 詢問，請允許多個下載。`);
+            if (resetAutoExportCounter) {
+                flashCardMasteryDataRef.current = data;
+                setFlashCardMasteryData(data);
+                scheduleFlashCardMasteryAutoSave(data);
+                setFlashCardNotice('已手動下載 JSON；自動匯出計數已歸零。');
+            }
+            return true;
         } catch (err) {
             console.warn("Failed to export flashcard mastery JSON", err);
+            if (automatic) setFlashCardNotice(`自動匯出失敗：${String(err?.message || err || "請改用手動匯出")}`);
+            return false;
         }
-    }, []);
+    }, [scheduleFlashCardMasteryAutoSave]);
 
     const importFlashCardMasteryJsonFiles = useCallback(async (filesInput) => {
         const files = Array.from(filesInput || []).filter(Boolean);
@@ -16692,9 +16718,17 @@ ${userQ}`;
             dueAfter: fsrsResult.card.due,
             log: fsrsResult.log
         };
+        const autoExportEnabled = Boolean(normalizedPrev.fsrsConfig?.autoExportEnabled);
+        const currentAutoExportCount = autoExportEnabled ? Math.max(0, Number(normalizedPrev.fsrsConfig?.autoExportSinceLastDownload || 0)) : 0;
+        const autoExportEvery = Math.max(1, Number(normalizedPrev.fsrsConfig?.autoExportEvery || 30));
+        const shouldAutoExport = autoExportEnabled && currentAutoExportCount + 1 >= autoExportEvery;
         const next = {
             ...normalizedPrev,
             updatedAt: now,
+            fsrsConfig: normalizeFsrsConfig({
+                ...normalizedPrev.fsrsConfig,
+                autoExportSinceLastDownload: autoExportEnabled ? (shouldAutoExport ? 0 : currentAutoExportCount + 1) : 0
+            }),
             reviewLogs: [...(normalizedPrev.reviewLogs || []), reviewLog].slice(-10000),
             cards: {
                 ...normalizedPrev.cards,
@@ -16721,7 +16755,8 @@ ${userQ}`;
             flashCardMasteryFeedbackCountSinceFlushRef.current = 0;
             flushFlashCardMasteryToFolder(next);
         }
-    }, [flushFlashCardMasteryToFolder, scheduleFlashCardMasteryAutoSave]);
+        if (shouldAutoExport) void exportFlashCardMasteryJson(next, { automatic: true });
+    }, [exportFlashCardMasteryJson, flushFlashCardMasteryToFolder, scheduleFlashCardMasteryAutoSave]);
 
     const handleFeedback = useCallback((outcome) => {
         if (!currentFlashCard || !currentFlashCard.front) return;
@@ -18800,6 +18835,30 @@ ${userQ}`;
                                                         }} className={`px-2 py-1 rounded-full border text-[11px] font-semibold ${flashCardMasteryData?.fsrsConfig?.remindersEnabled ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-gray-200 bg-white text-gray-600'}`}>
                                                             {flashCardMasteryData?.fsrsConfig?.remindersEnabled ? '到期提醒：開' : '到期提醒：關'}
                                                         </button>
+                                                        <button type="button" onClick={() => {
+                                                            const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+                                                            const enabled = !current.fsrsConfig.autoExportEnabled;
+                                                            const next = {
+                                                                ...current,
+                                                                updatedAt: new Date().toISOString(),
+                                                                fsrsConfig: normalizeFsrsConfig({ ...current.fsrsConfig, autoExportEnabled: enabled, autoExportSinceLastDownload: 0 })
+                                                            };
+                                                            flashCardMasteryDataRef.current = next; setFlashCardMasteryData(next); scheduleFlashCardMasteryAutoSave(next);
+                                                            setFlashCardNotice(enabled ? `已開啟：每 ${next.fsrsConfig.autoExportEvery} 次正式作答自動匯出 JSON。` : '已關閉自動匯出 JSON。');
+                                                        }} className={`px-2 py-1 rounded-full border text-[11px] font-semibold ${flashCardMasteryData?.fsrsConfig?.autoExportEnabled ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-gray-200 bg-white text-gray-600'}`} title="每次按 Again / Hard / Good / Easy 都計一次；第一次自動下載時 Chrome 可能要求允許多個下載。">
+                                                            {flashCardMasteryData?.fsrsConfig?.autoExportEnabled ? '自動 JSON：開' : '自動 JSON：關'}
+                                                        </button>
+                                                        <label className="flex items-center gap-1 px-2 py-1 rounded-full border border-sky-100 bg-white text-[11px] text-sky-700 font-semibold" title="啟用自動 JSON 後，每累積這個數量的正式作答便匯出一份；已累積次數會在 JSON 中保存。">
+                                                            每
+                                                            <select value={String(flashCardMasteryData?.fsrsConfig?.autoExportEvery ?? 30)} onChange={(e) => {
+                                                                const current = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+                                                                const next = { ...current, updatedAt: new Date().toISOString(), fsrsConfig: normalizeFsrsConfig({ ...current.fsrsConfig, autoExportEvery: Number(e.target.value) }) };
+                                                                flashCardMasteryDataRef.current = next; setFlashCardMasteryData(next); scheduleFlashCardMasteryAutoSave(next);
+                                                            }} className="bg-transparent outline-none">
+                                                                {[10, 20, 30, 50, 100].map(value => <option key={value} value={value}>{value}</option>)}
+                                                            </select> 張
+                                                            {flashCardMasteryData?.fsrsConfig?.autoExportEnabled ? `（${flashCardMasteryData?.fsrsConfig?.autoExportSinceLastDownload || 0}）` : ''}
+                                                        </label>
                                                         <div className="relative">
                                                             <button
                                                                 type="button"
@@ -18828,7 +18887,7 @@ ${userQ}`;
                                                                         type="button"
                                                                         onClick={() => {
                                                                             setFlashCardReviewMenuOpen(false);
-                                                                            exportFlashCardMasteryJson();
+                                                                            exportFlashCardMasteryJson(null, { resetAutoExportCounter: true });
                                                                         }}
                                                                         className="w-full px-2 py-1.5 rounded-lg text-left text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
                                                                     >

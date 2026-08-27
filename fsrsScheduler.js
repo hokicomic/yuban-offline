@@ -1,7 +1,7 @@
 import { createEmptyCard, fsrs, Rating, State } from 'ts-fsrs';
 
 export const FSRS_SCHEMA_VERSION = 3;
-export const DEFAULT_FSRS_CONFIG = Object.freeze({ requestRetention: 0.90, maximumInterval: 36500, legacyCalibrationPerDay: 20, newCardsPerDay: 20, remindersEnabled: false });
+export const DEFAULT_FSRS_CONFIG = Object.freeze({ requestRetention: 0.90, maximumInterval: 36500, legacyCalibrationPerDay: 20, newCardsPerDay: 20, remindersEnabled: false, autoExportEnabled: false, autoExportEvery: 30, autoExportSinceLastDownload: 0 });
 export const FSRS_RATINGS = Object.freeze({ Again: Rating.Again, Hard: Rating.Hard, Good: Rating.Good, Easy: Rating.Easy });
 
 const ISO_FIELDS = new Set(['due', 'last_review', 'review']);
@@ -42,7 +42,10 @@ export function normalizeFsrsConfig(raw) {
     maximumInterval: Math.min(36500, Math.max(1, Math.round(Number.isFinite(maximumInterval) ? maximumInterval : DEFAULT_FSRS_CONFIG.maximumInterval))),
     legacyCalibrationPerDay: Math.min(100, Math.max(0, Math.round(Number(raw?.legacyCalibrationPerDay ?? DEFAULT_FSRS_CONFIG.legacyCalibrationPerDay) || 0))),
     newCardsPerDay: Math.min(100, Math.max(0, Math.round(Number(raw?.newCardsPerDay ?? DEFAULT_FSRS_CONFIG.newCardsPerDay) || 0))),
-    remindersEnabled: Boolean(raw?.remindersEnabled)
+    remindersEnabled: Boolean(raw?.remindersEnabled),
+    autoExportEnabled: Boolean(raw?.autoExportEnabled),
+    autoExportEvery: Math.min(200, Math.max(1, Math.round(Number(raw?.autoExportEvery ?? DEFAULT_FSRS_CONFIG.autoExportEvery) || DEFAULT_FSRS_CONFIG.autoExportEvery))),
+    autoExportSinceLastDownload: Math.min(1000000, Math.max(0, Math.round(Number(raw?.autoExportSinceLastDownload ?? DEFAULT_FSRS_CONFIG.autoExportSinceLastDownload) || 0)))
   };
 }
 
