@@ -5455,22 +5455,26 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
 // Parse the original block only once for a document.  EPUB conversions can be
 // tens of thousands of lines; repeatedly splitting it for each LRC cue made
 // playback stutter and turned a sequential alignment problem into full scans.
-const buildKnowledgeOriginalSearchIndex = (content = "") => {
+const buildKnowledgeOriginalSearchIndex = (content = "", { allowWholeDocumentFallback = false } = {}) => {
     const lines = String(content || "").replace(/\r/g, "").split("\n");
     let inOriginal = false;
     let originalMarkerCount = 0;
     const entries = [];
+    const fallbackEntries = [];
     for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
         const raw = String(lines[sourceLine] || "");
         const trimmed = raw.trim();
         if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(trimmed) || /^\[\s*(?:原文|original)(?:\s*\/\s*(?:原文|original))?\s*\]$/i.test(trimmed) || /^@ORIG@\s*$/i.test(trimmed)) { originalMarkerCount += 1; inOriginal = true; continue; }
         if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
-        if (!inOriginal || !trimmed) continue;
+        if (!trimmed) continue;
         const sentences = splitKnowledgeLineIntoSentences(raw);
         if (!sentences.length) continue;
-        entries.push({ sourceLine, raw, sentences });
+        const entry = { sourceLine, raw, sentences };
+        if (inOriginal) entries.push(entry);
+        else fallbackEntries.push(entry);
     }
-    return { lineCount: lines.length, originalMarkerCount, entries };
+    const useWholeDocument = originalMarkerCount === 0 && allowWholeDocumentFallback;
+    return { lineCount: lines.length, originalMarkerCount, entries: useWholeDocument ? fallbackEntries : entries, useWholeDocument };
 };
 
 const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnostics = null, options = {}) => {
@@ -5700,7 +5704,10 @@ const MarkdownView = ({
     onKnowledgeTermClick = null,
     activeKnowledgeSourceLine = -1,
     activeKnowledgeSourceLines = [],
-    activeKnowledgeSubtitleText = ""
+    activeKnowledgeSubtitleText = "",
+    treatWholeDocumentAsOriginal = false,
+    manualKnowledgeAnchorMode = false,
+    onKnowledgeSourceLineConfirm = null
 }) => {
     if (!content || typeof content !== 'string') return null;
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
@@ -6310,8 +6317,14 @@ const MarkdownView = ({
                             <div
                                 key={i}
                                 data-knowledge-source-line={seg.sourceLine}
-                                className={`flex items-start gap-1 ${wrapClass}`}
-                                style={seg.inOriginal ? { contentVisibility: 'auto', containIntrinsicSize: '0 3.5rem' } : undefined}
+                                className={`flex items-start gap-1 ${wrapClass} ${manualKnowledgeAnchorMode ? 'cursor-crosshair rounded hover:bg-amber-50' : ''}`}
+                                style={(seg.inOriginal || treatWholeDocumentAsOriginal) ? { contentVisibility: 'auto', containIntrinsicSize: '0 3.5rem' } : undefined}
+                                onClick={(event) => {
+                                    if (!manualKnowledgeAnchorMode || typeof onKnowledgeSourceLineConfirm !== 'function') return;
+                                    event.preventDefault();
+                                    onKnowledgeSourceLineConfirm(seg.sourceLine, plainTextForLink);
+                                }}
+                                title={manualKnowledgeAnchorMode ? '點選這一行，設為目前字幕的對應位置' : undefined}
                             >
                                 {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
@@ -6519,6 +6532,7 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeAlignmentLogNotice, setEmbeddedKnowledgeAlignmentLogNotice] = useState("");
     const [embeddedKnowledgeMatchCandidates, setEmbeddedKnowledgeMatchCandidates] = useState([]);
     const [embeddedKnowledgeManualAnchors, setEmbeddedKnowledgeManualAnchors] = useState({});
+    const [embeddedKnowledgeManualAnchorMode, setEmbeddedKnowledgeManualAnchorMode] = useState(false);
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
     const [isHeaderVisible, setIsHeaderVisible] = useState(true);
@@ -16055,9 +16069,13 @@ ${userQ}`;
     const embeddedKnowledgeTermEntries = useMemo(() => {
         return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
+    const embeddedKnowledgeIsDirectBookText = useMemo(() => {
+        const filename = String(embeddedKnowledgeFileInfo?.filename || "");
+        return !/(?:知識點|knowledge\s*point|lrc)/i.test(filename);
+    }, [embeddedKnowledgeFileInfo?.filename]);
     const embeddedKnowledgeAlignmentIndex = useMemo(() => {
-        return buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText);
-    }, [embeddedKnowledgeText]);
+        return buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText, { allowWholeDocumentFallback: embeddedKnowledgeIsDirectBookText });
+    }, [embeddedKnowledgeText, embeddedKnowledgeIsDirectBookText]);
     const embeddedKnowledgeDocumentKey = useMemo(() => {
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
@@ -17992,6 +18010,14 @@ ${userQ}`;
                                     >
                                         對位Log
                                     </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setEmbeddedKnowledgeManualAnchorMode(value => !value)}
+                                        className={`px-2.5 py-1.5 text-xs rounded-full border shrink-0 ${embeddedKnowledgeManualAnchorMode ? 'border-amber-300 bg-amber-100 text-amber-800' : 'border-amber-200 bg-white text-amber-700 hover:bg-amber-50'}`}
+                                        title="開啟後，先捲到正確原文，再點該行以指定目前字幕的對應位置"
+                                    >
+                                        {embeddedKnowledgeManualAnchorMode ? '點選正文句…' : '手動定位'}
+                                    </button>
                                     {embeddedKnowledgeAlignmentLogNotice && <span className="text-[10px] text-violet-700 shrink-0">{embeddedKnowledgeAlignmentLogNotice}</span>}
                                     <div className="flex items-center gap-2 shrink-0">
                                         <span className="text-[11px] text-gray-500">高度</span>
@@ -18068,6 +18094,16 @@ ${userQ}`;
                                                 onKnowledgeTermClick={handleKnowledgePreviewTermClick}
                                                 activeKnowledgeSourceLines={embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine)}
                                                 activeKnowledgeSubtitleText={subtitles[currentIndex]?.text || ""}
+                                                treatWholeDocumentAsOriginal={embeddedKnowledgeAlignmentIndex.useWholeDocument}
+                                                manualKnowledgeAnchorMode={embeddedKnowledgeManualAnchorMode}
+                                                onKnowledgeSourceLineConfirm={(sourceLine) => {
+                                                    const key = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
+                                                    embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = sourceLine;
+                                                    setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: sourceLine }));
+                                                    setEmbeddedKnowledgeMatchCandidates([]);
+                                                    setEmbeddedKnowledgeManualAnchorMode(false);
+                                                    setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${sourceLine + 1} 行為目前字幕對應。`);
+                                                }}
                                             />
                                         )}
                                     </div>
