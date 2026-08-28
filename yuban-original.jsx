@@ -5709,7 +5709,7 @@ const MarkdownView = ({
     manualKnowledgeAnchorMode = false,
     onKnowledgeSourceLineConfirm = null
 }) => {
-    if (!content || typeof content !== 'string') return null;
+    const sourceContent = typeof content === 'string' ? content : '';
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
     const preferredSpeakerLanguage = String(speakerLanguage || "").trim();
     const tableHeaderFontSize = Math.max(10, Math.round(fontSize * 0.8));
@@ -6173,8 +6173,11 @@ const MarkdownView = ({
         return wordCount >= 4 ? 'ai' : 'native';
     };
 
-    const lines = content.split('\n');
-    const segments = [];
+    // Parsing a long converted EPUB is independent from the changing LRC cue.
+    // Cache it so playback does not split and classify the entire book again.
+    const segments = useMemo(() => {
+    const lines = sourceContent.split('\n');
+    const nextSegments = [];
     let currentTable = [];
     let inOriginalBlock = false;
     const originalStartRe = /^\[\s*原文\s*\]$/i;
@@ -6201,21 +6204,25 @@ const MarkdownView = ({
                 const nextTrim = j < lines.length ? String(lines[j] || '').trim() : '';
                 const nextIsTableRow = nextTrim.startsWith('|') && nextTrim.endsWith('|');
                 if (!nextIsTableRow) {
-                    segments.push({ type: 'table', lines: currentTable });
+                    nextSegments.push({ type: 'table', lines: currentTable });
                     currentTable = [];
                 }
             }
-            segments.push({ type: 'blank' });
+            nextSegments.push({ type: 'blank' });
             continue;
         }
 
         if (currentTable.length > 0) {
-            segments.push({ type: 'table', lines: currentTable });
+            nextSegments.push({ type: 'table', lines: currentTable });
             currentTable = [];
         }
-        segments.push({ type: 'text', content: line, inOriginal: lineInOriginal, sourceLine: idx });
+        nextSegments.push({ type: 'text', content: line, inOriginal: lineInOriginal, sourceLine: idx });
     }
-    if (currentTable.length > 0) segments.push({ type: 'table', lines: currentTable });
+    if (currentTable.length > 0) nextSegments.push({ type: 'table', lines: currentTable });
+    return nextSegments;
+    }, [sourceContent]);
+
+    if (!sourceContent) return null;
 
     return (
         <div style={{ fontSize: `${fontSize}px` }} className="space-y-3 leading-relaxed text-gray-800">
