@@ -5452,34 +5452,50 @@ const findKnowledgeSubtitleMatch = (content = "", subtitleText = "") => {
     return findKnowledgeSubtitleMatches(content, subtitleText)[0] || null;
 };
 
-const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnostics = null) => {
+// Parse the original block only once for a document.  EPUB conversions can be
+// tens of thousands of lines; repeatedly splitting it for each LRC cue made
+// playback stutter and turned a sequential alignment problem into full scans.
+const buildKnowledgeOriginalSearchIndex = (content = "") => {
+    const lines = String(content || "").replace(/\r/g, "").split("\n");
+    let inOriginal = false;
+    let originalMarkerCount = 0;
+    const entries = [];
+    for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
+        const raw = String(lines[sourceLine] || "");
+        const trimmed = raw.trim();
+        if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(trimmed) || /^\[\s*(?:原文|original)(?:\s*\/\s*(?:原文|original))?\s*\]$/i.test(trimmed) || /^@ORIG@\s*$/i.test(trimmed)) { originalMarkerCount += 1; inOriginal = true; continue; }
+        if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
+        if (!inOriginal || !trimmed) continue;
+        const sentences = splitKnowledgeLineIntoSentences(raw);
+        if (!sentences.length) continue;
+        entries.push({ sourceLine, raw, sentences });
+    }
+    return { lineCount: lines.length, originalMarkerCount, entries };
+};
+
+const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnostics = null, options = {}) => {
     const target = normalizeKnowledgeAlignmentText(subtitleText);
     const targetWords = target.match(/[\p{L}\p{N}]+/gu) || [];
     if (!target || target.length < 6) {
         if (diagnostics) Object.assign(diagnostics, { target, skipped: "subtitle_too_short", matchedLines: [], nearLines: [] });
         return [];
     }
-    const lines = String(content || "").replace(/\r/g, "").split("\n");
-    let inOriginal = false;
+    const index = options?.index || buildKnowledgeOriginalSearchIndex(content);
+    const startLine = Math.max(0, Number.isFinite(Number(options?.startLine)) ? Number(options.startLine) : 0);
+    const endLine = Number.isFinite(Number(options?.endLine)) ? Number(options.endLine) : Infinity;
     const matches = [];
     const nearLines = [];
-    let originalMarkerCount = 0;
     let eligibleLineCount = 0;
-    for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
-        const raw = String(lines[sourceLine] || "");
-        const trimmed = raw.trim();
-        if (KNOWLEDGE_ORIGINAL_MARKER_RE.test(trimmed) || /^\[\s*(?:原文|original)(?:\s*\/\s*(?:原文|original))?\s*\]$/i.test(trimmed) || /^@ORIG@\s*$/i.test(trimmed)) { originalMarkerCount += 1; inOriginal = true; continue; }
-        if (inOriginal && /^(?:LRC\s*知識點整理|@K_HEADER@|@FN@|@LG@|@TS@|@TT@|@SEC@|@ITEM@|@HEAD@|@DESC@|@EX@|@TAG@|===)/i.test(trimmed)) inOriginal = false;
-        // 僅能以使用者提供的原文 scaffold 對位；不能把 LRC 猜測配到 AI 例句或說明。
-        if (!inOriginal || !trimmed) continue;
+    for (const entry of index.entries) {
+        const { sourceLine, raw, sentences } = entry;
+        if (sourceLine < startLine || sourceLine > endLine) continue;
         // 電子書常把多句放在同一行。逐句評分可避免整段的共同功能詞
         // 意外命中遠處段落，並讓短 LRC 對到段落內真正的那一句。
         eligibleLineCount += 1;
-        const sentenceCandidates = splitKnowledgeLineIntoSentences(raw);
         // 單句 LRC 必須只和段落內的單句比較；把整段也放進候選會讓遠處句子
         // 因為「包含」關係被誤判為精確符合。LRC 本身含多句時才保留整段候選。
         const subtitleSentenceCount = splitKnowledgeLineIntoSentences(subtitleText).filter(Boolean).length;
-        const candidates = subtitleSentenceCount > 1 ? [raw, ...sentenceCandidates] : sentenceCandidates;
+        const candidates = subtitleSentenceCount > 1 ? [raw, ...sentences] : sentences;
         let bestScore = 0;
         let bestObservedScore = 0;
         let bestCandidatePreview = "";
@@ -5525,9 +5541,10 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
     if (diagnostics) {
         Object.assign(diagnostics, {
             target,
-            lineCount: lines.length,
-            originalMarkerCount,
+            lineCount: index.lineCount,
+            originalMarkerCount: index.originalMarkerCount,
             eligibleLineCount,
+            searchRange: { startLine, endLine: Number.isFinite(endLine) ? endLine : null },
             matchedLines: sortedMatches,
             nearLines: nearLines.sort((a, b) => b.observedScore - a.observedScore).slice(0, 16)
         });
@@ -6288,6 +6305,7 @@ const MarkdownView = ({
                                 key={i}
                                 data-knowledge-source-line={seg.sourceLine}
                                 className={`flex items-start gap-1 ${wrapClass}`}
+                                style={seg.inOriginal ? { contentVisibility: 'auto', containIntrinsicSize: '0 3.5rem' } : undefined}
                             >
                                 {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
@@ -6493,6 +6511,8 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(50);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [embeddedKnowledgeAlignmentLogNotice, setEmbeddedKnowledgeAlignmentLogNotice] = useState("");
+    const [embeddedKnowledgeMatchCandidates, setEmbeddedKnowledgeMatchCandidates] = useState([]);
+    const [embeddedKnowledgeManualAnchors, setEmbeddedKnowledgeManualAnchors] = useState({});
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
     const [isHeaderVisible, setIsHeaderVisible] = useState(true);
@@ -6752,6 +6772,7 @@ export default function GeminiPlayer() {
     const embeddedKnowledgePlaybackProgressRef = useRef({ documentText: "", subtitleIndex: -1, maxSourceLine: -1 });
     const embeddedKnowledgeAlignmentLogRef = useRef([]);
     const embeddedKnowledgeAlignmentLogSignatureRef = useRef("");
+    const embeddedKnowledgeMatchCandidatesRef = useRef([]);
     const knowledgePreviewPopupPanelRef = useRef(null);
     const knowledgePreviewPopupDragRef = useRef(null);
     const knowledgePreviewSplitDragRef = useRef(null);
@@ -16028,8 +16049,16 @@ ${userQ}`;
     const embeddedKnowledgeTermEntries = useMemo(() => {
         return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
+    const embeddedKnowledgeAlignmentIndex = useMemo(() => {
+        return buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText);
+    }, [embeddedKnowledgeText]);
+    const embeddedKnowledgeDocumentKey = useMemo(() => {
+        return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
+    }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
+        const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
+        const manualSourceLine = Number(embeddedKnowledgeManualAnchors[manualAnchorKey]);
         const progress = embeddedKnowledgePlaybackProgressRef.current;
         let documentReset = false;
         if (progress.documentText !== embeddedKnowledgeText) {
@@ -16049,7 +16078,18 @@ ${userQ}`;
         if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
         const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
         const diagnostics = {};
-        const allRawMatches = findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics);
+        // Once an anchor exists, this is a sequential reading task.  Search a
+        // small forward window only; a miss is surfaced for confirmation rather
+        // than silently scanning the whole book and jumping to a duplicate.
+        const windowStart = isForwardPlayback && progress.maxSourceLine >= 0 ? Math.max(0, progress.maxSourceLine - 1) : 0;
+        const windowEnd = isForwardPlayback && progress.maxSourceLine >= 0 ? progress.maxSourceLine + 260 : Infinity;
+        const allRawMatches = Number.isInteger(manualSourceLine) && manualSourceLine >= 0
+            ? [{ sourceLine: manualSourceLine, score: 1, manual: true }]
+            : findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics, {
+                index: embeddedKnowledgeAlignmentIndex,
+                startLine: windowStart,
+                endLine: windowEnd
+            });
         const rawMatches = selectKnowledgeSubtitleMatchCluster(
             allRawMatches,
             isForwardPlayback ? progress.maxSourceLine : -1
@@ -16061,6 +16101,13 @@ ${userQ}`;
         if (matches.length > 0) {
             progress.maxSourceLine = Math.max(...matches.map(match => match.sourceLine));
         }
+        embeddedKnowledgeMatchCandidatesRef.current = matches.length > 0
+            ? []
+            : (diagnostics.nearLines || []).map(item => ({
+                sourceLine: item.sourceLine,
+                score: Number(item.observedScore || item.acceptedScore || 0),
+                preview: String(item.preview || "")
+            })).slice(0, 5);
         if (hasCurrentSubtitleIndex) progress.subtitleIndex = currentIndex;
         if (hasCurrentSubtitleIndex) {
             const signature = `${embeddedKnowledgeText.length}:${currentIndex}:${subtitleText}`;
@@ -16085,7 +16132,10 @@ ${userQ}`;
             }
         }
         return matches;
-    }, [embeddedKnowledgeText, subtitles, currentIndex]);
+    }, [embeddedKnowledgeText, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, currentIndex]);
+    useEffect(() => {
+        setEmbeddedKnowledgeMatchCandidates(embeddedKnowledgeMatchCandidatesRef.current || []);
+    }, [embeddedKnowledgeDocumentKey, currentIndex, embeddedKnowledgeSubtitleMatches]);
     const copyEmbeddedKnowledgeAlignmentLog = useCallback(async () => {
         const entries = embeddedKnowledgeAlignmentLogRef.current || [];
         const text = JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
@@ -17960,6 +18010,30 @@ ${userQ}`;
                                 {trackKnowledgeTabEntries.length > 1 && (
                                     <div className="px-3 py-2 border-b border-gray-100 bg-white shrink-0 overflow-x-auto no-scrollbar">
                                         {renderTrackKnowledgeTabs("embedded")}
+                                    </div>
+                                )}
+                                {embeddedKnowledgeMatchCandidates.length > 0 && (
+                                    <div className="px-3 py-2 border-b border-amber-200 bg-amber-50 shrink-0">
+                                        <div className="text-[11px] font-semibold text-amber-800">目前字幕未自動對到。請選最接近的原文句，設為此處對應（之後會從此處往後找）：</div>
+                                        <div className="mt-1 flex flex-wrap gap-1.5">
+                                            {embeddedKnowledgeMatchCandidates.map((candidate) => (
+                                                <button
+                                                    key={`manual-anchor-${candidate.sourceLine}`}
+                                                    type="button"
+                                                    onClick={() => {
+                                                        const key = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
+                                                        embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = candidate.sourceLine;
+                                                        setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: candidate.sourceLine }));
+                                                        setEmbeddedKnowledgeMatchCandidates([]);
+                                                        setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${candidate.sourceLine + 1} 行為目前字幕對應。`);
+                                                    }}
+                                                    title={candidate.preview}
+                                                    className="max-w-[24rem] truncate rounded-lg border border-amber-300 bg-white px-2 py-1 text-left text-[11px] text-amber-900 hover:bg-amber-100"
+                                                >
+                                                    {candidate.preview || `第 ${candidate.sourceLine + 1} 行`} <span className="text-amber-600">({Math.round(candidate.score * 100)}%)</span>
+                                                </button>
+                                            ))}
+                                        </div>
                                     </div>
                                 )}
                                 <div className="flex-1 flex overflow-hidden">
