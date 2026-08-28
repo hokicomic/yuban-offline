@@ -5531,8 +5531,14 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
                 bestScore = Math.max(bestScore, score);
             }
         }
-        if (bestScore > 0 || bestObservedScore >= 0.45) {
+        // Keep a tiny best-of list even for a weak match: it is the recovery
+        // UI when transcription differs too much for automatic acceptance.
+        if (bestScore > 0 || bestCandidatePreview) {
             nearLines.push({ sourceLine, accepted: bestScore > 0, acceptedScore: bestScore, observedScore: bestObservedScore, preview: bestCandidatePreview, alignment: bestObservedAlignment });
+            if (nearLines.length > 32) {
+                nearLines.sort((a, b) => b.observedScore - a.observedScore);
+                nearLines.length = 16;
+            }
         }
         if (bestScore <= 0) continue;
         matches.push({ sourceLine, score: bestScore });
