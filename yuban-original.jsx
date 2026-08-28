@@ -17660,13 +17660,6 @@ ${userQ}`;
         }
     }, [currentTrackIndex, loadKnowledgeBankFromTxtFile, mergeFilesIntoSelectedFolderMap, trackLanguage]);
 
-    const openManualKnowledgeTxtPickerForEmbedded = useCallback(() => {
-        if (embeddedKnowledgeTxtInputRef.current) {
-            embeddedKnowledgeTxtInputRef.current.value = "";
-            embeddedKnowledgeTxtInputRef.current.click();
-        }
-    }, []);
-
     const handleManualKnowledgeTxtFileForEmbedded = useCallback(async (file) => {
         if (!file) return;
         try {
@@ -17678,6 +17671,44 @@ ${userQ}`;
             setEmbeddedKnowledgeError(String(err?.message || err || "開啟文字檔失敗。"));
         }
     }, [jumpToSubtitle, loadEmbeddedKnowledgeTxtFile, subtitles]);
+
+    const openManualKnowledgeTxtPickerForEmbedded = useCallback(async () => {
+        const mediaFolderHandle = openedFolderHandleRef.current;
+        // A File System Access directory handle lets Chrome start exactly in
+        // the already-authorized media folder instead of the last arbitrary
+        // location used by the operating system's file chooser.
+        if (mediaFolderHandle && typeof window !== 'undefined' && typeof window.showOpenFilePicker === 'function') {
+            try {
+                const handles = await window.showOpenFilePicker({
+                    multiple: false,
+                    startIn: mediaFolderHandle,
+                    types: [{
+                        description: '文字或字幕檔',
+                        accept: {
+                            'text/plain': ['.txt', '.md', '.markdown', '.srt', '.vtt', '.lrc', '.csv', '.tsv'],
+                            'application/json': ['.json'],
+                            'text/html': ['.html', '.htm', '.xml'],
+                            'application/pdf': ['.pdf'],
+                            'application/epub+zip': ['.epub']
+                        }
+                    }]
+                });
+                const file = handles && handles[0] ? await handles[0].getFile() : null;
+                if (file) await handleManualKnowledgeTxtFileForEmbedded(file);
+                return;
+            } catch (err) {
+                // Cancelling is expected.  Security/browser support failures
+                // fall through to the ordinary input, where the user can pick
+                // a file in a different folder.
+                if (err?.name === 'AbortError') return;
+                console.warn('Open TXT picker with media folder startIn failed:', err);
+            }
+        }
+        if (embeddedKnowledgeTxtInputRef.current) {
+            embeddedKnowledgeTxtInputRef.current.value = "";
+            embeddedKnowledgeTxtInputRef.current.click();
+        }
+    }, [handleManualKnowledgeTxtFileForEmbedded]);
 
     const loadEmbeddedKnowledgePanel = useCallback(async () => {
         if (!canShowEmbeddedKnowledgePanel) return false;
