@@ -5568,13 +5568,26 @@ const splitKnowledgeLineIntoSentences = (value = "") => {
     const source = String(value || "");
     const parts = source.match(/[^\n.!?。！？]+(?:[.!?。！？]+(?:[”’"')\]\}]+)?|$)/gu) || [];
     const rawParts = parts.map(part => String(part || "")).filter(Boolean);
+    // The punctuation matcher deliberately keeps punctuation simple, so it
+    // initially sees "Mr. Dursley" as "Mr." + " Dursley".  Stitch recognised
+    // abbreviations back before matching LRC to the reference text. This also
+    // covers a title in the middle of a sentence and chained initials/e.g.
+    const sentenceParts = [];
+    for (const part of rawParts) {
+        const previous = sentenceParts[sentenceParts.length - 1];
+        if (previous && isAbbreviation(previous.trim())) {
+            sentenceParts[sentenceParts.length - 1] = previous + part;
+        } else {
+            sentenceParts.push(part);
+        }
+    }
     const wordCount = (part) => (normalizeKnowledgeAlignmentText(part).match(/[\p{L}\p{N}]+/gu) || []).length;
     const isShortExclamation = (part) => wordCount(part) <= 2 && /[!?][”’"')\]\}]*\s*$/u.test(part);
     const merged = [];
-    for (let index = 0; index < rawParts.length; index += 1) {
-        const first = rawParts[index];
-        const second = rawParts[index + 1];
-        const attribution = rawParts[index + 2];
+    for (let index = 0; index < sentenceParts.length; index += 1) {
+        const first = sentenceParts[index];
+        const second = sentenceParts[index + 1];
+        const attribution = sentenceParts[index + 2];
         // “Ah! Sacré!” cried Poirot. is one spoken sentence, not three.  Only
         // merge this exact dialogue pattern; normal short LRC sentences remain
         // independently matchable.
