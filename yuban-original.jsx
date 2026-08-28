@@ -6155,8 +6155,60 @@ const MarkdownView = ({
         return nodes.length > 0 ? nodes : source;
     };
 
+    const findExactSubtitleRangesInKnowledgeLine = (text, subtitleText) => {
+        const source = String(text || "");
+        // Match the same word units as normalizeKnowledgeAlignmentText:
+        // apostrophes and hyphens separate units there (Dursley's -> dursley s).
+        const tokenRe = /[\p{L}\p{N}]+/gu;
+        const sourceTokens = Array.from(source.matchAll(tokenRe)).map(match => ({
+            start: Number(match.index || 0),
+            end: Number(match.index || 0) + String(match[0] || "").length,
+            value: normalizeKnowledgeAlignmentText(match[0])
+        })).filter(token => token.value);
+        if (sourceTokens.length < 2) return [];
+        const ranges = [];
+        for (const subtitlePart of splitKnowledgeLineIntoSentences(subtitleText)) {
+            const targetWords = normalizeKnowledgeAlignmentText(subtitlePart).match(/[\p{L}\p{N}]+/gu) || [];
+            // A one-word cue is too ambiguous inside a long ebook paragraph.
+            if (targetWords.length < 2) continue;
+            for (let startToken = 0; startToken <= sourceTokens.length - targetWords.length; startToken += 1) {
+                let same = true;
+                for (let wordIndex = 0; wordIndex < targetWords.length; wordIndex += 1) {
+                    if (sourceTokens[startToken + wordIndex].value !== targetWords[wordIndex]) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (!same) continue;
+                const first = sourceTokens[startToken];
+                const last = sourceTokens[startToken + targetWords.length - 1];
+                let end = last.end;
+                const punctuation = source.slice(end).match(/^[\s]*[,.!?;:。！？]+(?:[”’"')\]\}]*)?/u);
+                if (punctuation) end += punctuation[0].length;
+                ranges.push({ start: first.start, end });
+                break;
+            }
+        }
+        return ranges.sort((a, b) => a.start - b.start).filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
+    };
+
     const buildSentenceHighlightedKnowledgeNodes = (text, subtitleText, keyPrefix = "mdk-active") => {
         const source = String(text || "");
+        // LRC often ends a cue at a semicolon/comma even though the ebook keeps
+        // the surrounding prose as one grammatical sentence. Prefer an exact
+        // word-range so only the spoken cue is marked (including Mr./Ms.).
+        const exactRanges = findExactSubtitleRangesInKnowledgeLine(source, subtitleText);
+        if (exactRanges.length > 0) {
+            const nodes = [];
+            let cursor = 0;
+            exactRanges.forEach((range, index) => {
+                if (range.start > cursor) nodes.push(<React.Fragment key={`${keyPrefix}-before-${index}`}>{buildKnowledgeLinkedNodes(source.slice(cursor, range.start), `${keyPrefix}-before-${index}`)}</React.Fragment>);
+                nodes.push(<mark key={`${keyPrefix}-exact-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{buildKnowledgeLinkedNodes(source.slice(range.start, range.end), `${keyPrefix}-exact-${index}`)}</mark>);
+                cursor = range.end;
+            });
+            if (cursor < source.length) nodes.push(<React.Fragment key={`${keyPrefix}-after`}>{buildKnowledgeLinkedNodes(source.slice(cursor), `${keyPrefix}-after`)}</React.Fragment>);
+            return nodes;
+        }
         const sentences = splitKnowledgeLineIntoSentences(source);
         if (!sentences.length) return buildKnowledgeLinkedNodes(source, keyPrefix);
         return sentences.map((sentence, index) => {
@@ -9610,13 +9662,13 @@ ${subtitles.slice(Math.max(0, currentIndex - 2), Math.min(subtitles.length, curr
               Then provide the merged answer and explanation.
 
             **CRITICAL**: Ensure "Example Sentence" is strictly in the Target Language and uses **simple, high-frequency vocabulary** suitable for Level ${learnerLevel}.
-            **TAGGING**: Wrap ALL target-language words/phrases/sentences with <T lang="${targetLangTag}">...</T> (including any non-table text). 
+            **TAGGING**: Wrap ALL target-language words/phrases/sentences with <T lang="${targetLangTag}">...</T> (including any non-table text).
             **EXAMPLE ORDER**: Target-language sentence first, then Chinese translation on the next line using <small>中文翻譯</small>. ${translationInstruction} ${targetLanguageSafetyInstruction} ${targetFixInstruction}`;
         } else if (type === 'deep') {
             title = "文法詳解";
             const langPrompt = "Focus on grammar patterns and usage. Minimize literary analysis unless truly necessary for understanding.";
 
-            specificPrompt = `TASK: ${langPrompt} 
+            specificPrompt = `TASK: ${langPrompt}
             ${contextDisambiguationOnly}
             TARGET LANGUAGE CODE: ${trackLanguage}
             Explain *why* this phrasing is used and how to apply it.
