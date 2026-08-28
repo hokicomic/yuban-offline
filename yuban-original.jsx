@@ -6222,13 +6222,28 @@ const MarkdownView = ({
     return nextSegments;
     }, [sourceContent]);
 
+    // A converted novel can contain thousands of paragraphs.  During playback
+    // render only the current reading neighbourhood; manual-anchor mode remains
+    // full-document so the learner can deliberately browse and choose a line.
+    const renderSegments = useMemo(() => {
+        const activeLines = Array.isArray(activeKnowledgeSourceLines)
+            ? activeKnowledgeSourceLines.filter(Number.isFinite)
+            : [];
+        const shouldWindow = treatWholeDocumentAsOriginal && !manualKnowledgeAnchorMode && segments.length > 900;
+        if (!shouldWindow) return segments;
+        const anchor = activeLines.length ? Math.min(...activeLines) : 0;
+        const start = Math.max(0, anchor - 100);
+        const end = anchor + 240;
+        return segments.filter((segment) => Number.isFinite(segment?.sourceLine) && segment.sourceLine >= start && segment.sourceLine <= end);
+    }, [segments, activeKnowledgeSourceLines, treatWholeDocumentAsOriginal, manualKnowledgeAnchorMode]);
+
     if (!sourceContent) return null;
 
     return (
         <div style={{ fontSize: `${fontSize}px` }} className="space-y-3 leading-relaxed text-gray-800">
             {(() => {
                 let lastTextType = null;
-                return segments.map((seg, i) => {
+                return renderSegments.map((seg, i) => {
                     if (seg.type === 'blank') {
                         lastTextType = null;
                         return <div key={i} className="h-2" />;
@@ -16073,13 +16088,16 @@ ${userQ}`;
         if (!isKnowledgePreviewTextMode) return [];
         return buildKnowledgeTermEntriesFromTxt(modalContent);
     }, [buildKnowledgeTermEntriesFromTxt, isKnowledgePreviewTextMode, modalContent]);
-    const embeddedKnowledgeTermEntries = useMemo(() => {
-        return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
-    }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeText]);
     const embeddedKnowledgeIsDirectBookText = useMemo(() => {
         const filename = String(embeddedKnowledgeFileInfo?.filename || "");
         return !/(?:知識點|knowledge\s*point|lrc)/i.test(filename);
     }, [embeddedKnowledgeFileInfo?.filename]);
+    const embeddedKnowledgeTermEntries = useMemo(() => {
+        // Plain EPUB/PDF exports are reading references, not knowledge-point
+        // files.  Do not parse their prose into clickable vocabulary entries.
+        if (embeddedKnowledgeIsDirectBookText) return [];
+        return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
+    }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeIsDirectBookText, embeddedKnowledgeText]);
     const embeddedKnowledgeAlignmentIndex = useMemo(() => {
         return buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText, { allowWholeDocumentFallback: embeddedKnowledgeIsDirectBookText });
     }, [embeddedKnowledgeText, embeddedKnowledgeIsDirectBookText]);
@@ -18096,7 +18114,7 @@ ${userQ}`;
                                                 fontSize={embeddedKnowledgeFontSize}
                                                 trackLanguage={trackLanguage}
                                                 speakerLanguage={String(embeddedKnowledgeFileInfo?.targetLanguage || trackLanguage || "").trim()}
-                                                enableKnowledgeTermLinks={true}
+                                                enableKnowledgeTermLinks={!embeddedKnowledgeIsDirectBookText}
                                                 knowledgeTermEntries={embeddedKnowledgeTermEntries}
                                                 onKnowledgeTermClick={handleKnowledgePreviewTermClick}
                                                 activeKnowledgeSourceLines={embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine)}
