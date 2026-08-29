@@ -6876,7 +6876,16 @@ export default function GeminiPlayer() {
     const embeddedKnowledgeContentRef = useRef(null);
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
-    const embeddedKnowledgePlaybackProgressRef = useRef({ documentText: "", subtitleIndex: -1, maxSourceLine: -1 });
+    // Do not lock the document cursor until the audiobook is reliably aligned
+    // to body text. Opening narration (title, author, rights notice) can match
+    // a duplicate phrase much later in a book.
+    const embeddedKnowledgePlaybackProgressRef = useRef({
+        documentText: "",
+        subtitleIndex: -1,
+        maxSourceLine: -1,
+        anchorState: "unanchored",
+        anchorCandidate: null
+    });
     const embeddedKnowledgeAlignmentLogRef = useRef([]);
     const embeddedKnowledgeAlignmentLogSignatureRef = useRef("");
     const embeddedKnowledgeMatchCandidatesRef = useRef([]);
@@ -16179,6 +16188,8 @@ ${userQ}`;
             progress.documentText = embeddedKnowledgeText;
             progress.subtitleIndex = -1;
             progress.maxSourceLine = -1;
+            progress.anchorState = "unanchored";
+            progress.anchorCandidate = null;
             embeddedKnowledgeAlignmentLogRef.current = [];
             embeddedKnowledgeAlignmentLogSignatureRef.current = "";
             documentReset = true;
@@ -16188,15 +16199,28 @@ ${userQ}`;
         // 不能清掉防回頭保護，否則下一段會重新選中先前原文並把視窗捲上去。
         const hasCurrentSubtitleIndex = Number.isInteger(currentIndex) && currentIndex >= 0;
         const hadSubtitleIndex = Number.isInteger(progress.subtitleIndex) && progress.subtitleIndex >= 0;
-        const progressBefore = { subtitleIndex: progress.subtitleIndex, maxSourceLine: progress.maxSourceLine };
-        if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) progress.maxSourceLine = -1;
+        const progressBefore = {
+            subtitleIndex: progress.subtitleIndex,
+            maxSourceLine: progress.maxSourceLine,
+            anchorState: progress.anchorState,
+            anchorCandidate: progress.anchorCandidate
+        };
+        if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) {
+            progress.maxSourceLine = -1;
+            progress.anchorState = "unanchored";
+            progress.anchorCandidate = null;
+        }
         const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
         const diagnostics = {};
         // Once an anchor exists, this is a sequential reading task.  Search a
         // small forward window only; a miss is surfaced for confirmation rather
         // than silently scanning the whole book and jumping to a duplicate.
-        const windowStart = isForwardPlayback && progress.maxSourceLine >= 0 ? Math.max(0, progress.maxSourceLine - 1) : 0;
-        const windowEnd = isForwardPlayback && progress.maxSourceLine >= 0 ? progress.maxSourceLine + 260 : Infinity;
+        const isAnchored = progress.anchorState === "anchored" && progress.maxSourceLine >= 0;
+        const INITIAL_ANCHOR_MAX_LINES = 480;
+        const windowStart = isAnchored && isForwardPlayback ? Math.max(0, progress.maxSourceLine - 1) : 0;
+        const windowEnd = isAnchored && isForwardPlayback
+            ? progress.maxSourceLine + 260
+            : (isAnchored ? Infinity : INITIAL_ANCHOR_MAX_LINES);
         const allRawMatches = Number.isInteger(manualSourceLine) && manualSourceLine >= 0
             ? [{ sourceLine: manualSourceLine, score: 1, manual: true }]
             : findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics, {
@@ -16206,14 +16230,44 @@ ${userQ}`;
             });
         const rawMatches = selectKnowledgeSubtitleMatchCluster(
             allRawMatches,
-            isForwardPlayback ? progress.maxSourceLine : -1
+            isAnchored && isForwardPlayback ? progress.maxSourceLine : -1
         );
-        const matches = isForwardPlayback && progress.maxSourceLine >= 0
+        const matches = isAnchored && isForwardPlayback
             ? rawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
             : rawMatches;
         const rejectedByCursor = rawMatches.filter(match => !matches.some(kept => kept.sourceLine === match.sourceLine));
-        if (matches.length > 0) {
+        const bestMatch = matches.reduce((best, match) => !best || Number(match.score || 0) > Number(best.score || 0) ? match : best, null);
+        let anchorEvent = "unchanged";
+        if (bestMatch?.manual) {
+            progress.anchorState = "anchored";
+            progress.anchorCandidate = null;
+            progress.maxSourceLine = Math.max(progress.maxSourceLine, bestMatch.sourceLine);
+            anchorEvent = "manual_anchor";
+        } else if (isAnchored && matches.length > 0) {
             progress.maxSourceLine = Math.max(...matches.map(match => match.sourceLine));
+            anchorEvent = "advance";
+        } else if (!isAnchored && bestMatch) {
+            const candidate = progress.anchorCandidate;
+            const score = Number(bestMatch.score || 0);
+            const isSequentialConfirmation = candidate &&
+                hasCurrentSubtitleIndex &&
+                currentIndex > Number(candidate.subtitleIndex || -1) &&
+                currentIndex - Number(candidate.subtitleIndex || -1) <= 4 &&
+                bestMatch.sourceLine >= Number(candidate.sourceLine || 0) &&
+                bestMatch.sourceLine - Number(candidate.sourceLine || 0) <= 120;
+            // Require two nearby forward cues before treating a body position
+            // as authoritative; a one-off title match must not jump to a later chapter.
+            if (score >= 0.88 && isSequentialConfirmation) {
+                progress.anchorState = "anchored";
+                progress.anchorCandidate = null;
+                progress.maxSourceLine = bestMatch.sourceLine;
+                anchorEvent = "anchor_confirmed";
+            } else if (score >= 0.88) {
+                progress.anchorCandidate = { subtitleIndex: currentIndex, sourceLine: bestMatch.sourceLine, score };
+                anchorEvent = "anchor_candidate";
+            } else {
+                anchorEvent = "untrusted_opening_match";
+            }
         }
         embeddedKnowledgeMatchCandidatesRef.current = matches.length > 0
             ? []
@@ -16234,11 +16288,18 @@ ${userQ}`;
                     documentReset,
                     progressBefore,
                     isForwardPlayback,
+                    isAnchoredBefore: isAnchored,
+                    anchorEvent,
                     allRawMatches,
                     selectedCluster: rawMatches,
                     rejectedByCursor,
                     finalMatches: matches,
-                    progressAfter: { subtitleIndex: progress.subtitleIndex, maxSourceLine: progress.maxSourceLine },
+                    progressAfter: {
+                        subtitleIndex: progress.subtitleIndex,
+                        maxSourceLine: progress.maxSourceLine,
+                        anchorState: progress.anchorState,
+                        anchorCandidate: progress.anchorCandidate
+                    },
                     diagnostics
                 };
                 embeddedKnowledgeAlignmentLogRef.current = [...embeddedKnowledgeAlignmentLogRef.current, entry].slice(-120);
@@ -18176,6 +18237,8 @@ ${userQ}`;
                                                     onClick={() => {
                                                         const key = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
                                                         embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = candidate.sourceLine;
+                                                        embeddedKnowledgePlaybackProgressRef.current.anchorState = "anchored";
+                                                        embeddedKnowledgePlaybackProgressRef.current.anchorCandidate = null;
                                                         setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: candidate.sourceLine }));
                                                         setEmbeddedKnowledgeMatchCandidates([]);
                                                         setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${candidate.sourceLine + 1} 行為目前字幕對應。`);
@@ -18220,6 +18283,8 @@ ${userQ}`;
                                                 onKnowledgeSourceLineConfirm={(sourceLine) => {
                                                     const key = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
                                                     embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = sourceLine;
+                                                    embeddedKnowledgePlaybackProgressRef.current.anchorState = "anchored";
+                                                    embeddedKnowledgePlaybackProgressRef.current.anchorCandidate = null;
                                                     setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: sourceLine }));
                                                     setEmbeddedKnowledgeMatchCandidates([]);
                                                     setEmbeddedKnowledgeManualAnchorMode(false);
