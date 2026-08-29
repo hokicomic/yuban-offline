@@ -16269,13 +16269,18 @@ ${userQ}`;
                 anchorEvent = "untrusted_opening_match";
             }
         }
-        embeddedKnowledgeMatchCandidatesRef.current = matches.length > 0
+        // A provisional opening match is diagnostic data only.  It must never
+        // drive MarkdownView's active-line rendering or automatic scroll: a
+        // title/credits cue can be a convincing but unrelated match.
+        const hasConfirmedAnchor = progress.anchorState === "anchored";
+        const visibleMatches = hasConfirmedAnchor ? matches : [];
+        embeddedKnowledgeMatchCandidatesRef.current = visibleMatches.length > 0
             ? []
             : (diagnostics.nearLines || []).map(item => ({
                 sourceLine: item.sourceLine,
                 score: Number(item.observedScore || item.acceptedScore || 0),
                 preview: String(item.preview || "")
-            })).slice(0, 5);
+            })).filter(item => item.score >= 0.58).slice(0, 5);
         if (hasCurrentSubtitleIndex) progress.subtitleIndex = currentIndex;
         if (hasCurrentSubtitleIndex) {
             const signature = `${embeddedKnowledgeText.length}:${currentIndex}:${subtitleText}`;
@@ -16293,7 +16298,7 @@ ${userQ}`;
                     allRawMatches,
                     selectedCluster: rawMatches,
                     rejectedByCursor,
-                    finalMatches: matches,
+                    finalMatches: visibleMatches,
                     progressAfter: {
                         subtitleIndex: progress.subtitleIndex,
                         maxSourceLine: progress.maxSourceLine,
@@ -16306,7 +16311,7 @@ ${userQ}`;
                 console.info("[Yuban alignment]", entry);
             }
         }
-        return matches;
+        return visibleMatches;
     }, [embeddedKnowledgeText, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, currentIndex]);
     useEffect(() => {
         setEmbeddedKnowledgeMatchCandidates(embeddedKnowledgeMatchCandidatesRef.current || []);
