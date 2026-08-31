@@ -4806,11 +4806,24 @@ const normalizeJapaneseRubyForSpeech = (rawText = "", langHint = "") => {
             if (!base || !reading) return acc;
             return acc.replace(new RegExp(escapeRegExp(base) + "\\s*" + escapeRegExp(reading), "gu"), reading);
         }, text);
-    return normalizePastedRuby(src)
+    let normalized = normalizePastedRuby(src)
+        // Japanese-learning cards sometimes use square brackets as visual
+        // emphasis/read-along markers. They are not spoken content.
+        .replace(/[\[\]［］]/g, '')
         .replace(/[\u4e00-\u9fff々〆ヵヶ]+\s*[（(]\s*([\u3040-\u309f\u30a0-\u30ffー]{1,32})\s*[）)]/gu, '$1')
         .replace(/[「」『』]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
+    // e.g. 「［どうも］ありがとう［ございます］。（［どうも］ありがとう［ございます］。）」
+    // contains a parenthetical duplicate for display. Say the sentence once.
+    const duplicate = normalized.match(/^(.+?)\s*[（(]\s*(.+?)\s*[）)]\s*$/u);
+    if (duplicate) {
+        const comparable = (value) => String(value || '').replace(/[\s。！？!?]/gu, '');
+        if (comparable(duplicate[1]) && comparable(duplicate[1]) === comparable(duplicate[2])) {
+            normalized = String(duplicate[1] || '').trim();
+        }
+    }
+    return normalized;
 };
 
 // ============================================================================
