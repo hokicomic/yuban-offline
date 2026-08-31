@@ -5046,6 +5046,13 @@ const QuickSpeakBtn = ({ text, size = 16, className = "", rate = 1.0, mode = 'na
             const textHasJapanese = hasJapanese(text);
             const fallbackIsJapanese = /^ja/i.test(String(fallbackLang || trackLanguage || ""));
             const textHasChineseCue = /(?:這|這個|這裡|這種|這樣|意思|說明|中文|中譯|翻譯|解釋|例句|用法|常見|錯誤|比較|注意|表示|相當於|不是|可以|通常|後面|前面)/u.test(text);
+            // Kana is unambiguous evidence that this is a Japanese sentence.
+            // Do this before consulting the file/track language, which may be
+            // `auto` or inherited from a Chinese UI and must not reclassify
+            // embedded kanji (研究者) as Mandarin.
+            if (textHasJapanese && !textHasChineseCue) {
+                return [{ text, lang: "ja-JP" }];
+            }
             // Once an example is known to be Japanese, keep kanji in the same
             // ja-JP utterance instead of splitting it into a zh-TW segment.
             if (fallbackIsJapanese && !textHasChineseCue) {
