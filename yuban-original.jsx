@@ -16246,11 +16246,10 @@ ${userQ}`;
             anchorState: progress.anchorState,
             anchorCandidate: progress.anchorCandidate
         };
-        if (hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex) {
-            progress.maxSourceLine = -1;
-            progress.anchorState = "unanchored";
-            progress.anchorCandidate = null;
-        }
+        const isRewindPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex;
+        // Keep a proven body anchor during rewind.  Resetting it forced a large
+        // EPUB/TXT back to the first 480 lines, where the previous line could
+        // never be found once playback had reached the body of the book.
         const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
         const diagnostics = {};
         // Once an anchor exists, this is a sequential reading task.  Search a
@@ -16258,10 +16257,14 @@ ${userQ}`;
         // than silently scanning the whole book and jumping to a duplicate.
         const isAnchored = progress.anchorState === "anchored" && progress.maxSourceLine >= 0;
         const INITIAL_ANCHOR_MAX_LINES = 480;
-        const windowStart = isAnchored && isForwardPlayback ? Math.max(0, progress.maxSourceLine - 1) : 0;
+        const windowStart = isAnchored && isForwardPlayback
+            ? Math.max(0, progress.maxSourceLine - 1)
+            : (isAnchored && isRewindPlayback ? Math.max(0, progress.maxSourceLine - 260) : 0);
         const windowEnd = isAnchored && isForwardPlayback
             ? progress.maxSourceLine + 260
-            : (isAnchored ? Infinity : INITIAL_ANCHOR_MAX_LINES);
+            : (isAnchored && isRewindPlayback
+                ? progress.maxSourceLine + 24
+                : (isAnchored ? Infinity : INITIAL_ANCHOR_MAX_LINES));
         const allRawMatches = Number.isInteger(manualSourceLine) && manualSourceLine >= 0
             ? [{ sourceLine: manualSourceLine, score: 1, manual: true }]
             : findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics, {
@@ -16285,8 +16288,10 @@ ${userQ}`;
             progress.maxSourceLine = Math.max(progress.maxSourceLine, bestMatch.sourceLine);
             anchorEvent = "manual_anchor";
         } else if (isAnchored && matches.length > 0) {
-            progress.maxSourceLine = Math.max(...matches.map(match => match.sourceLine));
-            anchorEvent = "advance";
+            progress.maxSourceLine = isRewindPlayback
+                ? Math.max(...matches.map(match => match.sourceLine))
+                : Math.max(progress.maxSourceLine, ...matches.map(match => match.sourceLine));
+            anchorEvent = isRewindPlayback ? "rewind" : "advance";
         } else if (!isAnchored && bestMatch) {
             const candidate = progress.anchorCandidate;
             const score = Number(bestMatch.score || 0);
@@ -16334,6 +16339,7 @@ ${userQ}`;
                     documentReset,
                     progressBefore,
                     isForwardPlayback,
+                    isRewindPlayback,
                     isAnchoredBefore: isAnchored,
                     anchorEvent,
                     allRawMatches,
