@@ -964,6 +964,21 @@ const extractBackExamplesForSpeech = (card = null) => {
     return direct || parsed;
 };
 
+// The reverse-card question is the Chinese definition only.  Examples belong
+// to the answer side and must never become a fallback for question-side audio.
+const extractBackExplanationZhForSpeech = (card = null) => {
+    const backText = String(card?.back || "");
+    if (!backText) return "";
+    const explanation = backText
+        .split(/例句\s*[:：]/i)[0]
+        .split(/(?:^|\n)\s*(?:Tags?|分類)\s*[:：]/i)[0]
+        .replace(/^\s*(?:說明|解釋|解释)\s*[:：]\s*/i, "")
+        .trim();
+    // Do not turn a target-language-only definition into zh-TW speech.
+    if (!/[\u4e00-\u9fff]/u.test(explanation)) return "";
+    return sanitizeSpeakerText(explanation, "zh-TW");
+};
+
 const extractBackExampleZhTranslations = (card = null) => {
     if (!card) return "";
     const backText = String(card.back || "");
@@ -16467,14 +16482,9 @@ ${userQ}`;
     );
     const flashCardBackZhSpeakText = sanitizeSpeakerText(
         normalizeJapaneseRubyForSpeech(String(currentFlashCard?.backZhSpeakText || ""), "zh-TW")
-    );
-    const flashCardReverseFrontSpeakText = flashCardBackZhSpeakText || flashCardBackExampleSpeakText || sanitizeSpeakerText(
-        normalizeJapaneseRubyForSpeech(String(currentFlashCard?.back || ""), trackLanguage)
-    );
-    const flashCardFrontExampleZhText = String(currentFlashCard?.back || "").match(/例句\s*[:：]/i)
-        ? extractBackExampleZhTranslations(currentFlashCard)
-        : "";
-    const shouldShowFlashCardFrontExamples = Boolean(flashCardFrontExampleZhText);
+    ) || extractBackExplanationZhForSpeech(currentFlashCard);
+    // Never fall back to example/original text on the reverse question side.
+    const flashCardReverseFrontSpeakText = flashCardBackZhSpeakText;
 
     const flashCardBackDisplayData = useMemo(() => {
         const frontText = String(currentFlashCard?.front || "");
@@ -19472,12 +19482,6 @@ ${userQ}`;
                                                                             )}
                                                                         </div>
                                                                         <p className="text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardBackDisplayData.explanation}</p>
-                                                                        {shouldShowFlashCardFrontExamples && (
-                                                                            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
-                                                                                <p className="mb-1 text-[11px] font-bold text-amber-700">例句中譯</p>
-                                                                                <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardFrontExampleZhText}</p>
-                                                                            </div>
-                                                                        )}
                                                                         <p className="mt-4 text-xs text-cyan-700 font-semibold">點擊看答案</p>
                                                                         {flashCardAutoRun && (
                                                                             <p className="mt-1 text-[11px] text-emerald-700">
@@ -19507,12 +19511,6 @@ ${userQ}`;
                                                                             )}
                                                                         </div>
                                                                         <p className="text-2xl font-bold text-gray-900 leading-relaxed">{flashCardBackDisplayData.front}</p>
-                                                                        {shouldShowFlashCardFrontExamples && (
-                                                                            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
-                                                                                <p className="mb-1 text-[11px] font-bold text-amber-700">例句中譯</p>
-                                                                                <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardFrontExampleZhText}</p>
-                                                                            </div>
-                                                                        )}
                                                                         <p className="mt-4 text-xs text-cyan-700 font-semibold">點擊看答案</p>
                                                                         {flashCardAutoRun && (
                                                                             <p className="mt-1 text-[11px] text-emerald-700">
