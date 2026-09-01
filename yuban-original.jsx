@@ -983,12 +983,6 @@ const extractBackExampleZhTranslations = (card = null) => {
     if (!card) return "";
     const backText = String(card.back || "");
     if (!backText) return "";
-    const exMatch = backText.match(/例句\s*[:：]\s*([\s\S]*)/i);
-    if (!exMatch) return "";
-    const rawExamples = String(exMatch[1] || "")
-        .split(/\n(?:\s*Tags?\s*[:：]|\s*分類\s*[:：])/i)[0]
-        .trim();
-    if (!rawExamples) return "";
 
     const out = [];
     const seen = new Set();
@@ -1004,24 +998,31 @@ const extractBackExampleZhTranslations = (card = null) => {
         out.push(cleaned);
     };
 
-    // 中譯本身可以有括號，例如「罷免（踢走）了…」。先依最外層
-    // 例句分段，再只移除最後的外層中譯括號，不能在第一個 ）截斷。
-    for (const exampleSegment of splitExampleSegmentsPreservingParens(rawExamples)) {
-        const marker = String(exampleSegment || "").match(/[（(]\s*中譯\s*[:：]\s*/i);
-        if (!marker || marker.index == null) continue;
-        const translation = String(exampleSegment || "")
-            .slice(marker.index + marker[0].length)
-            .replace(/[）)]\s*$/, "")
-            .trim();
-        push(translation);
-    }
-    if (out.length === 0) {
-        rawExamples
-            .split(/\r?\n|[\/／]\s*/g)
-            .forEach((part) => {
-                const lineMatch = String(part || "").match(/中譯\s*[:：]\s*(.+)$/i);
-                if (lineMatch) push(lineMatch[1]);
-            });
+    // 題底的例句可用較寬鬆的格式顯示；題面也必須接受同一批資料。
+    // 不再以「例句：」為前提，直接掃描所有中譯／中文翻譯標記，避免
+    // 格式略異時題底看得到例句、題面卻遺漏中譯。
+    const markerRe = /(?:[（(]\s*)?(?:中[譯译]|中文(?:翻[譯译])?|翻[譯译])\s*(?:[:：]|[】\]])\s*/giu;
+    let marker;
+    while ((marker = markerRe.exec(backText))) {
+        const start = markerRe.lastIndex;
+        let end = start;
+        let depth = 0;
+        for (; end < backText.length; end += 1) {
+            const ch = backText[end];
+            if (ch === '（' || ch === '(') {
+                depth += 1;
+                continue;
+            }
+            if (ch === '）' || ch === ')') {
+                if (depth === 0) break;
+                depth -= 1;
+                continue;
+            }
+            if (depth === 0 && ch === '\n') break;
+            if (depth === 0 && /^(?:Tags?|分類)\s*[:：]/i.test(backText.slice(end))) break;
+        }
+        push(backText.slice(start, end));
+        markerRe.lastIndex = Math.max(markerRe.lastIndex, end + 1);
     }
     return out.join("\n");
 };
