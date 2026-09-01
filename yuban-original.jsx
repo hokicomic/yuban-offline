@@ -16485,6 +16485,10 @@ ${userQ}`;
     ) || extractBackExplanationZhForSpeech(currentFlashCard);
     // Never fall back to example/original text on the reverse question side.
     const flashCardReverseFrontSpeakText = flashCardBackZhSpeakText;
+    const flashCardFrontExampleZhText = String(currentFlashCard?.back || "").match(/例句\s*[:：]/i)
+        ? extractBackExampleZhTranslations(currentFlashCard)
+        : "";
+    const shouldShowFlashCardReverseExamples = Boolean(flashCardFrontExampleZhText);
 
     const flashCardBackDisplayData = useMemo(() => {
         const frontText = String(currentFlashCard?.front || "");
@@ -19482,6 +19486,12 @@ ${userQ}`;
                                                                             )}
                                                                         </div>
                                                                         <p className="text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardBackDisplayData.explanation}</p>
+                                                                        {shouldShowFlashCardReverseExamples && (
+                                                                            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                                                                                <p className="mb-1 text-[11px] font-bold text-amber-700">例句中譯</p>
+                                                                                <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardFrontExampleZhText}</p>
+                                                                            </div>
+                                                                        )}
                                                                         <p className="mt-4 text-xs text-cyan-700 font-semibold">點擊看答案</p>
                                                                         {flashCardAutoRun && (
                                                                             <p className="mt-1 text-[11px] text-emerald-700">
