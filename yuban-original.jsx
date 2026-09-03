@@ -185,6 +185,10 @@ function normalizeFlashCardText(text) {
     return s.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function stripFlashCardStudyMarks(text) {
+    return String(text || "").replace(/==([\s\S]*?)==/g, "$1");
+}
+
 function stripFlashCardFrontPronunciationForMastery(text) {
     let s = String(text || "").trim();
     if (!s) return "";
@@ -233,6 +237,24 @@ function buildFlashCardId(card) {
 }
 
 const FLASHCARD_MASTERY_SNAPSHOT_MAX_BACK_CHARS = 8000;
+const FLASHCARD_PERSONALIZATION_MAX_CHARS = 12000;
+
+function normalizeFlashCardPersonalization(rawPersonalization) {
+    const raw = rawPersonalization && typeof rawPersonalization === "object" ? rawPersonalization : null;
+    if (!raw) return null;
+    const front = String(raw.front || "").trim().slice(0, FLASHCARD_PERSONALIZATION_MAX_CHARS);
+    const back = String(raw.back || "").trim().slice(0, FLASHCARD_PERSONALIZATION_MAX_CHARS);
+    if (!front) return null;
+    return { front, back, updatedAt: String(raw.updatedAt || "") };
+}
+
+function mergeFlashCardPersonalization(existingRaw, incomingRaw) {
+    const existing = normalizeFlashCardPersonalization(existingRaw);
+    const incoming = normalizeFlashCardPersonalization(incomingRaw);
+    if (!existing) return incoming;
+    if (!incoming) return existing;
+    return String(incoming.updatedAt || "") >= String(existing.updatedAt || "") ? incoming : existing;
+}
 
 function normalizeFlashCardMasterySnapshot(rawSnapshot, fallbackHead = "") {
     const raw = rawSnapshot && typeof rawSnapshot === "object" ? rawSnapshot : {};
@@ -287,13 +309,19 @@ function mergeFlashCardMasterySnapshot(existingSnapshot, incomingSnapshot) {
 function buildFlashCardFromMasterySnapshot(entry, index = 0) {
     const snapshot = normalizeFlashCardMasterySnapshot(entry?.snapshot, entry?.head);
     if (!snapshot) return null;
+    const personalization = normalizeFlashCardPersonalization(entry?.personalization);
+    const front = personalization?.front || snapshot.front;
+    const back = personalization ? personalization.back : snapshot.back;
     return {
         id: `mastery-${String(entry?.cardId || index)}`,
+        masteryCardId: String(entry?.cardId || ""),
+        masteryOriginalCard: { front: snapshot.front, back: snapshot.back },
+        personalization,
         category: snapshot.category,
         categoryLabel: snapshot.categoryLabel || QUIZ_FOCUS_TYPE_LABELS?.[snapshot.category] || snapshot.category,
-        front: snapshot.front,
-        back: snapshot.back,
-        frontSpeakText: extractFrontTermForSpeech(snapshot.front) || snapshot.front,
+        front,
+        back,
+        frontSpeakText: extractFrontTermForSpeech(front) || front,
         speakText: "",
         backZhSpeakText: ""
     };
@@ -324,7 +352,8 @@ function mergeFlashCardMasteryEntry(existing, incoming, options = {}) {
         // FSRS becomes the source of truth for future scheduling.  The newest
         // real FSRS state wins; legacy counters remain historical only.
         fsrs: latest.fsrs || existing.fsrs || incoming.fsrs || null,
-        snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, incoming.snapshot)
+        snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, incoming.snapshot),
+        personalization: mergeFlashCardPersonalization(existing.personalization, incoming.personalization)
     };
 }
 
@@ -370,7 +399,8 @@ function normalizeFlashCardMasteryEntry(rawEntry, fallbackKey, nowIso) {
         lastReviewedAt: lastReview ? String(lastReview) : "",
         discardedAt: entry.discardedAt ? String(entry.discardedAt) : "",
         fsrs: entry.fsrs && typeof entry.fsrs === "object" ? entry.fsrs : null,
-        snapshot: normalizeFlashCardMasterySnapshot(entry.snapshot || entry.savedCard, head)
+        snapshot: normalizeFlashCardMasterySnapshot(entry.snapshot || entry.savedCard, head),
+        personalization: normalizeFlashCardPersonalization(entry.personalization || entry.personalizedCard)
     };
 }
 
@@ -6763,6 +6793,9 @@ export default function GeminiPlayer() {
     const [flashCardMasteryDirHandle, setFlashCardMasteryDirHandle] = useState(null);
     const [flashCardMasterySyncStatus, setFlashCardMasterySyncStatus] = useState("local_only");
     const [flashCardMasteryLastSaveError, setFlashCardMasteryLastSaveError] = useState("");
+    const [flashCardEditDraft, setFlashCardEditDraft] = useState(null);
+    const flashCardEditFrontRef = useRef(null);
+    const flashCardEditBackRef = useRef(null);
     const [flashCardFilterMode, setFlashCardFilterMode] = useState('all');
     const [flashCardRememberedMinInput, setFlashCardRememberedMinInput] = useState("");
     const [flashCardForgotMinInput, setFlashCardForgotMinInput] = useState("");
@@ -15803,10 +15836,31 @@ ${userQ}`;
         : flashCardCategories.filter((k) => k && k !== 'all');
     const getFlashCardMasteryForCard = useCallback((card) => {
         const cards = flashCardMasteryData?.cards || {};
-        const cardId = buildFlashCardId(card);
+        const cardId = String(card?.masteryCardId || buildFlashCardId(card));
         const frontKey = String(getFlashCardFrontText(card) || "");
         return cards[cardId] || cards[frontKey] || null;
     }, [flashCardMasteryData]);
+    const applyFlashCardPersonalization = useCallback((card) => {
+        if (!card) return card;
+        const mastery = getFlashCardMasteryForCard(card);
+        const personalization = normalizeFlashCardPersonalization(mastery?.personalization);
+        if (!personalization) return card;
+        const originalCard = card?.masteryOriginalCard || {
+            front: getFlashCardFrontText(card),
+            back: getFlashCardBackText(card)
+        };
+        return {
+            ...card,
+            masteryCardId: String(mastery?.cardId || card?.masteryCardId || buildFlashCardId(originalCard)),
+            masteryOriginalCard: originalCard,
+            personalization,
+            front: personalization.front,
+            back: personalization.back,
+            frontSpeakText: extractFrontTermForSpeech(personalization.front) || personalization.front,
+            speakText: "",
+            backZhSpeakText: ""
+        };
+    }, [getFlashCardMasteryForCard]);
     const parseFlashCardFilterMin = useCallback((raw) => {
         const s = String(raw || "").trim();
         if (!s) return null;
@@ -15849,7 +15903,7 @@ ${userQ}`;
         }
 
         return true;
-    });
+    }).map(applyFlashCardPersonalization);
     const flashCardMasteryStats = useMemo(() => {
         const total = flashCards.length;
         let reviewed = 0;
@@ -16479,23 +16533,33 @@ ${userQ}`;
         unsupported: "Unsupported"
     }[flashCardMasterySyncStatus] || "Local only";
     const flashCardFrontSpeakText = cleanQuizDisplayText(
-        String(currentFlashCard?.frontSpeakText || extractFrontTermForSpeech(currentFlashCard?.front || "") || currentFlashCard?.front || "")
+        stripFlashCardStudyMarks(String(currentFlashCard?.frontSpeakText || extractFrontTermForSpeech(currentFlashCard?.front || "") || currentFlashCard?.front || ""))
     );
     const flashCardBackExampleSpeakText = sanitizeSpeakerText(
         normalizeJapaneseRubyForSpeech(
-            extractBackExamplesForSpeech(currentFlashCard),
+            stripFlashCardStudyMarks(extractBackExamplesForSpeech(currentFlashCard)),
             trackLanguage
         )
     );
     const flashCardBackZhSpeakText = sanitizeSpeakerText(
-        normalizeJapaneseRubyForSpeech(String(currentFlashCard?.backZhSpeakText || ""), "zh-TW")
-    ) || extractBackExplanationZhForSpeech(currentFlashCard);
+        normalizeJapaneseRubyForSpeech(stripFlashCardStudyMarks(String(currentFlashCard?.backZhSpeakText || "")), "zh-TW")
+    ) || stripFlashCardStudyMarks(extractBackExplanationZhForSpeech(currentFlashCard));
     // Never fall back to example/original text on the reverse question side.
     const flashCardReverseFrontSpeakText = flashCardBackZhSpeakText;
     const flashCardFrontExampleZhText = String(currentFlashCard?.back || "").match(/例句\s*[:：]/i)
         ? extractBackExampleZhTranslations(currentFlashCard)
         : "";
     const shouldShowFlashCardReverseExamples = Boolean(flashCardFrontExampleZhText);
+    const renderFlashCardStudyText = useCallback((value, keyPrefix = "fc-study") => {
+        if (typeof value !== "string") return value;
+        const pieces = String(value || "").split(/(==[\s\S]*?==)/g);
+        return pieces.map((piece, index) => {
+            const marked = /^==([\s\S]*?)==$/.exec(piece);
+            return marked
+                ? <mark key={`${keyPrefix}-mark-${index}`} className="rounded bg-yellow-200 px-0.5 text-inherit">{marked[1]}</mark>
+                : <React.Fragment key={`${keyPrefix}-text-${index}`}>{piece}</React.Fragment>;
+        });
+    }, []);
 
     const flashCardBackDisplayData = useMemo(() => {
         const frontText = String(currentFlashCard?.front || "");
@@ -16503,6 +16567,10 @@ ${userQ}`;
         
         const buildNodes = (textToParse) => {
             if (!textToParse) return "";
+            // A personalized card may contain ==yellow highlight== markers.
+            // Keep that lightweight markup intact instead of wrapping terms
+            // into the knowledge-popup nodes first.
+            if (currentFlashCard?.personalization) return textToParse;
             if (currentFlashCard?.category !== 'sentence') return textToParse;
             if (flashCardKnowledgeTermEntries.length === 0) return textToParse;
 
@@ -16973,7 +17041,8 @@ ${userQ}`;
         if (!card) return;
         const reviewedAt = new Date();
         const now = reviewedAt.toISOString();
-        const cardId = buildFlashCardId(card);
+        const originalCard = card?.masteryOriginalCard || card;
+        const cardId = String(card?.masteryCardId || buildFlashCardId(originalCard));
         const normalizedPrev = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
         const existing = normalizedPrev.cards[cardId] || {};
         const rating = ["Again", "Hard", "Good", "Easy"].includes(result)
@@ -17011,9 +17080,9 @@ ${userQ}`;
                 [cardId]: {
                     ...existing,
                     cardId,
-                    head: String(getFlashCardFrontText(card) || existing.head || ""),
-                    headNormalized: normalizeFlashCardText(getFlashCardFrontText(card) || existing.head || ""),
-                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(card, sourceName)),
+                    head: String(getFlashCardFrontText(originalCard) || existing.head || ""),
+                    headNormalized: normalizeFlashCardText(getFlashCardFrontText(originalCard) || existing.head || ""),
+                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(originalCard, sourceName)),
                     rememberedCount: Math.max(0, Number(existing.rememberedCount || existing.level || 0)) + (remembered ? 1 : 0),
                     forgotCount: Math.max(0, Number(existing.forgotCount || existing.wrongCount || 0)) + (remembered ? 0 : 1),
                     reviewCount: Math.max(0, Number(existing.reviewCount || 0)) + 1,
@@ -17059,7 +17128,13 @@ ${userQ}`;
 
     const scheduleFlashCardAutoAdvance = useCallback((session, side, cardIndex) => {
         if (side === 'back') {
-            setFlashCardWaitingFeedback(true);
+            const waitMs = Math.max(0, Math.round((Number(flashCardBackPauseSec) || 0) * 1000));
+            setFlashCardWaitingFeedback(false);
+            clearFlashCardAutoTimer();
+            flashCardAutoTimerRef.current = setTimeout(async () => {
+                if (flashCardAutoSessionRef.current !== session) return;
+                await executeFlashCardAdvance(session, cardIndex);
+            }, waitMs);
             return;
         }
 
@@ -17069,7 +17144,7 @@ ${userQ}`;
             if (flashCardAutoSessionRef.current !== session) return;
             setFlashCardFlipped(true);
         }, waitMs);
-    }, [clearFlashCardAutoTimer, flashCardFrontPauseSec]);
+    }, [clearFlashCardAutoTimer, executeFlashCardAdvance, flashCardBackPauseSec, flashCardFrontPauseSec]);
 
     const handleFlashCardAutoSpeakDone = useCallback(({ side, cardId, cardIndex, manual }) => {
         if (manual) return;
@@ -17408,7 +17483,8 @@ ${userQ}`;
         if (!currentFlashCard) return;
         if (flashCardAutoRun) stopFlashCardAutoRun();
         const now = new Date().toISOString();
-        const cardId = buildFlashCardId(currentFlashCard);
+        const originalCard = currentFlashCard?.masteryOriginalCard || currentFlashCard;
+        const cardId = String(currentFlashCard?.masteryCardId || buildFlashCardId(originalCard));
         const normalizedPrev = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
         const existing = normalizedPrev.cards[cardId] || {};
         const next = {
@@ -17419,9 +17495,9 @@ ${userQ}`;
                 [cardId]: {
                     ...existing,
                     cardId,
-                    head: String(getFlashCardFrontText(currentFlashCard) || existing.head || ""),
-                    headNormalized: normalizeFlashCardText(getFlashCardFrontText(currentFlashCard) || existing.head || ""),
-                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(currentFlashCard, flashCardSourceName)),
+                    head: String(getFlashCardFrontText(originalCard) || existing.head || ""),
+                    headNormalized: normalizeFlashCardText(getFlashCardFrontText(originalCard) || existing.head || ""),
+                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(originalCard, flashCardSourceName)),
                     discardedAt: now
                 }
             }
@@ -17432,6 +17508,92 @@ ${userQ}`;
         setFlashCardNotice("已丟到垃圾桶，之後不會再出現。");
         setFlashCardFlipped(false);
         setFlashCardIndex(Math.max(0, Math.min(normalizedFlashCardIndex, filteredFlashCards.length - 2)));
+    };
+
+    const openFlashCardEditor = () => {
+        if (!currentFlashCard) return;
+        if (flashCardAutoRun) stopFlashCardAutoRun();
+        const originalCard = currentFlashCard?.masteryOriginalCard || currentFlashCard;
+        setFlashCardEditDraft({
+            cardId: String(currentFlashCard?.masteryCardId || buildFlashCardId(originalCard)),
+            originalCard,
+            front: String(currentFlashCard?.front || ""),
+            back: String(currentFlashCard?.back || "")
+        });
+    };
+    const updateFlashCardEditDraft = (field, value) => {
+        setFlashCardEditDraft(prev => prev ? { ...prev, [field]: String(value || "") } : prev);
+    };
+    const wrapFlashCardEditSelectionInHighlight = (field) => {
+        const textarea = field === "front" ? flashCardEditFrontRef.current : flashCardEditBackRef.current;
+        const draft = flashCardEditDraft;
+        if (!textarea || !draft) return;
+        const start = Number(textarea.selectionStart || 0);
+        const end = Number(textarea.selectionEnd || 0);
+        if (end <= start) {
+            setFlashCardNotice("請先在編輯框選取要標黃的文字。");
+            return;
+        }
+        const value = String(draft[field] || "");
+        const nextValue = value.slice(0, start) + "==" + value.slice(start, end) + "==" + value.slice(end);
+        updateFlashCardEditDraft(field, nextValue);
+        requestAnimationFrame(() => {
+            textarea.focus();
+            textarea.setSelectionRange(start + 2, end + 2);
+        });
+    };
+    const saveFlashCardPersonalization = () => {
+        const draft = flashCardEditDraft;
+        const front = String(draft?.front || "").trim();
+        const back = String(draft?.back || "").trim();
+        if (!draft || !front) {
+            setFlashCardNotice("題面不可留白。");
+            return;
+        }
+        const now = new Date().toISOString();
+        const normalizedPrev = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+        const originalCard = draft.originalCard || currentFlashCard?.masteryOriginalCard || currentFlashCard || {};
+        const cardId = String(draft.cardId || buildFlashCardId(originalCard));
+        const existing = normalizedPrev.cards[cardId] || {};
+        const next = {
+            ...normalizedPrev,
+            updatedAt: now,
+            cards: {
+                ...normalizedPrev.cards,
+                [cardId]: {
+                    ...existing,
+                    cardId,
+                    head: String(getFlashCardFrontText(originalCard) || existing.head || front),
+                    headNormalized: normalizeFlashCardText(getFlashCardFrontText(originalCard) || existing.head || front),
+                    snapshot: mergeFlashCardMasterySnapshot(existing.snapshot, buildFlashCardMasterySnapshot(originalCard, flashCardSourceName)),
+                    personalization: { front, back, updatedAt: now }
+                }
+            }
+        };
+        flashCardMasteryDataRef.current = next;
+        setFlashCardMasteryData(next);
+        scheduleFlashCardMasteryAutoSave(next);
+        setFlashCardEditDraft(null);
+        setFlashCardNotice("已儲存個人化卡片；原始知識點 TXT 未變更。");
+    };
+    const resetFlashCardPersonalization = () => {
+        const draft = flashCardEditDraft;
+        if (!draft) return;
+        const normalizedPrev = normalizeFlashCardMasteryData(flashCardMasteryDataRef.current);
+        const cardId = String(draft.cardId || "");
+        const existing = normalizedPrev.cards[cardId];
+        if (existing) {
+            const next = {
+                ...normalizedPrev,
+                updatedAt: new Date().toISOString(),
+                cards: { ...normalizedPrev.cards, [cardId]: { ...existing, personalization: null } }
+            };
+            flashCardMasteryDataRef.current = next;
+            setFlashCardMasteryData(next);
+            scheduleFlashCardMasteryAutoSave(next);
+        }
+        setFlashCardEditDraft(null);
+        setFlashCardNotice("已還原為知識點檔的原始卡片內容。");
     };
 
     const writeTextToClipboard = async (text) => {
@@ -19492,11 +19654,11 @@ ${userQ}`;
                                                                                 />
                                                                             )}
                                                                         </div>
-                                                                        <p className="text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardBackDisplayData.explanation}</p>
+                                                                        <p className="text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{renderFlashCardStudyText(flashCardBackDisplayData.explanation, 'fc-reverse-front-explanation')}</p>
                                                                         {shouldShowFlashCardReverseExamples && (
                                                                             <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
                                                                                 <p className="mb-1 text-[11px] font-bold text-amber-700">例句中譯</p>
-                                                                                <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardFrontExampleZhText}</p>
+                                                                                <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{renderFlashCardStudyText(flashCardFrontExampleZhText, 'fc-reverse-front-zh')}</p>
                                                                             </div>
                                                                         )}
                                                                         <p className="mt-4 text-xs text-cyan-700 font-semibold">點擊看答案</p>
@@ -19527,7 +19689,7 @@ ${userQ}`;
                                                                                 />
                                                                             )}
                                                                         </div>
-                                                                        <p className="text-2xl font-bold text-gray-900 leading-relaxed">{flashCardBackDisplayData.front}</p>
+                                                                        <p className="text-2xl font-bold text-gray-900 leading-relaxed">{renderFlashCardStudyText(flashCardBackDisplayData.front, 'fc-front')}</p>
                                                                         <p className="mt-4 text-xs text-cyan-700 font-semibold">點擊看答案</p>
                                                                         {flashCardAutoRun && (
                                                                             <p className="mt-1 text-[11px] text-emerald-700">
@@ -19575,9 +19737,9 @@ ${userQ}`;
                                                                                 />
                                                                             )}
                                                                         </div>
-                                                                        <p className="text-2xl font-bold text-gray-900 leading-relaxed">{flashCardBackDisplayData.front}</p>
+                                                                        <p className="text-2xl font-bold text-gray-900 leading-relaxed">{renderFlashCardStudyText(flashCardBackDisplayData.front, 'fc-reverse-back-front')}</p>
                                                                         {flashCardBackDisplayData.example && (
-                                                                            <p className="mt-4 text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardBackDisplayData.example}</p>
+                                                                            <p className="mt-4 text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{renderFlashCardStudyText(flashCardBackDisplayData.example, 'fc-reverse-back-example')}</p>
                                                                         )}
                                                                         <p className="mt-4 text-xs text-cyan-700 font-semibold">點擊回題面</p>
                                                                         {flashCardAutoRun && (
@@ -19624,7 +19786,7 @@ ${userQ}`;
                                                                                 />
                                                                             )}
                                                                         </div>
-                                                                        <p className="text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{flashCardBackDisplayData.full}</p>
+                                                                        <p className="text-base text-gray-800 whitespace-pre-wrap leading-relaxed">{renderFlashCardStudyText(flashCardBackDisplayData.full, 'fc-back')}</p>
                                                                         {currentFlashCard?.category === 'sentence' && flashCardKnowledgeTermEntries.length > 0 && (
                                                                             <p className="mt-2 text-[11px] text-cyan-700">
                                                                                 已對同檔「單字 / 用語」自動加底線，點擊可開啟知識點視窗
@@ -19669,7 +19831,7 @@ ${userQ}`;
                                                             })()}
                                                         </div>
 
-                                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                            <div className="flex flex-wrap items-center justify-between gap-2">
                                                             <div className="flex items-center gap-2">
                                                                 <button
                                                                     onClick={handleFlashCardPrev}
@@ -19703,6 +19865,14 @@ ${userQ}`;
                                                                     複製
                                                                 </button>
                                                                 <button
+                                                                    type="button"
+                                                                    onClick={(e) => { e.stopPropagation(); openFlashCardEditor(); }}
+                                                                    className="px-3 py-1.5 rounded-full border border-amber-200 bg-amber-50 text-amber-800 text-xs font-semibold hover:bg-amber-100"
+                                                                    title="修改此卡片的題面、答案與個人提示；只寫入 flashcard_mastery.json"
+                                                                >
+                                                                    編輯
+                                                                </button>
+                                                                <button
                                                                     onClick={handleFlashCardDiscard}
                                                                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-rose-200 bg-rose-50 text-rose-700 text-xs font-semibold hover:bg-rose-100"
                                                                     title="丟棄目前卡片，之後不再顯示"
@@ -19718,6 +19888,27 @@ ${userQ}`;
                                                                 </button>
                                                             </div>
                                                         </div>
+                                                        {flashCardEditDraft && (
+                                                            <div className="rounded-2xl border-2 border-amber-200 bg-amber-50/70 p-4 shadow-sm" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                                                                <div className="mb-3 flex items-center justify-between gap-3">
+                                                                    <div>
+                                                                        <p className="text-sm font-bold text-amber-900">編輯個人化卡片</p>
+                                                                        <p className="mt-0.5 text-[11px] text-amber-800">可直接改字、插入提示；選取文字後按「標黃」。只會寫入 mastery JSON。</p>
+                                                                    </div>
+                                                                    <button type="button" onClick={() => setFlashCardEditDraft(null)} className="rounded-full border border-amber-300 bg-white px-2.5 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100">取消</button>
+                                                                </div>
+                                                                <label className="block text-xs font-bold text-gray-700">題面</label>
+                                                                <textarea ref={flashCardEditFrontRef} value={flashCardEditDraft.front} onChange={(e) => updateFlashCardEditDraft('front', e.target.value)} onClick={(e) => e.stopPropagation()} rows={3} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm leading-relaxed text-gray-900 outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-200" />
+                                                                <div className="mt-1 flex justify-end"><button type="button" onClick={() => wrapFlashCardEditSelectionInHighlight('front')} className="rounded-md border border-yellow-300 bg-yellow-100 px-2.5 py-1 text-xs font-semibold text-yellow-900 hover:bg-yellow-200">選取文字標黃</button></div>
+                                                                <label className="mt-3 block text-xs font-bold text-gray-700">答案／說明</label>
+                                                                <textarea ref={flashCardEditBackRef} value={flashCardEditDraft.back} onChange={(e) => updateFlashCardEditDraft('back', e.target.value)} onClick={(e) => e.stopPropagation()} rows={8} className="mt-1 w-full rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm leading-relaxed text-gray-900 outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-200" />
+                                                                <div className="mt-1 flex justify-end"><button type="button" onClick={() => wrapFlashCardEditSelectionInHighlight('back')} className="rounded-md border border-yellow-300 bg-yellow-100 px-2.5 py-1 text-xs font-semibold text-yellow-900 hover:bg-yellow-200">選取文字標黃</button></div>
+                                                                <div className="mt-4 flex flex-wrap justify-end gap-2">
+                                                                    <button type="button" onClick={resetFlashCardPersonalization} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-100">還原原始卡片</button>
+                                                                    <button type="button" onClick={saveFlashCardPersonalization} className="rounded-lg border border-amber-500 bg-amber-500 px-3 py-2 text-xs font-bold text-white hover:bg-amber-600">儲存個人化編輯</button>
+                                                                </div>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 )}
                                             </div>
