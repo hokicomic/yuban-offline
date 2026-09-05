@@ -3494,47 +3494,57 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const punctuationRegex = /([.?!。！？]["']?)(?=\s|$)/g;
     const sentenceEndRegex = /[.?!。！？]["']?\s*$/;
     const isCJKLine = (text) => /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(String(text || ""));
-    const getPeriodForText = (text) => {
-        const isCJKTrack = /^(ja|ko|zh)/i.test(trackLanguage);
-        return (isCJKLine(text) || isCJKTrack) ? "。" : ".";
-    };
-    const ensureSentenceTerminal = (text) => {
-        const trimmed = String(text || "").trim();
-        if (!trimmed) return trimmed;
-        if (sentenceEndRegex.test(trimmed)) return trimmed;
-        return trimmed + getPeriodForText(trimmed);
-    };
     const stripLeadingListMarker = (text) => String(text || "")
         .replace(/^\s*(?:[0-9０-９]+|[A-Za-z])\s*[.)．、]\s*/, '')
         .trim();
-    const contentLines = rawSubtitles
-        .map(sub => {
-            const raw = (sub?.text || "").trim();
-            const cleaned = stripLeadingListMarker(raw);
-            return cleaned || raw;
-        })
-        .filter(text => text && !isTitleLike(text));
-    // Auto-append punctuation only when file head has 40 consecutive space-delimited tokens
-    // (half-width or full-width spaces) without full-stop marks.
-    // Important: only full stop is considered here ('.' / '。'), not other punctuation.
-    const HEAD_TOKEN_LIMIT = 40;
-    const hasFullStop = (token) => /[.。]/.test(String(token || ""));
-    let headTokenCount = 0;
-    let sawFullStopBeforeLimit = false;
-    for (const line of contentLines) {
-        const tokens = String(line || "").split(/[ \u3000]+/).filter(Boolean);
-        for (const token of tokens) {
-            if (hasFullStop(token)) {
-                sawFullStopBeforeLimit = true;
-                break;
-            }
-            headTokenCount++;
-            if (headTokenCount >= HEAD_TOKEN_LIMIT) break;
+    // Match Bridge Reader's LRC reconstruction rules before assigning audio
+    // timings.  The timestamp is merely a cue boundary: a lower-case cue or a
+    // cue after a comma/dash normally continues the same spoken sentence.
+    const isAbbreviationEnding = (line) =>
+        /(?:\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc)\.|\b(?:e\.g|i\.e)\.|(?:\b[A-Z]\.){1,})[”’"')\]]*$/i.test(String(line || "").trim());
+    const endsCompleteSentence = (line) => {
+        const value = String(line || "").trim();
+        return Boolean(value) && !isAbbreviationEnding(value) && /[.!?…。！？][”’"')\]]*$/.test(value);
+    };
+    const joinWithNaturalSpacing = (previous, next) => {
+        const a = String(previous || "").trim();
+        const b = String(next || "").trim();
+        if (!a) return b;
+        if (!b) return a;
+        const noSpace = /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(b)
+            || /[(\[{“‘]$/.test(a)
+            || /[-‑–]$/.test(a)
+            || isCJKLine(a.slice(-1))
+            || isCJKLine(b.charAt(0));
+        return a + (noSpace ? "" : " ") + b;
+    };
+    const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(String(line || "").trim())
+        || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(String(line || "").trim());
+    const previousDemandsContinuation = (line) => /(?:[,;:—–-]|[“‘(\[{])$/.test(String(line || "").trim());
+    const logicalSubtitles = [];
+    for (const rawSub of rawSubtitles) {
+        const text = String(rawSub?.text || "").trim();
+        if (!text) continue;
+        const previous = logicalSubtitles[logicalSubtitles.length - 1];
+        const continuesPrevious = previous
+            && !isTitleLike(text)
+            && !isTitleLike(previous.text)
+            && !endsCompleteSentence(previous.text)
+            && (isAbbreviationEnding(previous.text)
+                || previousDemandsContinuation(previous.text)
+                || startsClearlyAsContinuation(text));
+        if (continuesPrevious) {
+            previous.text = joinWithNaturalSpacing(previous.text, text);
+            previous.end = rawSub.end;
+        } else {
+            logicalSubtitles.push({ ...rawSub, text });
         }
-        if (sawFullStopBeforeLimit || headTokenCount >= HEAD_TOKEN_LIMIT) break;
     }
-    const hasHead40TokenRunWithoutFullStop = headTokenCount >= HEAD_TOKEN_LIMIT && !sawFullStopBeforeLimit;
-    const shouldAutoAddPunctuation = contentLines.length > 0 && hasHead40TokenRunWithoutFullStop;
+    // An LRC timestamp/line break is a timing cue, not proof of a sentence boundary.
+    // Some subtitle sources contain no punctuation at all, so retain a deliberately
+    // conservative safety limit only for preventing one enormous subtitle forever.
+    const maxUnpunctuatedDuration = Math.max(12, Number(minDuration || 0) * 4);
+    const maxUnpunctuatedUnits = 58;
 
     const sentences = [];
     // When a sentence ends exactly at an original segment boundary, the next sentence MUST start at the next segment's start.
@@ -3545,9 +3555,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         text: ""
     };
 
-    let sentenceCount = 0; // [NEW] Count to control no-punctuation sentence merging
-
-    rawSubtitles.forEach((sub, index) => {
+    logicalSubtitles.forEach((sub, index) => {
         let text = sub.text.trim();
         if (!text) return;
         const punctCheckText = stripLeadingListMarker(text) || text;
@@ -3562,7 +3570,6 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
                 text: text
             });
             currentSentence = { start: null, end: null, text: "" };
-            sentenceCount = 0;
             return;
         }
 
@@ -3572,35 +3579,6 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             currentSentence.start = sub.start;
             if (pendingBoundaryStart) pendingBoundaryStart = false;
         }
-
-        // [NEW] Logic for segments without punctuation
-        // Check for Latin (.?!) or CJK (。！？) punctuation
-        const hasPunctuation = sentenceEndRegex.test(punctCheckText);
-        if (shouldAutoAddPunctuation && !hasPunctuation) {
-            // Determine period type based on content (CJK vs Latin) OR Track Language
-            const isCJK = isCJKLine(punctCheckText) || /^(ja|ko|zh)/i.test(trackLanguage);
-            const period = isCJK ? "。" : ".";
-            const space = isCJK ? "　" : " "; // Full-width space for CJK
-            const textForAppend = punctCheckText || text;
-
-            // Add space if appending to existing text
-            const prefix = currentSentence.text ? space : "";
-
-            currentSentence.text += prefix + textForAppend + period;
-            currentSentence.end = sub.end;
-            sentenceCount++;
-
-            const currentDuration = currentSentence.end - currentSentence.start;
-            // Respect both constraints: flush when count hits cap OR duration reaches minimum target.
-            if (sentenceCount >= Math.max(1, maxMergeCount) || currentDuration >= minDuration) {
-                sentences.push(currentSentence);
-                pendingBoundaryStart = true;
-                currentSentence = { start: null, end: null, text: "" };
-                sentenceCount = 0;
-            }
-            return;
-        }
-        sentenceCount = 0;
 
         const regex = punctuationRegex;
         let match;
@@ -3636,6 +3614,10 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             // If the sentence is too short, we skip this split point and let it merge with the next part.
             const currentDuration = estimatedEnd - currentSentence.start;
             if (currentDuration < minDuration) {
+                // Keep the real cue end even while waiting to merge a short
+                // sentence.  Without this, a final short cue could reach the
+                // output with end:null and fail to play/highlight correctly.
+                currentSentence.end = estimatedEnd;
                 lastIndex = endIdx;
                 continue;
             }
@@ -3684,6 +3666,20 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             currentSentence.text += (currentSentence.text ? " " : "") + remaining;
             currentSentence.end = sub.end;
         }
+
+        // Only when a source has withheld all sentence punctuation for an unusually
+        // long stretch do we make an emergency timing boundary.  This is intentionally
+        // far less aggressive than the old 3-second/3-cue rule, which split continuations
+        // such as "and then he lost ..." away from their grammatical sentence.
+        const currentDuration = currentSentence.start === null ? 0 : (currentSentence.end - currentSentence.start);
+        if (currentSentence.text
+            && !sentenceEndRegex.test(currentSentence.text)
+            && (currentDuration >= maxUnpunctuatedDuration
+                || countTimelineUnits(currentSentence.text) >= maxUnpunctuatedUnits)) {
+            sentences.push(currentSentence);
+            pendingBoundaryStart = true;
+            currentSentence = { start: null, end: null, text: "" };
+        }
     });
 
     if (currentSentence.text) {
@@ -3693,7 +3689,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     return sentences.map((s, i) => ({
         id: `smart-${i}`,
         ...s,
-        text: shouldAutoAddPunctuation ? ensureSentenceTerminal(s.text) : s.text.trim()
+        text: s.text.trim()
     }));
 };
 
