@@ -17044,7 +17044,10 @@ ${userQ}`;
         const rating = ["Again", "Hard", "Good", "Easy"].includes(result)
             ? result
             : (result === "remembered" ? "Good" : "Again");
-        const remembered = rating !== "Again";
+        // Keep FSRS's four scheduling ratings, but make the historical
+        // learner record deliberately binary: Good/Easy = recall;
+        // Again/Hard = forget.
+        const remembered = rating === "Good" || rating === "Easy";
         // Old binary controls remain compatible, but every intentional answer
         // now enters the one FSRS scheduler (Forgot→Again, Remembered→Good).
         const fsrsResult = applyFsrsRating(existing, rating, normalizedPrev.fsrsConfig, reviewedAt);
