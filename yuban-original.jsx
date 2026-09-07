@@ -3517,16 +3517,6 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         const titleWords = words.filter((word) => /^[A-ZÀ-ÖØ-Þ]/.test(word));
         return words.length >= 2 && titleWords.length / words.length >= 0.7;
     };
-    const countCompleteSentenceEndings = (line) => {
-        const value = String(line || "").trim();
-        const endingRegex = /[.?!。！？]+[”’"')\]]*(?=\s|$)/g;
-        let count = 0;
-        let match;
-        while ((match = endingRegex.exec(value)) !== null) {
-            if (!isAbbreviation(value.slice(0, match.index + match[0].length))) count += 1;
-        }
-        return count;
-    };
     const joinWithNaturalSpacing = (previous, next) => {
         const a = String(previous || "").trim();
         const b = String(next || "").trim();
@@ -3548,92 +3538,14 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
     const useCueMergedTiming = timingMode === "cue-merged";
 
-    // Exact cue timing makes no attempt to guess a timestamp inside an LRC
-    // line. A merged sentence is emitted only after BOTH of its textual
-    // boundaries land on source-cue boundaries. If a cue contains an internal
-    // sentence boundary, or punctuation is missing beyond Max Merge Lines, we
-    // keep the original cues instead of pretending to have timed a sentence.
-    if (useCueMergedTiming) {
-        const cueSentences = [];
-        let pendingCues = [];
-        let canStartExactSentence = true;
-        const pushRawCue = (cue) => {
-            cueSentences.push({
-                start: cue.start,
-                end: Math.max(cue.start + 0.01, cue.end),
-                text: cue.text.trim()
-            });
-        };
-        const flushPendingAsRawCues = () => {
-            pendingCues.forEach(pushRawCue);
-            pendingCues = [];
-        };
-        const pendingText = () => pendingCues
-            .map((cue) => cue.text)
-            .reduce((joined, text) => joinWithNaturalSpacing(joined, text), "");
-        const flushExactSentence = () => {
-            if (!pendingCues.length) return;
-            const first = pendingCues[0];
-            const last = pendingCues[pendingCues.length - 1];
-            cueSentences.push({
-                start: first.start,
-                end: Math.max(first.start + 0.01, last.end),
-                text: pendingText().trim()
-            });
-            pendingCues = [];
-        };
-
-        for (const rawSub of rawSubtitles) {
-            const text = String(rawSub?.text || "").trim();
-            const start = Number(rawSub?.start);
-            const end = Number(rawSub?.end);
-            if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-
-            if (isStandaloneHeadingCue(text)) {
-                flushPendingAsRawCues();
-                pushRawCue({ start, end, text });
-                canStartExactSentence = true;
-                continue;
-            }
-
-            if (!canStartExactSentence) {
-                pushRawCue({ start, end, text });
-                if (endsCompleteSentence(text)) canStartExactSentence = true;
-                continue;
-            }
-
-            pendingCues.push({ start, end, text });
-            const combined = pendingText();
-            const sentenceEndingCount = countCompleteSentenceEndings(combined);
-            if (sentenceEndingCount === 1 && endsCompleteSentence(combined)) {
-                flushExactSentence();
-                canStartExactSentence = true;
-            } else if (sentenceEndingCount > 1) {
-                // At least one sentence starts or ends inside a cue. Keep
-                // those source cues intact: there is no honest timestamp-only
-                // way to split them further.
-                flushPendingAsRawCues();
-                canStartExactSentence = endsCompleteSentence(combined);
-            } else if (pendingCues.length >= maxMergedLines) {
-                flushPendingAsRawCues();
-                canStartExactSentence = false;
-            }
-        }
-        flushPendingAsRawCues();
-        return cueSentences.map((sentence, index) => ({
-            id: `smart-cue-${index}`,
-            ...sentence
-        }));
-    }
-
     const logicalSubtitles = [];
     for (const rawSub of rawSubtitles) {
         const text = String(rawSub?.text || "").trim();
         if (!text) continue;
         const previous = logicalSubtitles[logicalSubtitles.length - 1];
         const continuesPrevious = previous
-            && !isTitleLike(text)
-            && !isTitleLike(previous.text)
+            && !isStandaloneHeadingCue(text)
+            && !isStandaloneHeadingCue(previous.text)
             && !endsCompleteSentence(previous.text)
             && previous.sourceLineCount < maxMergedLines
             && (isAbbreviationEnding(previous.text)
@@ -3647,6 +3559,20 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             logicalSubtitles.push({ ...rawSub, text, sourceLineCount: 1 });
         }
     }
+
+    // Timestamp-only mode uses the same reconstruction rules as Bridge
+    // Reader: first join the LRC cues that demonstrably form one text unit,
+    // then keep the first cue's start and the last cue's end. Sentence marks
+    // inside that unit are retained as text, but never become guessed times.
+    if (useCueMergedTiming) {
+        return logicalSubtitles.map((subtitle, index) => ({
+            id: `smart-cue-${index}`,
+            start: subtitle.start,
+            end: Math.max(Number(subtitle.start || 0) + 0.01, Number(subtitle.end || subtitle.start || 0)),
+            text: String(subtitle.text || "").trim()
+        }));
+    }
+
     // An LRC timestamp/line break is a timing cue, not proof of a sentence boundary.
     // Some subtitle sources contain no punctuation at all, so retain a deliberately
     // conservative safety limit only for preventing one enormous subtitle forever.
@@ -6827,7 +6753,9 @@ export default function GeminiPlayer() {
     const [timePadding, setTimePadding] = useState(0.2);
     const [timeBuffer, setTimeBuffer] = useState(0.2);
     const [minDuration, setMinDuration] = useState(3.0);
-    const [maxMergeCount, setMaxMergeCount] = useState(3);
+    // Eight preserves ordinary multi-cue news paragraphs in timestamp-only
+    // mode; users can lower it when they prefer shorter shadowing turns.
+    const [maxMergeCount, setMaxMergeCount] = useState(8);
     // "covered" estimates punctuation inside an LRC cue with protective
     // overlap; "cue-merged" only uses original LRC timestamp boundaries.
     const [smartTimingMode, setSmartTimingMode] = useState("covered");
@@ -18439,11 +18367,11 @@ ${userQ}`;
                                 className="w-full border border-gray-300 rounded p-2 text-xs"
                             >
                                 <option value="covered">Coverage-first estimate (recommended)</option>
-                                <option value="cue-merged">Exact LRC sentence anchors (no internal estimate)</option>
+                                <option value="cue-merged">Reader-style LRC sentence groups (no internal estimate)</option>
                             </select>
                             <p className="mt-1 text-[10px] leading-relaxed text-gray-500">
                                 {smartTimingMode === "cue-merged"
-                                    ? "Only a complete sentence whose beginning and ending both match original LRC cue boundaries is merged. Other cues stay separate; Max Merge Lines is the safety cap."
+                                    ? "The same continuation/abbreviation rules as Reader first rebuild each text group. The group then uses its first LRC cue start and last LRC cue end; punctuation inside is never assigned a guessed time."
                                     : "Punctuation inside a cue is estimated, then widened to avoid clipping the sentence's first or last words."}
                             </p>
                         </div>
