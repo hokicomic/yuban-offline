@@ -3521,6 +3521,10 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(String(line || "").trim())
         || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(String(line || "").trim());
     const previousDemandsContinuation = (line) => /(?:[,;:—–-]|[“‘(\[{])$/.test(String(line || "").trim());
+    // An LRC line start is an actual timing observation. Punctuation inside a
+    // line is not. Keep a bounded number of original cues together only when
+    // they are clearly a continuation; the limit is exposed as Max Merge Lines.
+    const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
     const logicalSubtitles = [];
     for (const rawSub of rawSubtitles) {
         const text = String(rawSub?.text || "").trim();
@@ -3530,14 +3534,16 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             && !isTitleLike(text)
             && !isTitleLike(previous.text)
             && !endsCompleteSentence(previous.text)
+            && previous.sourceLineCount < maxMergedLines
             && (isAbbreviationEnding(previous.text)
                 || previousDemandsContinuation(previous.text)
                 || startsClearlyAsContinuation(text));
         if (continuesPrevious) {
             previous.text = joinWithNaturalSpacing(previous.text, text);
             previous.end = rawSub.end;
+            previous.sourceLineCount += 1;
         } else {
-            logicalSubtitles.push({ ...rawSub, text });
+            logicalSubtitles.push({ ...rawSub, text, sourceLineCount: 1 });
         }
     }
     // An LRC timestamp/line break is a timing cue, not proof of a sentence boundary.
@@ -3547,12 +3553,50 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const maxUnpunctuatedUnits = 58;
 
     const sentences = [];
+    // A punctuation split within one LRC cue has no real timestamp. Estimate
+    // its centre, then widen it rather than trimming it. This deliberately
+    // favours replaying a little neighbouring speech over losing displayed
+    // sentence's first or last words.
+    const pushCoveredSentence = (sentence, options = {}) => {
+        const sourceStart = Number.isFinite(Number(options.sourceStart)) ? Number(options.sourceStart) : Number(sentence.start || 0);
+        const sourceEnd = Number.isFinite(Number(options.sourceEnd)) ? Number(options.sourceEnd) : Number(sentence.end || sourceStart);
+        if (!(sourceEnd > sourceStart) || !String(sentence.text || "").trim()) return;
+        const exactStart = options.exactStart !== false;
+        const exactEnd = options.exactEnd === true;
+        const nominalStart = Number.isFinite(Number(sentence.start)) ? Number(sentence.start) : sourceStart;
+        const nominalEnd = Number.isFinite(Number(sentence.end)) ? Number(sentence.end) : sourceEnd;
+        const sourceDuration = sourceEnd - sourceStart;
+        // `timeBuffer` used to cut time off the first sentence. It now means
+        // safety overlap around uncertain internal boundaries.
+        const overlap = Math.min(1.4, Math.max(0.12, Number(bufferTime) || 0, sourceDuration * 0.12));
+        let start = exactStart ? nominalStart : Math.max(sourceStart, nominalStart - overlap);
+        let end = exactEnd ? nominalEnd : Math.min(sourceEnd, nominalEnd + overlap);
+        // Retain short grammatical sentences in the UI, but give shadowing a
+        // usable audio window by expanding inside known cue bounds only.
+        const targetDuration = Math.min(Math.max(0, Number(minDuration) || 0), sourceDuration);
+        if (targetDuration > 0 && end - start < targetDuration) {
+            const deficit = targetDuration - (end - start);
+            const growBefore = Math.min(start - sourceStart, deficit / 2);
+            const growAfter = Math.min(sourceEnd - end, deficit - growBefore);
+            start -= growBefore;
+            end += growAfter;
+            if (end - start < targetDuration) {
+                const remaining = targetDuration - (end - start);
+                start = Math.max(sourceStart, start - remaining);
+                end = Math.min(sourceEnd, end + Math.max(0, targetDuration - (end - start)));
+            }
+        }
+        sentences.push({ start, end: Math.max(start + 0.01, end), text: String(sentence.text || "").trim() });
+    };
     // When a sentence ends exactly at an original segment boundary, the next sentence MUST start at the next segment's start.
     let pendingBoundaryStart = false;
     let currentSentence = {
         start: null,
         end: null,
-        text: ""
+        text: "",
+        sourceStart: null,
+        sourceEnd: null,
+        startIsExact: true
     };
 
     logicalSubtitles.forEach((sub, index) => {
@@ -3562,14 +3606,19 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
 
         if (isTitleLike(text)) {
             if (currentSentence.text) {
-                sentences.push(currentSentence);
+                pushCoveredSentence(currentSentence, {
+                    sourceStart: currentSentence.sourceStart,
+                    sourceEnd: currentSentence.sourceEnd,
+                    exactStart: currentSentence.startIsExact,
+                    exactEnd: true
+                });
             }
             sentences.push({
                 start: sub.start,
                 end: sub.end,
                 text: text
             });
-            currentSentence = { start: null, end: null, text: "" };
+            currentSentence = { start: null, end: null, text: "", sourceStart: null, sourceEnd: null, startIsExact: true };
             return;
         }
 
@@ -3577,8 +3626,11 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             // Requirement: if a new sentence begins at an original segment start, use that start exactly (no +/-).
             // Also, if the previous sentence ended exactly at a segment boundary, we must start at THIS segment's start.
             currentSentence.start = sub.start;
+            currentSentence.sourceStart = sub.start;
+            currentSentence.startIsExact = true;
             if (pendingBoundaryStart) pendingBoundaryStart = false;
         }
+        currentSentence.sourceEnd = sub.end;
 
         const regex = punctuationRegex;
         let match;
@@ -3610,24 +3662,17 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             // Requirement #1: if the sentence ends exactly at the original segment end, use sub.end exactly
             const estimatedEnd = (splitPos >= lineLength) ? sub.end : (sub.start + (lineDuration * ratio));
 
-            // [NEW] Merge short sentences (< minDuration) to avoid iOS playback skipping/sync issues.
-            // If the sentence is too short, we skip this split point and let it merge with the next part.
-            const currentDuration = estimatedEnd - currentSentence.start;
-            if (currentDuration < minDuration) {
-                // Keep the real cue end even while waiting to merge a short
-                // sentence.  Without this, a final short cue could reach the
-                // output with end:null and fail to play/highlight correctly.
-                currentSentence.end = estimatedEnd;
-                lastIndex = endIdx;
-                continue;
-            }
-
-            // [UPDATED] Dynamic TRIM
-            // Requirement #1: exact boundary -> no +/- time
+            // Preserve a short sentence as text. The coverage helper expands
+            // only its audio range; it never merges the words into the next
+            // grammatical sentence.
             if (splitPos >= lineLength) {
-                // Requirement #1: exact boundary -> end must equal the original segment end (no +/-)
                 currentSentence.end = sub.end;
-                sentences.push(currentSentence);
+                pushCoveredSentence(currentSentence, {
+                    sourceStart: currentSentence.sourceStart,
+                    sourceEnd: sub.end,
+                    exactStart: currentSentence.startIsExact,
+                    exactEnd: true
+                });
 
                 // IMPORTANT: The next sentence MUST start at the NEXT original segment's start (not sub.end),
                 // otherwise we can hear a tiny carryover tail at playback.
@@ -3635,27 +3680,31 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
                 currentSentence = {
                     start: null,
                     end: null,
-                    text: ""
+                    text: "",
+                    sourceStart: null,
+                    sourceEnd: null,
+                    startIsExact: true
                 };
 
                 lastIndex = endIdx;
                 continue;
             }
 
-            const segDuration = estimatedEnd - currentSentence.start;
-            let buffer = Math.min(bufferTime, 0.12);
-            if (segDuration < 1.6) buffer = 0;
-            else if (segDuration < 2.8) buffer = Math.min(bufferTime, 0.05);
-
-            const trimmedEnd = Math.max(currentSentence.start + 0.2, estimatedEnd - buffer);
-
-            currentSentence.end = trimmedEnd;
-            sentences.push(currentSentence);
+            currentSentence.end = estimatedEnd;
+            pushCoveredSentence(currentSentence, {
+                sourceStart: currentSentence.sourceStart,
+                sourceEnd: sub.end,
+                exactStart: currentSentence.startIsExact,
+                exactEnd: false
+            });
 
             currentSentence = {
                 start: estimatedEnd,
                 end: null,
-                text: ""
+                text: "",
+                sourceStart: sub.start,
+                sourceEnd: sub.end,
+                startIsExact: false
             };
 
             lastIndex = endIdx;
@@ -3665,6 +3714,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         if (remaining) {
             currentSentence.text += (currentSentence.text ? " " : "") + remaining;
             currentSentence.end = sub.end;
+            currentSentence.sourceEnd = sub.end;
         }
 
         // Only when a source has withheld all sentence punctuation for an unusually
@@ -3676,14 +3726,24 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             && !sentenceEndRegex.test(currentSentence.text)
             && (currentDuration >= maxUnpunctuatedDuration
                 || countTimelineUnits(currentSentence.text) >= maxUnpunctuatedUnits)) {
-            sentences.push(currentSentence);
+            pushCoveredSentence(currentSentence, {
+                sourceStart: currentSentence.sourceStart,
+                sourceEnd: currentSentence.sourceEnd,
+                exactStart: currentSentence.startIsExact,
+                exactEnd: true
+            });
             pendingBoundaryStart = true;
-            currentSentence = { start: null, end: null, text: "" };
+            currentSentence = { start: null, end: null, text: "", sourceStart: null, sourceEnd: null, startIsExact: true };
         }
     });
 
     if (currentSentence.text) {
-        sentences.push(currentSentence);
+        pushCoveredSentence(currentSentence, {
+            sourceStart: currentSentence.sourceStart,
+            sourceEnd: currentSentence.sourceEnd,
+            exactStart: currentSentence.startIsExact,
+            exactEnd: true
+        });
     }
 
     return sentences.map((s, i) => ({
@@ -18276,7 +18336,7 @@ ${userQ}`;
                         </div>
                         <div className="mb-3">
                             <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                <span>Internal Split Trim</span>
+                                <span>Internal Split Safety Overlap</span>
                                 <span>{timeBuffer.toFixed(2)}s</span>
                             </div>
                             <input type="range" min="0" max="2.0" step="0.1" value={timeBuffer} onChange={(e) => setTimeBuffer(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
