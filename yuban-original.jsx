@@ -3489,7 +3489,7 @@ const estimateSubtitleTailPadding = (text, durationSec) => {
     return Math.max(0.08, Math.min(0.55, pad));
 };
 
-const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.0, maxMergeCount = 3, trackLanguage = "en-US") => {
+const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.0, maxMergeCount = 3, trackLanguage = "en-US", timingMode = "covered") => {
     if (!rawSubtitles || rawSubtitles.length === 0) return [];
     const punctuationRegex = /([.?!。！？]["']?)(?=\s|$)/g;
     const sentenceEndRegex = /[.?!。！？]["']?\s*$/;
@@ -3525,6 +3525,58 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     // line is not. Keep a bounded number of original cues together only when
     // they are clearly a continuation; the limit is exposed as Max Merge Lines.
     const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
+    const useCueMergedTiming = timingMode === "cue-merged";
+
+    // Cue-merged timing deliberately makes no attempt to guess a timestamp
+    // inside an LRC line.  It joins whole source cues until one ends a
+    // sentence, so every displayed segment starts and ends at an observed
+    // timestamp.  The maximum is a safety cap for sources with missing
+    // punctuation; it is not a word/sentence estimation rule.
+    if (useCueMergedTiming) {
+        const cueSentences = [];
+        let currentCueSentence = null;
+        const flushCueSentence = () => {
+            if (!currentCueSentence || !currentCueSentence.text) return;
+            cueSentences.push({
+                start: currentCueSentence.start,
+                end: Math.max(currentCueSentence.start + 0.01, currentCueSentence.end),
+                text: currentCueSentence.text.trim()
+            });
+            currentCueSentence = null;
+        };
+
+        for (const rawSub of rawSubtitles) {
+            const text = String(rawSub?.text || "").trim();
+            const start = Number(rawSub?.start);
+            const end = Number(rawSub?.end);
+            if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+
+            if (isTitleLike(text)) {
+                flushCueSentence();
+                cueSentences.push({ start, end, text });
+                continue;
+            }
+
+            if (!currentCueSentence) {
+                currentCueSentence = { start, end, text, sourceLineCount: 1 };
+            } else {
+                currentCueSentence.text = joinWithNaturalSpacing(currentCueSentence.text, text);
+                currentCueSentence.end = end;
+                currentCueSentence.sourceLineCount += 1;
+            }
+
+            if (endsCompleteSentence(currentCueSentence.text)
+                || currentCueSentence.sourceLineCount >= maxMergedLines) {
+                flushCueSentence();
+            }
+        }
+        flushCueSentence();
+        return cueSentences.map((sentence, index) => ({
+            id: `smart-cue-${index}`,
+            ...sentence
+        }));
+    }
+
     const logicalSubtitles = [];
     for (const rawSub of rawSubtitles) {
         const text = String(rawSub?.text || "").trim();
@@ -6727,6 +6779,9 @@ export default function GeminiPlayer() {
     const [timeBuffer, setTimeBuffer] = useState(0.2);
     const [minDuration, setMinDuration] = useState(3.0);
     const [maxMergeCount, setMaxMergeCount] = useState(3);
+    // "covered" estimates punctuation inside an LRC cue with protective
+    // overlap; "cue-merged" only uses original LRC timestamp boundaries.
+    const [smartTimingMode, setSmartTimingMode] = useState("covered");
 
     // [NEW] Subtitle Font Size (Independent of Modal)
     const [subtitleFontSize, setSubtitleFontSize] = useState(24);
@@ -7345,12 +7400,12 @@ export default function GeminiPlayer() {
         }
     }, [playbackRate]);
 
-    // [NEW] Re-generate subtitles when timeBuffer changes (if in smart mode)
+    // Re-generate subtitles whenever the active smart-timing strategy changes.
     useEffect(() => {
         if (isSmartMode && rawSubtitles.length > 0) {
-            setSubtitles(generateSmartSubtitles(rawSubtitles, timeBuffer, minDuration, maxMergeCount, trackLanguage));
+            setSubtitles(generateSmartSubtitles(rawSubtitles, timeBuffer, minDuration, maxMergeCount, trackLanguage, smartTimingMode));
         }
-    }, [timeBuffer, minDuration, maxMergeCount, trackLanguage]);
+    }, [timeBuffer, minDuration, maxMergeCount, trackLanguage, smartTimingMode]);
 
     useEffect(() => {
         setShadowRepeatInput(String(shadowRepeatCount));
@@ -8602,7 +8657,7 @@ export default function GeminiPlayer() {
                 const detectedLang = detectTrackLanguageGlobal(parsed);
                 setTrackLanguage(detectedLang);
 
-                if (isSmartMode) setSubtitles(generateSmartSubtitles(parsed, timeBuffer, minDuration, maxMergeCount, detectedLang));
+                if (isSmartMode) setSubtitles(generateSmartSubtitles(parsed, timeBuffer, minDuration, maxMergeCount, detectedLang, smartTimingMode));
                 else setSubtitles(parsed);
 
                 setCurrentIndex(0);
@@ -14559,7 +14614,7 @@ ${userQ}`;
         const newMode = !isSmartMode;
         const nowTime = playerRef.current ? playerRef.current.currentTime : currentTime;
         const nextSubtitles = rawSubtitles.length > 0
-            ? (newMode ? generateSmartSubtitles(rawSubtitles, timeBuffer, minDuration, maxMergeCount, trackLanguage) : rawSubtitles)
+            ? (newMode ? generateSmartSubtitles(rawSubtitles, timeBuffer, minDuration, maxMergeCount, trackLanguage, smartTimingMode) : rawSubtitles)
             : [];
 
         setIsSmartMode(newMode);
@@ -18328,26 +18383,46 @@ ${userQ}`;
                         {/* TIMING CONTROLS */}
                         <h3 className="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2 mt-4"><Clock size={16} /> Timing Adjustment</h3>
                         <div className="mb-3">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">Smart Timing Mode</label>
+                            <select
+                                value={smartTimingMode}
+                                onChange={(e) => setSmartTimingMode(e.target.value === "cue-merged" ? "cue-merged" : "covered")}
+                                className="w-full border border-gray-300 rounded p-2 text-xs"
+                            >
+                                <option value="covered">Coverage-first estimate (recommended)</option>
+                                <option value="cue-merged">Original LRC cue merge (no internal estimate)</option>
+                            </select>
+                            <p className="mt-1 text-[10px] leading-relaxed text-gray-500">
+                                {smartTimingMode === "cue-merged"
+                                    ? "Only original LRC timestamp boundaries are used. Cues join until a sentence-ending cue; Max Merge Lines is the safety cap."
+                                    : "Punctuation inside a cue is estimated, then widened to avoid clipping the sentence's first or last words."}
+                            </p>
+                        </div>
+                        <div className="mb-3">
                             <div className="flex justify-between text-xs text-gray-600 mb-1">
                                 <span>Start Padding (Pad)</span>
                                 <span>{timePadding.toFixed(2)}s</span>
                             </div>
                             <input type="range" min="0" max="2.0" step="0.1" value={timePadding} onChange={(e) => setTimePadding(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
                         </div>
-                        <div className="mb-3">
-                            <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                <span>Internal Split Safety Overlap</span>
-                                <span>{timeBuffer.toFixed(2)}s</span>
-                            </div>
-                            <input type="range" min="0" max="2.0" step="0.1" value={timeBuffer} onChange={(e) => setTimeBuffer(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
-                        </div>
-                        <div className="mb-3">
-                            <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                <span>Min Segment Duration</span>
-                                <span>{minDuration.toFixed(1)}s</span>
-                            </div>
-                            <input type="range" min="0.5" max="10.0" step="0.5" value={minDuration} onChange={(e) => setMinDuration(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
-                        </div>
+                        {smartTimingMode === "covered" && (
+                            <>
+                                <div className="mb-3">
+                                    <div className="flex justify-between text-xs text-gray-600 mb-1">
+                                        <span>Internal Split Safety Overlap</span>
+                                        <span>{timeBuffer.toFixed(2)}s</span>
+                                    </div>
+                                    <input type="range" min="0" max="2.0" step="0.1" value={timeBuffer} onChange={(e) => setTimeBuffer(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
+                                </div>
+                                <div className="mb-3">
+                                    <div className="flex justify-between text-xs text-gray-600 mb-1">
+                                        <span>Min Segment Duration</span>
+                                        <span>{minDuration.toFixed(1)}s</span>
+                                    </div>
+                                    <input type="range" min="0.5" max="10.0" step="0.5" value={minDuration} onChange={(e) => setMinDuration(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
+                                </div>
+                            </>
+                        )}
                         <div className="mb-3">
                             <div className="flex justify-between text-xs text-gray-600 mb-1">
                                 <span>Max Merge Lines</span>
