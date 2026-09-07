@@ -3506,6 +3506,27 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         const value = String(line || "").trim();
         return Boolean(value) && !isAbbreviationEnding(value) && /[.!?…。！？][”’"')\]]*$/.test(value);
     };
+    const isStandaloneHeadingCue = (line) => {
+        const value = String(line || "").trim();
+        if (!value || endsCompleteSentence(value) || isTitleLike(value)) return isTitleLike(value);
+        // A title-cased label separated with an em/en dash (for example
+        // "The World This Week – Politics") is a heading, not the beginning
+        // of the following spoken sentence.
+        if (!/\s[–—]\s/.test(value) || /[,;:]/.test(value)) return false;
+        const words = value.match(/[A-Za-zÀ-ÖØ-öø-ÿ]+/g) || [];
+        const titleWords = words.filter((word) => /^[A-ZÀ-ÖØ-Þ]/.test(word));
+        return words.length >= 2 && titleWords.length / words.length >= 0.7;
+    };
+    const countCompleteSentenceEndings = (line) => {
+        const value = String(line || "").trim();
+        const endingRegex = /[.?!。！？]+[”’"')\]]*(?=\s|$)/g;
+        let count = 0;
+        let match;
+        while ((match = endingRegex.exec(value)) !== null) {
+            if (!isAbbreviation(value.slice(0, match.index + match[0].length))) count += 1;
+        }
+        return count;
+    };
     const joinWithNaturalSpacing = (previous, next) => {
         const a = String(previous || "").trim();
         const b = String(next || "").trim();
@@ -3527,22 +3548,39 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
     const useCueMergedTiming = timingMode === "cue-merged";
 
-    // Cue-merged timing deliberately makes no attempt to guess a timestamp
-    // inside an LRC line.  It joins whole source cues until one ends a
-    // sentence, so every displayed segment starts and ends at an observed
-    // timestamp.  The maximum is a safety cap for sources with missing
-    // punctuation; it is not a word/sentence estimation rule.
+    // Exact cue timing makes no attempt to guess a timestamp inside an LRC
+    // line. A merged sentence is emitted only after BOTH of its textual
+    // boundaries land on source-cue boundaries. If a cue contains an internal
+    // sentence boundary, or punctuation is missing beyond Max Merge Lines, we
+    // keep the original cues instead of pretending to have timed a sentence.
     if (useCueMergedTiming) {
         const cueSentences = [];
-        let currentCueSentence = null;
-        const flushCueSentence = () => {
-            if (!currentCueSentence || !currentCueSentence.text) return;
+        let pendingCues = [];
+        let canStartExactSentence = true;
+        const pushRawCue = (cue) => {
             cueSentences.push({
-                start: currentCueSentence.start,
-                end: Math.max(currentCueSentence.start + 0.01, currentCueSentence.end),
-                text: currentCueSentence.text.trim()
+                start: cue.start,
+                end: Math.max(cue.start + 0.01, cue.end),
+                text: cue.text.trim()
             });
-            currentCueSentence = null;
+        };
+        const flushPendingAsRawCues = () => {
+            pendingCues.forEach(pushRawCue);
+            pendingCues = [];
+        };
+        const pendingText = () => pendingCues
+            .map((cue) => cue.text)
+            .reduce((joined, text) => joinWithNaturalSpacing(joined, text), "");
+        const flushExactSentence = () => {
+            if (!pendingCues.length) return;
+            const first = pendingCues[0];
+            const last = pendingCues[pendingCues.length - 1];
+            cueSentences.push({
+                start: first.start,
+                end: Math.max(first.start + 0.01, last.end),
+                text: pendingText().trim()
+            });
+            pendingCues = [];
         };
 
         for (const rawSub of rawSubtitles) {
@@ -3551,26 +3589,37 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             const end = Number(rawSub?.end);
             if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
 
-            if (isTitleLike(text)) {
-                flushCueSentence();
-                cueSentences.push({ start, end, text });
+            if (isStandaloneHeadingCue(text)) {
+                flushPendingAsRawCues();
+                pushRawCue({ start, end, text });
+                canStartExactSentence = true;
                 continue;
             }
 
-            if (!currentCueSentence) {
-                currentCueSentence = { start, end, text, sourceLineCount: 1 };
-            } else {
-                currentCueSentence.text = joinWithNaturalSpacing(currentCueSentence.text, text);
-                currentCueSentence.end = end;
-                currentCueSentence.sourceLineCount += 1;
+            if (!canStartExactSentence) {
+                pushRawCue({ start, end, text });
+                if (endsCompleteSentence(text)) canStartExactSentence = true;
+                continue;
             }
 
-            if (endsCompleteSentence(currentCueSentence.text)
-                || currentCueSentence.sourceLineCount >= maxMergedLines) {
-                flushCueSentence();
+            pendingCues.push({ start, end, text });
+            const combined = pendingText();
+            const sentenceEndingCount = countCompleteSentenceEndings(combined);
+            if (sentenceEndingCount === 1 && endsCompleteSentence(combined)) {
+                flushExactSentence();
+                canStartExactSentence = true;
+            } else if (sentenceEndingCount > 1) {
+                // At least one sentence starts or ends inside a cue. Keep
+                // those source cues intact: there is no honest timestamp-only
+                // way to split them further.
+                flushPendingAsRawCues();
+                canStartExactSentence = endsCompleteSentence(combined);
+            } else if (pendingCues.length >= maxMergedLines) {
+                flushPendingAsRawCues();
+                canStartExactSentence = false;
             }
         }
-        flushCueSentence();
+        flushPendingAsRawCues();
         return cueSentences.map((sentence, index) => ({
             id: `smart-cue-${index}`,
             ...sentence
@@ -18390,11 +18439,11 @@ ${userQ}`;
                                 className="w-full border border-gray-300 rounded p-2 text-xs"
                             >
                                 <option value="covered">Coverage-first estimate (recommended)</option>
-                                <option value="cue-merged">Original LRC cue merge (no internal estimate)</option>
+                                <option value="cue-merged">Exact LRC sentence anchors (no internal estimate)</option>
                             </select>
                             <p className="mt-1 text-[10px] leading-relaxed text-gray-500">
                                 {smartTimingMode === "cue-merged"
-                                    ? "Only original LRC timestamp boundaries are used. Cues join until a sentence-ending cue; Max Merge Lines is the safety cap."
+                                    ? "Only a complete sentence whose beginning and ending both match original LRC cue boundaries is merged. Other cues stay separate; Max Merge Lines is the safety cap."
                                     : "Punctuation inside a cue is estimated, then widened to avoid clipping the sentence's first or last words."}
                             </p>
                         </div>
