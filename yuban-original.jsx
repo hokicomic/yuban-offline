@@ -16528,9 +16528,26 @@ ${userQ}`;
             allRawMatches,
             isAnchored && isForwardPlayback ? progress.maxSourceLine : -1
         );
-        const matches = isAnchored && isForwardPlayback
-            ? rawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
+        // A single fuzzy duplicate far ahead is far more damaging than a
+        // temporary miss: advancing the cursor to it makes every following
+        // subtitle search from the wrong chapter.  Accept ordinary forward
+        // movement only; retain the last trusted cursor when a match leaps an
+        // implausibly large number of source lines.  The allowance grows when
+        // playback has genuinely skipped several LRC cues.
+        const subtitleAdvance = isForwardPlayback
+            ? Math.max(1, currentIndex - Number(progressBefore.subtitleIndex || currentIndex - 1))
+            : 1;
+        const maxPlausibleForwardLineAdvance = Math.min(260, 48 + (subtitleAdvance - 1) * 18);
+        const forwardCursorLimit = Number(progressBefore.maxSourceLine) + maxPlausibleForwardLineAdvance;
+        const suspiciousFarForwardMatches = isAnchored && isForwardPlayback
+            ? rawMatches.filter(match => Number(match.sourceLine) > forwardCursorLimit)
+            : [];
+        const cursorSafeRawMatches = isAnchored && isForwardPlayback
+            ? rawMatches.filter(match => Number(match.sourceLine) <= forwardCursorLimit)
             : rawMatches;
+        const matches = isAnchored && isForwardPlayback
+            ? cursorSafeRawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
+            : cursorSafeRawMatches;
         const rejectedByCursor = rawMatches.filter(match => !matches.some(kept => kept.sourceLine === match.sourceLine));
         const bestMatch = matches.reduce((best, match) => !best || Number(match.score || 0) > Number(best.score || 0) ? match : best, null);
         let anchorEvent = "unchanged";
@@ -16544,6 +16561,8 @@ ${userQ}`;
                 ? Math.max(...matches.map(match => match.sourceLine))
                 : Math.max(progress.maxSourceLine, ...matches.map(match => match.sourceLine));
             anchorEvent = isRewindPlayback ? "rewind" : "advance";
+        } else if (isAnchored && suspiciousFarForwardMatches.length > 0) {
+            anchorEvent = "suspicious_far_jump_ignored";
         } else if (!isAnchored && bestMatch) {
             const candidate = progress.anchorCandidate;
             const score = Number(bestMatch.score || 0);
@@ -16596,6 +16615,8 @@ ${userQ}`;
                     anchorEvent,
                     allRawMatches,
                     selectedCluster: rawMatches,
+                    suspiciousFarForwardMatches,
+                    maxPlausibleForwardLineAdvance,
                     rejectedByCursor,
                     finalMatches: visibleMatches,
                     progressAfter: {
