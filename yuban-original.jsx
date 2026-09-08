@@ -3363,15 +3363,30 @@ const clampSubtitles = (subs) => {
 };
 
 const parseSRT = (data) => {
+    // Do not rely on one rigid whole-file regex: real SRTs can use a UTF-8 BOM,
+    // LF-only line endings, `.` instead of `,` for milliseconds, cue settings
+    // after the end time, and non-numeric cue identifiers.
+    const source = String(data || "").replace(/^\uFEFF/, "").replace(/\r/g, "");
     const subtitles = [];
-    const regex = /(\d+)\r?\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\r?\n([\s\S]*?)(?=\r?\n\r?\n|$)/g;
-    let match;
-    while ((match = regex.exec(data)) !== null) {
+    const timingPattern = /^(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}|\d{1,2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}|\d{1,2}:\d{2}[,.]\d{1,3})(?:\s+.*)?$/;
+
+    for (const block of source.split(/\n\s*\n+/)) {
+        const lines = block.split("\n");
+        const timingIndex = lines.findIndex((line) => timingPattern.test(String(line || "").trim()));
+        if (timingIndex < 0) continue;
+        const timing = String(lines[timingIndex] || "").trim().match(timingPattern);
+        if (!timing) continue;
+        const text = lines.slice(timingIndex + 1)
+            .join(" ")
+            .replace(/<[^>]*>/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+        if (!text) continue;
         subtitles.push({
-            id: match[1],
-            start: timeToSeconds(match[2]),
-            end: timeToSeconds(match[3]),
-            text: match[4].replace(/\r?\n/g, ' ').replace(/<[^>]*>/g, '')
+            id: String(lines.slice(0, timingIndex).find((line) => String(line || "").trim()) || subtitles.length + 1).trim(),
+            start: timeToSeconds(timing[1]),
+            end: timeToSeconds(timing[2]),
+            text
         });
     }
     return clampSubtitles(subtitles);
@@ -8112,7 +8127,10 @@ export default function GeminiPlayer() {
     const getSubtitleBaseKeys = (fileName) => {
         const lower = fileName.toLowerCase();
         const base = lower.substring(0, lower.lastIndexOf('.'));
-        const langSuffixes = ['.en', '.eng', '.ja', '.jp', '.ko', '.kr', '.zh', '.zh-tw', '.zh-hk', '.zh-cn', '.cht', '.chs', '.cn', '.tw', '.hk', '.chinese', '.han', '.zht', '.zhs'];
+        // Subtitle distributors commonly append BCP-47 tags such as
+        // `.en-US.srt`.  Remove the complete tag before matching the subtitle
+        // with the media filename, otherwise the track silently has no captions.
+        const langSuffixes = ['.en-us', '.en-gb', '.en-au', '.en-ca', '.zh-tw', '.zh-hk', '.zh-cn', '.ja-jp', '.ko-kr', '.en_us', '.en_gb', '.zh_tw', '.zh_hk', '.zh_cn', '.ja_jp', '.ko_kr', '.en', '.eng', '.ja', '.jp', '.ko', '.kr', '.zh', '.cht', '.chs', '.cn', '.tw', '.hk', '.chinese', '.han', '.zht', '.zhs'];
         let baseNoLang = base;
         for (const suf of langSuffixes) {
             if (base.endsWith(suf)) {
