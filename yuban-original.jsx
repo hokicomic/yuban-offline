@@ -6739,6 +6739,9 @@ export default function GeminiPlayer() {
     const [rawSubtitles, setRawSubtitles] = useState([]);
     const [subtitles, setSubtitles] = useState([]);
     const [isSmartMode, setIsSmartMode] = useState(true);
+    // Segmentation and playback are intentionally independent: generated subtitle
+    // groups can still drive highlighting while media plays continuously.
+    const [playbackMode, setPlaybackMode] = useState('sentence'); // 'sentence' | 'continuous'
     const [currentIndex, setCurrentIndex] = useState(-1);
     const [mediaSrc, setMediaSrc] = useState(null);
     const [mediaError, setMediaError] = useState("");
@@ -8687,7 +8690,7 @@ export default function GeminiPlayer() {
                 // Normal toggle
                 if (playerRef.current.paused) {
                     // [FIX] If at end of subtitle, rewind to start to prevent immediate shadow re-trigger
-                    if (subtitles.length > 0 && currentIndex !== -1) {
+                    if (playbackMode !== 'continuous' && subtitles.length > 0 && currentIndex !== -1) {
                         const currentSub = subtitles[currentIndex];
                         const { start, end } = getBufferedRange(currentSub);
                         // If we are very close to end or past it
@@ -8732,9 +8735,10 @@ export default function GeminiPlayer() {
             setIsPlaying, // function
             setIsWaitingShadow,
             setShadowCountdown,
-            getBufferedRange // function
+            getBufferedRange, // function
+            playbackMode
         };
-    }, [isPlaying, subtitles, currentIndex, isShadowing, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate]);
+    }, [isPlaying, subtitles, currentIndex, isShadowing, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, playbackMode]);
 
     useEffect(() => {
         // Create Worker from Blob
@@ -8761,7 +8765,7 @@ export default function GeminiPlayer() {
                     const currentSub = subtitles[currentIndex];
                     if (!currentSub) return;
                     const { end } = getBufferedRange(currentSub);
-                    const shouldPauseAtEnd = state.isSmartMode || isShadowing || loopMode === 'single';
+                    const shouldPauseAtEnd = state.playbackMode !== 'continuous';
 
                     if (now >= end) {
                         if (shouldPauseAtEnd) {
@@ -8872,9 +8876,10 @@ export default function GeminiPlayer() {
             setShadowCountdown,
             getBufferedRange,
             isSmartMode,
+            playbackMode,
             worker: workerRef.current
         };
-    }, [isPlaying, subtitles, currentIndex, isShadowing, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, isSmartMode]);
+    }, [isPlaying, subtitles, currentIndex, isShadowing, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, isSmartMode, playbackMode]);
 
     // Re-implement the `onmessage` logic with correct Ref usage:
     useEffect(() => {
@@ -8885,7 +8890,7 @@ export default function GeminiPlayer() {
             const state = latestStateRef.current;
             if (!state || !state.player) return;
 
-            const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, isSmartMode, worker } = state;
+            const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, playbackMode, worker } = state;
 
             if (type === 'TICK') {
                 if (!isPlaying || isGapPausingRef.current) return;
@@ -8901,7 +8906,11 @@ export default function GeminiPlayer() {
                     const currentSub = subtitles[currentIndex];
                     if (!currentSub) return;
                     const { end } = getBufferedRange(currentSub);
-                    const shouldPauseAtEnd = isSmartMode || isShadowing || loopMode === 'single';
+                    // Continuous mode is normal media playback: it must never stop
+                    // at a subtitle boundary, even if a shadow/loop setting remains
+                    // selected.  The TICK below still advances currentIndex, keeping
+                    // subtitles and any opened reference document in sync.
+                    const shouldPauseAtEnd = playbackMode !== 'continuous';
 
                     if (now >= end) {
                         if (shouldPauseAtEnd) {
@@ -14603,6 +14612,22 @@ ${userQ}`;
         }
     };
 
+    const togglePlaybackMode = () => {
+        const nextMode = playbackMode === 'continuous' ? 'sentence' : 'continuous';
+        setPlaybackMode(nextMode);
+        if (nextMode === 'continuous') {
+            // A user may switch while the sentence timer is between segments.
+            // Clear that timer/lock so the next ordinary Play click never waits
+            // for an old drill action or rewinds to the previous segment.
+            cancelWorkerTimer();
+            currentRepeatRef.current = 0;
+            isGapPausing.current = false;
+            isWaitingShadowRef.current = false;
+            setIsWaitingShadow(false);
+            setShadowCountdown(0);
+        }
+    };
+
     // [NEW] Survival Mode Logic
     const survivalQuestionPool = useMemo(() => {
         const source = (rawSubtitles && rawSubtitles.length > 0) ? rawSubtitles : subtitles;
@@ -18331,6 +18356,16 @@ ${userQ}`;
                                         <span className="text-[10px] font-bold w-4 text-center">{subtitleFontSize}</span>
                                     </div>
                                     <button onClick={toggleSmartMode} className={`flex items-center gap-1 px-3 py-1.5 rounded-md border text-xs font-medium shrink-0 transition-colors ${isSmartMode ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-gray-50 text-gray-600 border-gray-200'}`}><Puzzle size={14} /><span>智能斷句</span></button>
+                                    <button
+                                        type="button"
+                                        onClick={togglePlaybackMode}
+                                        title={playbackMode === 'continuous'
+                                            ? '連續播放：影音不中斷；字幕與已開啟的參照文件仍依時間軸同步。點此切回單句學習。'
+                                            : '單句學習：每個字幕段落結束時暫停。點此切換為不中斷的連續播放。'}
+                                        className={`flex items-center gap-1 px-3 py-1.5 rounded-md border text-xs font-medium shrink-0 transition-colors ${playbackMode === 'continuous' ? 'bg-emerald-100 text-emerald-700 border-emerald-300' : 'bg-gray-50 text-gray-600 border-gray-200'}`}
+                                    >
+                                        <span>{playbackMode === 'continuous' ? '連續播放' : '單句學習'}</span>
+                                    </button>
                                     <button onClick={downloadNotes} className="flex items-center gap-1 px-3 py-1.5 bg-gray-100 text-gray-700 rounded-md border border-gray-200 text-xs font-medium shrink-0"><Download size={14} /><span>筆記</span></button>
                                 </div>
                             </>
