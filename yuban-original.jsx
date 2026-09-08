@@ -3532,6 +3532,23 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(String(line || "").trim())
         || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(String(line || "").trim());
     const previousDemandsContinuation = (line) => /(?:[,;:—–-]|[“‘(\[{])$/.test(String(line || "").trim());
+    // A large number of auto-generated LRCs omit all terminal punctuation.
+    // Only infer a display sentence end when the *next cue* begins with a
+    // common English sentence starter.  This deliberately does not treat a
+    // capitalised name/place as sufficient evidence, because it often merely
+    // continues a sentence across an LRC timestamp.
+    const looksLikeFreshEnglishSentenceStart = (line) => {
+        const value = String(line || "").trim().replace(/^[“‘"'([{\[]+/, '');
+        return /^(?:I(?:'m|'ve|'ll|'d)?|you(?:'re|'ve|'ll|'d)?|he(?:'s|'d|'ll)?|she(?:'s|'d|'ll)?|it(?:'s|'d|'ll)?|we(?:'re|'ve|'ll|'d)?|they(?:'re|'ve|'ll|'d)?|this|that|these|those|there(?:'s|\s)|here(?:'s|\s)|the|a|an|and|but|so|yet|oh|ah|look|thank|give|what|why|how|when|where|who|do|does|did|is|are|was|were|can|could|will|would|have|has|had|let(?:'s|\s)|please)\b/i.test(value);
+    };
+    const appendInferredSentenceEnd = (line) => {
+        const value = String(line || "").trim();
+        if (!value || endsCompleteSentence(value)) return value;
+        const closingMatch = value.match(/([”’"')\]\}]+)$/);
+        const closing = closingMatch ? closingMatch[1] : "";
+        const body = closing ? value.slice(0, -closing.length).trimEnd() : value;
+        return `${body}${isCJKLine(body) ? "。" : "."}${closing}`;
+    };
     // An LRC line start is an actual timing observation. Punctuation inside a
     // line is not. Keep a bounded number of original cues together only when
     // they are clearly a continuation; the limit is exposed as Max Merge Lines.
@@ -3558,6 +3575,24 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         } else {
             logicalSubtitles.push({ ...rawSub, text, sourceLineCount: 1 });
         }
+    }
+
+    // Preserve timestamps exactly, but make high-confidence omitted full stops
+    // visible in every playback view.  In covered mode those marks also create
+    // a sentence boundary at this original cue end; in cue-merged mode they are
+    // display-only because that mode already uses cue boundaries for timing.
+    for (let index = 0; index < logicalSubtitles.length - 1; index++) {
+        const current = logicalSubtitles[index];
+        const next = logicalSubtitles[index + 1];
+        const currentText = String(current?.text || "").trim();
+        if (!currentText
+            || endsCompleteSentence(currentText)
+            || isAbbreviationEnding(currentText)
+            || previousDemandsContinuation(currentText)
+            || isStandaloneHeadingCue(currentText)
+            || isStandaloneHeadingCue(next?.text)
+            || !looksLikeFreshEnglishSentenceStart(next?.text)) continue;
+        current.text = appendInferredSentenceEnd(currentText);
     }
 
     // Timestamp-only mode uses the same reconstruction rules as Bridge
