@@ -3532,28 +3532,35 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(String(line || "").trim())
         || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(String(line || "").trim());
     const previousDemandsContinuation = (line) => /(?:[,;:—–-]|[“‘(\[{])$/.test(String(line || "").trim());
-    // A large number of auto-generated LRCs omit all terminal punctuation.
-    // Only infer a display sentence end when the *next cue* begins with a
-    // common English sentence starter.  This deliberately does not treat a
-    // capitalised name/place as sufficient evidence, because it often merely
-    // continues a sentence across an LRC timestamp.
-    const looksLikeFreshEnglishSentenceStart = (line) => {
-        const value = String(line || "").trim().replace(/^[“‘"'([{\[]+/, '');
-        return /^(?:I(?:'m|'ve|'ll|'d)?|you(?:'re|'ve|'ll|'d)?|he(?:'s|'d|'ll)?|she(?:'s|'d|'ll)?|it(?:'s|'d|'ll)?|we(?:'re|'ve|'ll|'d)?|they(?:'re|'ve|'ll|'d)?|this|that|these|those|there(?:'s|\s)|here(?:'s|\s)|the|a|an|and|but|so|yet|oh|ah|look|thank|give|what|why|how|when|where|who|do|does|did|is|are|was|were|can|could|will|would|have|has|had|let(?:'s|\s)|please)\b/i.test(value);
-    };
-    const appendInferredSentenceEnd = (line) => {
+    // Keep LRC display punctuation exactly aligned with Bridge Reader.  The
+    // grouping above already decides whether a cue is a continuation; every
+    // remaining spoken group is displayed as a sentence when source captions
+    // omitted punctuation.
+    const appendTerminalPunctuation = (line, punctuation) => {
         const value = String(line || "").trim();
         if (!value || endsCompleteSentence(value)) return value;
         const closingMatch = value.match(/([”’"')\]\}]+)$/);
         const closing = closingMatch ? closingMatch[1] : "";
         const body = closing ? value.slice(0, -closing.length).trimEnd() : value;
-        return `${body}${isCJKLine(body) ? "。" : "."}${closing}`;
+        return `${body}${punctuation}${closing}`;
+    };
+    const addReaderStyleLrcPunctuation = (line) => {
+        const value = String(line || "").trim();
+        if (!value || endsCompleteSentence(value)) return value;
+        if (/^you$/i.test(value)) return appendTerminalPunctuation(value, "…");
+        if (/^(?:oh|wow|hey|look(?:\s|$)|come on(?:\s|$)|give it up(?:\s|$)|thank you(?:\s|$)|please(?:\s|$)|congratulations(?:\s|$))/i.test(value)) {
+            return appendTerminalPunctuation(value, "!");
+        }
+        return appendTerminalPunctuation(value, ".");
     };
     // An LRC line start is an actual timing observation. Punctuation inside a
     // line is not. Keep a bounded number of original cues together only when
     // they are clearly a continuation; the limit is exposed as Max Merge Lines.
-    const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
     const useCueMergedTiming = timingMode === "cue-merged";
+    // The explicitly named Reader-style mode must not silently split a long
+    // chain of lower-case continuation cues.  The adjustable cap remains for
+    // estimated, sentence-learning timing only.
+    const maxMergedLines = useCueMergedTiming ? Number.POSITIVE_INFINITY : Math.max(1, Math.round(Number(maxMergeCount) || 1));
 
     const logicalSubtitles = [];
     for (const rawSub of rawSubtitles) {
@@ -3577,22 +3584,14 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         }
     }
 
-    // Preserve timestamps exactly, but make high-confidence omitted full stops
-    // visible in every playback view.  In covered mode those marks also create
-    // a sentence boundary at this original cue end; in cue-merged mode they are
-    // display-only because that mode already uses cue boundaries for timing.
-    for (let index = 0; index < logicalSubtitles.length - 1; index++) {
-        const current = logicalSubtitles[index];
-        const next = logicalSubtitles[index + 1];
-        const currentText = String(current?.text || "").trim();
-        if (!currentText
-            || endsCompleteSentence(currentText)
-            || isAbbreviationEnding(currentText)
-            || previousDemandsContinuation(currentText)
-            || isStandaloneHeadingCue(currentText)
-            || isStandaloneHeadingCue(next?.text)
-            || !looksLikeFreshEnglishSentenceStart(next?.text)) continue;
-        current.text = appendInferredSentenceEnd(currentText);
+    // Apply the same post-group punctuation policy as Reader.  These marks do
+    // not alter cue timestamps; they simply make continuous playback readable
+    // and prevent several stand-alone lines from becoming one unpunctuated UI
+    // sentence in the covered timing mode.
+    for (const subtitle of logicalSubtitles) {
+        if (!isStandaloneHeadingCue(subtitle?.text)) {
+            subtitle.text = addReaderStyleLrcPunctuation(subtitle?.text);
+        }
     }
 
     // Timestamp-only mode uses the same reconstruction rules as Bridge
@@ -7076,6 +7075,14 @@ export default function GeminiPlayer() {
     const embeddedKnowledgeContentRef = useRef(null);
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
+    // Multiple reference TXT files are common for long audiobooks.  Keep the
+    // parsed original-text index for each File so changing LRC cues does not
+    // repeatedly re-read and re-split large EPUB conversions on the UI thread.
+    const embeddedKnowledgeTabIndexCacheRef = useRef(new Map());
+    // Tab selection is a reading sequence, not a global document search:
+    // 1/n should advance to 2/n only after the current source is exhausted.
+    const embeddedKnowledgeTabSequenceRef = useRef({ subtitleIndex: -1, tabName: "", sourceLine: -1, misses: 0 });
+    const embeddedKnowledgePreferSeriesStartRef = useRef(true);
     // Do not lock the document cursor until the audiobook is reliably aligned
     // to body text. Opening narration (title, author, rights notice) can match
     // a duplicate phrase much later in a book.
@@ -7552,6 +7559,18 @@ export default function GeminiPlayer() {
         setFlashCardNotice("");
         setFlashCardTermPopup(null);
         setIsFlashCardLoading(false);
+        // A newly selected audio/video file must not inherit tab 2/n or 3/n
+        // from the previous title.  The first automatic document lookup below
+        // therefore opens the series at 1/n.
+        embeddedKnowledgePreferSeriesStartRef.current = true;
+        embeddedKnowledgeTabSearchRef.current = "";
+        embeddedKnowledgeTabIndexCacheRef.current.clear();
+        embeddedKnowledgeTabSequenceRef.current = { subtitleIndex: -1, tabName: "", sourceLine: -1, misses: 0 };
+        setEmbeddedKnowledgeText("");
+        setEmbeddedKnowledgeFileInfo(null);
+        setEmbeddedKnowledgeError("");
+        setActiveTrackKnowledgeTabName("");
+        setSelectedKnowledgeTxtName("");
     }, [currentTrackIndex, clearFlashCardAutoTimer, clearPocketUnlockTimer, resetFlashCardAutoFileQueue]);
 
     useEffect(() => {
@@ -8055,6 +8074,37 @@ export default function GeminiPlayer() {
     const commitProgressSeek = (value) => {
         if (value == null || Number.isNaN(value)) return;
         seekToSubtitleByTime(value);
+    };
+
+    const seekByContinuousOffset = (offsetSeconds) => {
+        if (!playerRef.current) return;
+        const current = Number(playerRef.current.currentTime || 0);
+        const ceiling = Number(duration || playerRef.current.duration || 0);
+        const target = Math.max(0, Math.min(current + Number(offsetSeconds || 0), ceiling || current + Number(offsetSeconds || 0)));
+        const shouldPlay = !playerRef.current.paused;
+        cancelWorkerTimer();
+        resetShadowStateForSeek();
+        const targetIndex = findSubtitleIndexByTime(target);
+        if (targetIndex !== -1 && targetIndex !== currentIndex) setCurrentIndex(targetIndex);
+        setCurrentTime(target);
+        seekThenMaybePlay(target, shouldPlay);
+        if (!shouldPlay) setIsPlaying(false);
+    };
+
+    const handlePreviousPlaybackControl = () => {
+        if (playbackMode === 'continuous') {
+            seekByContinuousOffset(-10);
+            return;
+        }
+        jumpToSubtitle(currentIndex - 1);
+    };
+
+    const handleNextPlaybackControl = () => {
+        if (playbackMode === 'continuous') {
+            seekByContinuousOffset(10);
+            return;
+        }
+        jumpToSubtitle(currentIndex + 1);
     };
 
     const getSubtitleBaseKeys = (fileName) => {
@@ -18034,24 +18084,26 @@ ${userQ}`;
         };
     }, [subtitleDisplayText, effectiveSubtitleFontSize, fittedSubtitleFontSize]);
 
-    const loadEmbeddedKnowledgeTxtFile = useCallback(async (file, { markSelected = true } = {}) => {
+    const loadEmbeddedKnowledgeTxtFile = useCallback(async (file, { markSelected = true, preferSeriesStart = false } = {}) => {
         if (!file) throw new Error("找不到指定的文字檔。");
+        const seriesStartFile = preferSeriesStart ? getKnowledgeSeriesTabEntries(String(file?.name || ""))?.[0]?.file : null;
+        const fileToLoad = seriesStartFile || file;
         setEmbeddedKnowledgeLoading(true);
         setEmbeddedKnowledgeError("");
         try {
-            mergeFilesIntoSelectedFolderMap([file]);
-            const rawTxt = String(await readManualDocumentText(file) || "").trim();
+            mergeFilesIntoSelectedFolderMap([fileToLoad]);
+            const rawTxt = String(await readManualDocumentText(fileToLoad) || "").trim();
             if (!rawTxt) throw new Error("文字檔為空。");
             let knowledgeBank = null;
             try {
-                knowledgeBank = await loadKnowledgeBankFromTxtFile(file, {
+                knowledgeBank = await loadKnowledgeBankFromTxtFile(fileToLoad, {
                     quizTargetLanguage: trackLanguage,
-                    trackKey: `${currentTrackIndex >= 0 ? currentTrackIndex : "manual"}:embedded:${String(file?.name || "").toLowerCase()}`
+                    trackKey: `${currentTrackIndex >= 0 ? currentTrackIndex : "manual"}:embedded:${String(fileToLoad?.name || "").toLowerCase()}`
                 });
             } catch (_) {}
             setEmbeddedKnowledgeText(rawTxt);
             setEmbeddedKnowledgeFileInfo({
-                filename: String(knowledgeBank?.filename || file?.name || "知識點.txt"),
+                filename: String(knowledgeBank?.filename || fileToLoad?.name || "知識點.txt"),
                 targetLanguage: String(
                     knowledgeBank?.targetLanguage ||
                     extractKnowledgeTxtDeclaredLanguage(rawTxt, trackLanguage) ||
@@ -18059,8 +18111,8 @@ ${userQ}`;
                 ).trim() || trackLanguage
             });
             if (markSelected) {
-                setSelectedKnowledgeTxtName(String(file?.name || "知識點.txt"));
-                setActiveTrackKnowledgeTabName(String(file?.name || "知識點.txt"));
+                setSelectedKnowledgeTxtName(String(fileToLoad?.name || "知識點.txt"));
+                setActiveTrackKnowledgeTabName(String(fileToLoad?.name || "知識點.txt"));
             }
             if (knowledgeBank) {
                 setQuizKnowledgeBankMap(prev => ({ ...prev, [knowledgeBank.trackKey]: knowledgeBank }));
@@ -18073,13 +18125,14 @@ ${userQ}`;
                 });
             } else {
                 setQuizKnowledgeFileInfo({
-                    filename: String(file?.name || "知識點.txt"),
+                    filename: String(fileToLoad?.name || "知識點.txt"),
                     total: 0,
                     generatedAt: Date.now(),
                     targetLanguage: extractKnowledgeTxtDeclaredLanguage(rawTxt, trackLanguage)
                 });
             }
-            return true;
+            if (preferSeriesStart) embeddedKnowledgePreferSeriesStartRef.current = false;
+            return { ok: true, rawTxt, filename: String(fileToLoad?.name || "知識點.txt") };
         } finally {
             setEmbeddedKnowledgeLoading(false);
         }
@@ -18142,21 +18195,18 @@ ${userQ}`;
         setEmbeddedKnowledgeError("");
         try {
             const hit = await probeKnowledgeFileForCurrentTrack({ refreshFromHandle: true, deepScan: true });
+            if (hit?.file) {
+                const result = await loadEmbeddedKnowledgeTxtFile(hit.file, {
+                    markSelected: true,
+                    preferSeriesStart: embeddedKnowledgePreferSeriesStartRef.current
+                });
+                return !!result?.ok;
+            }
             let knowledgeBank = null;
             let rawTxt = "";
             if (hit?.knowledgeBank) {
                 knowledgeBank = hit.knowledgeBank;
                 rawTxt = String(knowledgeBank?.txt || buildQuizKnowledgeTxt(knowledgeBank) || "").trim();
-            } else if (hit?.file) {
-                rawTxt = String(await readTextFileRobust(hit.file, { purpose: "knowledge" }) || "").trim();
-                if (rawTxt) {
-                    try {
-                        knowledgeBank = await loadKnowledgeBankFromTxtFile(hit.file, {
-                            quizTargetLanguage: trackLanguage,
-                            trackKey: `${currentTrackIndex >= 0 ? currentTrackIndex : "manual"}:embedded:${String(hit?.file?.name || "").toLowerCase()}`
-                        });
-                    } catch (_) {}
-                }
             }
             if (!rawTxt) {
                 throw new Error("目前媒體找不到可對照的文字檔。");
@@ -18185,6 +18235,7 @@ ${userQ}`;
         canShowEmbeddedKnowledgePanel,
         currentTrackIndex,
         embeddedKnowledgeText,
+        loadEmbeddedKnowledgeTxtFile,
         loadKnowledgeBankFromTxtFile,
         probeKnowledgeFileForCurrentTrack,
         trackLanguage
@@ -18197,6 +18248,19 @@ ${userQ}`;
         if (!file) throw new Error(`找不到指定的知識點 txt：${targetName}`);
         return loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
     }, [getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile]);
+    const getEmbeddedKnowledgeTabSearchData = useCallback(async (file) => {
+        const cacheKey = `${String(file?.name || '')}:${Number(file?.size || 0)}:${Number(file?.lastModified || 0)}`;
+        const cached = embeddedKnowledgeTabIndexCacheRef.current.get(cacheKey);
+        if (cached) return cached;
+        const rawTxt = String(await readManualDocumentText(file) || "").trim();
+        const allowWholeDocumentFallback = !/(?:知識點|knowledge\s*point|\.lrc(?:\s|$))/i.test(String(file?.name || ""));
+        const data = {
+            rawTxt,
+            index: buildKnowledgeOriginalSearchIndex(rawTxt, { allowWholeDocumentFallback })
+        };
+        embeddedKnowledgeTabIndexCacheRef.current.set(cacheKey, data);
+        return data;
+    }, []);
 
     const handleSelectTrackKnowledgeTab = useCallback(async (name, { target = "modal" } = {}) => {
         const nextName = String(name || "").trim();
@@ -18219,26 +18283,72 @@ ${userQ}`;
     }, [openEmbeddedKnowledgeTxtByName, openKnowledgeTxtInModal]);
     useEffect(() => {
         const subtitleText = subtitles[currentIndex]?.text || "";
-        const searchKey = `${currentIndex}:${activeTrackKnowledgeTabName}:${subtitleText}`;
-        if (topPanelMode !== 'document' || embeddedKnowledgeLoading || embeddedKnowledgeSubtitleMatches.length > 0 || trackKnowledgeTabEntries.length < 2 || embeddedKnowledgeTabSearchRef.current === searchKey) return;
+        const searchKey = `${currentIndex}:${subtitleText}`;
+        if (topPanelMode !== 'document' || embeddedKnowledgeLoading || trackKnowledgeTabEntries.length < 2 || embeddedKnowledgeTabSearchRef.current === searchKey) return;
         embeddedKnowledgeTabSearchRef.current = searchKey;
         let cancelled = false;
         (async () => {
-            for (const entry of trackKnowledgeTabEntries) {
-                const name = String(entry?.name || "");
-                if (!name || name === activeTrackKnowledgeTabName) continue;
-                const file = getKnowledgeTxtFileByName(name);
-                if (!file) continue;
-                const rawTxt = String(await readManualDocumentText(file) || "").trim();
-                if (!rawTxt || !findKnowledgeSubtitleMatch(rawTxt, subtitleText) || cancelled) continue;
-                setActiveTrackKnowledgeTabName(name);
-                setSelectedKnowledgeTxtName(name);
-                await loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
-                break;
+            const names = trackKnowledgeTabEntries.map(entry => String(entry?.name || "")).filter(Boolean);
+            const activeIndex = Math.max(0, names.indexOf(activeTrackKnowledgeTabName));
+            const activeName = names[activeIndex];
+            const sequence = embeddedKnowledgeTabSequenceRef.current;
+            const isForward = Number.isInteger(currentIndex) && currentIndex > Number(sequence.subtitleIndex || -1);
+            if (!isForward) {
+                // Manual rewind/seeking has no dependable 1/n position.  Let
+                // the current tab establish a fresh cursor; never jump back to
+                // an earlier tab automatically.
+                sequence.tabName = activeName;
+                sequence.sourceLine = -1;
+                sequence.misses = 0;
+            }
+            const pickForwardMatch = (data, minimumLine = -1) => {
+                const matches = findKnowledgeSubtitleMatches(data.rawTxt, subtitleText, null, { index: data.index });
+                return matches
+                    .filter(match => Number(match?.score || 0) >= 0.84 && Number(match?.sourceLine) >= minimumLine)
+                    .sort((a, b) => Number(a.sourceLine) - Number(b.sourceLine) || Number(b.score) - Number(a.score))[0] || null;
+            };
+            const activeFile = getKnowledgeTxtFileByName(activeName);
+            if (!activeFile) return;
+            const activeData = await getEmbeddedKnowledgeTabSearchData(activeFile);
+            if (cancelled || !activeData.rawTxt) return;
+            const keepAfter = isForward && sequence.tabName === activeName ? Number(sequence.sourceLine || -1) : -1;
+            const activeMatch = pickForwardMatch(activeData, keepAfter);
+            if (activeMatch) {
+                sequence.subtitleIndex = currentIndex;
+                sequence.tabName = activeName;
+                sequence.sourceLine = Number(activeMatch.sourceLine);
+                sequence.misses = 0;
+                return;
+            }
+            sequence.subtitleIndex = currentIndex;
+            sequence.tabName = activeName;
+            sequence.misses = Number(sequence.misses || 0) + 1;
+            if (!isForward) return;
+            const nextName = names[activeIndex + 1];
+            if (!nextName) return;
+            const nextFile = getKnowledgeTxtFileByName(nextName);
+            if (!nextFile) return;
+            const nextData = await getEmbeddedKnowledgeTabSearchData(nextFile);
+            if (cancelled || !nextData.rawTxt) return;
+            const nextMatch = pickForwardMatch(nextData, -1);
+            const lastActiveLine = activeData.index.entries.length
+                ? Number(activeData.index.entries[activeData.index.entries.length - 1].sourceLine)
+                : -1;
+            const reachedCurrentEnd = lastActiveLine >= 0 && Number(sequence.sourceLine || -1) >= lastActiveLine - 5;
+            // A small version discrepancy can miss one cue.  Do not abandon a
+            // tab on that one miss unless its previously matched line was at
+            // the end; otherwise require two consecutive misses.
+            if (nextMatch && (reachedCurrentEnd || sequence.misses >= 2)) {
+                sequence.tabName = nextName;
+                sequence.sourceLine = Number(nextMatch.sourceLine);
+                sequence.misses = 0;
+                setActiveTrackKnowledgeTabName(nextName);
+                setSelectedKnowledgeTxtName(nextName);
+                await loadEmbeddedKnowledgeTxtFile(nextFile, { markSelected: true });
             }
         })();
         return () => { cancelled = true; };
-    }, [activeTrackKnowledgeTabName, currentIndex, embeddedKnowledgeLoading, embeddedKnowledgeSubtitleMatches, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile, subtitles, topPanelMode, trackKnowledgeTabEntries]);
+    }, [activeTrackKnowledgeTabName, currentIndex, embeddedKnowledgeLoading, getEmbeddedKnowledgeTabSearchData, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile, subtitles, topPanelMode, trackKnowledgeTabEntries]);
     const renderTrackKnowledgeTabs = (target = "modal") => {
         if (!Array.isArray(trackKnowledgeTabEntries) || trackKnowledgeTabEntries.length <= 1) return null;
         const activeName = String(activeTrackKnowledgeTabName || "").trim();
@@ -18754,9 +18864,9 @@ ${userQ}`;
 
                         <div className="flex flex-col gap-3 px-4 py-3 w-full md:flex-row md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
                             <div className="flex flex-wrap items-center gap-3 pr-0 md:shrink-0 md:pr-4 md:border-r md:border-gray-100">
-                                <button onClick={() => jumpToSubtitle(currentIndex - 1)} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">上句</span></button>
+                                <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
-                                <button onClick={() => jumpToSubtitle(currentIndex + 1)} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">下句</span></button>
+                                <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
                                 <button onClick={() => { const modes = ['single', 'all', 'none']; setLoopMode(modes[(modes.indexOf(loopMode) + 1) % modes.length]); }} className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${loopMode !== 'none' ? 'text-blue-600 bg-blue-50' : 'text-gray-400'}`}>
                                     {loopMode === 'single' && <><Repeat1 size={16} /><span className="text-[9px]">單句</span></>}
                                     {loopMode === 'all' && <><Repeat size={16} /><span className="text-[9px]">全部</span></>}
@@ -18879,13 +18989,13 @@ ${userQ}`;
                     <div className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
                         <div className="px-3 py-2 flex items-center justify-between gap-2">
                             <div className="flex items-center gap-2 min-w-0">
-                                <button onClick={() => jumpToSubtitle(currentIndex - 1)} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
+                                <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipBack size={16} />
                                 </button>
                                 <button onClick={togglePlay} className="flex items-center justify-center p-2 rounded-full bg-gray-100 text-gray-900 hover:scale-105 transition-transform">
                                     {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
                                 </button>
-                                <button onClick={() => jumpToSubtitle(currentIndex + 1)} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
+                                <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipForward size={16} />
                                 </button>
                             </div>
