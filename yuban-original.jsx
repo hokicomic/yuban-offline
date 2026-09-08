@@ -7091,7 +7091,9 @@ export default function GeminiPlayer() {
         subtitleIndex: -1,
         maxSourceLine: -1,
         anchorState: "unanchored",
-        anchorCandidate: null
+        anchorCandidate: null,
+        trustedSourceLines: [],
+        forwardMisses: 0
     });
     const embeddedKnowledgeAlignmentLogRef = useRef([]);
     const embeddedKnowledgeAlignmentLogSignatureRef = useRef("");
@@ -16483,6 +16485,8 @@ ${userQ}`;
             progress.maxSourceLine = -1;
             progress.anchorState = "unanchored";
             progress.anchorCandidate = null;
+            progress.trustedSourceLines = [];
+            progress.forwardMisses = 0;
             embeddedKnowledgeAlignmentLogRef.current = [];
             embeddedKnowledgeAlignmentLogSignatureRef.current = "";
             documentReset = true;
@@ -16496,7 +16500,9 @@ ${userQ}`;
             subtitleIndex: progress.subtitleIndex,
             maxSourceLine: progress.maxSourceLine,
             anchorState: progress.anchorState,
-            anchorCandidate: progress.anchorCandidate
+            anchorCandidate: progress.anchorCandidate,
+            trustedSourceLines: Array.isArray(progress.trustedSourceLines) ? [...progress.trustedSourceLines] : [],
+            forwardMisses: Number(progress.forwardMisses || 0)
         };
         const isRewindPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex;
         // Keep a proven body anchor during rewind.  Resetting it forced a large
@@ -16509,8 +16515,17 @@ ${userQ}`;
         // than silently scanning the whole book and jumping to a duplicate.
         const isAnchored = progress.anchorState === "anchored" && progress.maxSourceLine >= 0;
         const INITIAL_ANCHOR_MAX_LINES = 480;
+        const trustedSourceLines = Array.isArray(progress.trustedSourceLines)
+            ? progress.trustedSourceLines.filter(Number.isFinite).slice(-4)
+            : [];
+        const recoveryStartLine = trustedSourceLines.length >= 2
+            ? Number(trustedSourceLines[Math.max(0, trustedSourceLines.length - 4)])
+            : -1;
+        const shouldTryHistoricalRecovery = isAnchored && isForwardPlayback &&
+            Number(progress.forwardMisses || 0) >= 2 && recoveryStartLine >= 0;
+        const sequentialSearchStart = shouldTryHistoricalRecovery ? recoveryStartLine : progress.maxSourceLine;
         const windowStart = isAnchored && isForwardPlayback
-            ? Math.max(0, progress.maxSourceLine - 1)
+            ? Math.max(0, sequentialSearchStart - 1)
             : (isAnchored && isRewindPlayback ? Math.max(0, progress.maxSourceLine - 260) : 0);
         const windowEnd = isAnchored && isForwardPlayback
             ? progress.maxSourceLine + 260
@@ -16526,7 +16541,7 @@ ${userQ}`;
             });
         const rawMatches = selectKnowledgeSubtitleMatchCluster(
             allRawMatches,
-            isAnchored && isForwardPlayback ? progress.maxSourceLine : -1
+            isAnchored && isForwardPlayback ? sequentialSearchStart : -1
         );
         // A single fuzzy duplicate far ahead is far more damaging than a
         // temporary miss: advancing the cursor to it makes every following
@@ -16545,9 +16560,12 @@ ${userQ}`;
         const cursorSafeRawMatches = isAnchored && isForwardPlayback
             ? rawMatches.filter(match => Number(match.sourceLine) <= forwardCursorLimit)
             : rawMatches;
-        const matches = isAnchored && isForwardPlayback
-            ? cursorSafeRawMatches.filter(match => match.sourceLine >= progress.maxSourceLine)
+        let matches = isAnchored && isForwardPlayback
+            ? cursorSafeRawMatches.filter(match => match.sourceLine >= sequentialSearchStart)
             : cursorSafeRawMatches;
+        if (shouldTryHistoricalRecovery) {
+            matches = matches.filter(match => Number(match?.score || 0) >= 0.88);
+        }
         const rejectedByCursor = rawMatches.filter(match => !matches.some(kept => kept.sourceLine === match.sourceLine));
         const bestMatch = matches.reduce((best, match) => !best || Number(match.score || 0) > Number(best.score || 0) ? match : best, null);
         let anchorEvent = "unchanged";
@@ -16555,14 +16573,26 @@ ${userQ}`;
             progress.anchorState = "anchored";
             progress.anchorCandidate = null;
             progress.maxSourceLine = Math.max(progress.maxSourceLine, bestMatch.sourceLine);
+            progress.trustedSourceLines = [...trustedSourceLines.filter(line => line <= bestMatch.sourceLine), bestMatch.sourceLine].slice(-4);
+            progress.forwardMisses = 0;
             anchorEvent = "manual_anchor";
         } else if (isAnchored && matches.length > 0) {
-            progress.maxSourceLine = isRewindPlayback
+            progress.maxSourceLine = shouldTryHistoricalRecovery
                 ? Math.max(...matches.map(match => match.sourceLine))
-                : Math.max(progress.maxSourceLine, ...matches.map(match => match.sourceLine));
-            anchorEvent = isRewindPlayback ? "rewind" : "advance";
+                : (isRewindPlayback
+                ? Math.max(...matches.map(match => match.sourceLine))
+                : Math.max(progress.maxSourceLine, ...matches.map(match => match.sourceLine)));
+            const acceptedLine = Number(progress.maxSourceLine);
+            progress.trustedSourceLines = [...trustedSourceLines.filter(line => line <= acceptedLine), acceptedLine]
+                .filter((line, index, list) => index === 0 || line !== list[index - 1]).slice(-4);
+            progress.forwardMisses = 0;
+            anchorEvent = shouldTryHistoricalRecovery ? "historical_recovery" : (isRewindPlayback ? "rewind" : "advance");
         } else if (isAnchored && suspiciousFarForwardMatches.length > 0) {
+            if (isForwardPlayback) progress.forwardMisses = Number(progress.forwardMisses || 0) + 1;
             anchorEvent = "suspicious_far_jump_ignored";
+        } else if (isAnchored && isForwardPlayback) {
+            progress.forwardMisses = Number(progress.forwardMisses || 0) + 1;
+            anchorEvent = shouldTryHistoricalRecovery ? "historical_recovery_no_match" : "forward_no_match";
         } else if (!isAnchored && bestMatch) {
             const candidate = progress.anchorCandidate;
             const score = Number(bestMatch.score || 0);
@@ -16578,6 +16608,8 @@ ${userQ}`;
                 progress.anchorState = "anchored";
                 progress.anchorCandidate = null;
                 progress.maxSourceLine = bestMatch.sourceLine;
+                progress.trustedSourceLines = [bestMatch.sourceLine];
+                progress.forwardMisses = 0;
                 anchorEvent = "anchor_confirmed";
             } else if (score >= 0.88) {
                 progress.anchorCandidate = { subtitleIndex: currentIndex, sourceLine: bestMatch.sourceLine, score };
@@ -16613,6 +16645,8 @@ ${userQ}`;
                     isRewindPlayback,
                     isAnchoredBefore: isAnchored,
                     anchorEvent,
+                    shouldTryHistoricalRecovery,
+                    recoveryStartLine,
                     allRawMatches,
                     selectedCluster: rawMatches,
                     suspiciousFarForwardMatches,
@@ -16623,7 +16657,9 @@ ${userQ}`;
                         subtitleIndex: progress.subtitleIndex,
                         maxSourceLine: progress.maxSourceLine,
                         anchorState: progress.anchorState,
-                        anchorCandidate: progress.anchorCandidate
+                        anchorCandidate: progress.anchorCandidate,
+                        trustedSourceLines: progress.trustedSourceLines,
+                        forwardMisses: progress.forwardMisses
                     },
                     diagnostics
                 };
@@ -18764,6 +18800,8 @@ ${userQ}`;
                                                         embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = candidate.sourceLine;
                                                         embeddedKnowledgePlaybackProgressRef.current.anchorState = "anchored";
                                                         embeddedKnowledgePlaybackProgressRef.current.anchorCandidate = null;
+                                                        embeddedKnowledgePlaybackProgressRef.current.trustedSourceLines = [candidate.sourceLine];
+                                                        embeddedKnowledgePlaybackProgressRef.current.forwardMisses = 0;
                                                         setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: candidate.sourceLine }));
                                                         setEmbeddedKnowledgeMatchCandidates([]);
                                                         setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${candidate.sourceLine + 1} 行為目前字幕對應。`);
@@ -18810,6 +18848,8 @@ ${userQ}`;
                                                     embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = sourceLine;
                                                     embeddedKnowledgePlaybackProgressRef.current.anchorState = "anchored";
                                                     embeddedKnowledgePlaybackProgressRef.current.anchorCandidate = null;
+                                                    embeddedKnowledgePlaybackProgressRef.current.trustedSourceLines = [sourceLine];
+                                                    embeddedKnowledgePlaybackProgressRef.current.forwardMisses = 0;
                                                     setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: sourceLine }));
                                                     setEmbeddedKnowledgeMatchCandidates([]);
                                                     setEmbeddedKnowledgeManualAnchorMode(false);
