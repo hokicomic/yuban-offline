@@ -5701,7 +5701,8 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
         eligibleLineCount += 1;
         // 單句 LRC 必須只和段落內的單句比較；把整段也放進候選會讓遠處句子
         // 因為「包含」關係被誤判為精確符合。LRC 本身含多句時才保留整段候選。
-        const subtitleSentenceCount = splitKnowledgeLineIntoSentences(subtitleText).filter(Boolean).length;
+        const subtitleParts = splitKnowledgeLineIntoSentences(subtitleText).filter(Boolean);
+        const subtitleSentenceCount = subtitleParts.length;
         const candidates = subtitleSentenceCount > 1 ? [raw, ...sentences] : sentences;
         let bestScore = 0;
         let bestObservedScore = 0;
@@ -5713,7 +5714,13 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
             const candidateWords = candidate.match(/[\p{L}\p{N}]+/gu) || [];
             // 名稱或短片語（例如 "Miss Mary Marvell"）常會出現在遠處段落。
             // 短句只可完全相等；至少四個詞才允許一方包含另一方。
-            const exact = (candidate === target && candidateWords.length >= 2) ||
+            // A multi-sentence LRC cue may contain a very short dialogue line
+            // (for example “Sent them back?”).  The full-cue containment guard
+            // intentionally rejects <4 words, but an exact match against one
+            // individual subtitle sentence is unambiguous and must be retained.
+            const exactSubtitlePart = candidateWords.length >= 3 && subtitleParts.some((part) =>
+                candidate === normalizeKnowledgeAlignmentText(part));
+            const exact = exactSubtitlePart || (candidate === target && candidateWords.length >= 2) ||
                 (Math.min(targetWords.length, candidateWords.length) >= 4 &&
                     (candidate.includes(target) || target.includes(candidate)));
             const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
