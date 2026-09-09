@@ -5838,6 +5838,23 @@ const isKnowledgeSentenceCoveredBySubtitle = (sentence = "", subtitleText = "") 
     return candidates.some(part => isKnowledgeSentenceMatchedBySubtitlePart(sentence, part));
 };
 
+// A short sentence with only a determiner/article changed is unsafe to accept
+// by itself, but becomes strong evidence when it is literally between two
+// exact matches from the same active subtitle cue.  This keeps `A most amazing
+// cove, Jeeves.` aligned with `The most amazing cove, Jeeves.` without
+// weakening the document-wide matcher.
+const isKnowledgeSentenceSandwichedNearMatch = (sentence = "", subtitleText = "") => {
+    const candidateWords = normalizeKnowledgeAlignmentText(sentence).match(/[\p{L}\p{N}]+/gu) || [];
+    if (candidateWords.length < 4 || candidateWords.length > 18) return false;
+    return splitKnowledgeLineIntoSentences(subtitleText).some((part) => {
+        const targetWords = normalizeKnowledgeAlignmentText(part).match(/[\p{L}\p{N}]+/gu) || [];
+        if (targetWords.length < 4 || targetWords.length > 18) return false;
+        const evidence = getKnowledgeAlignmentContentEvidence(part, sentence);
+        const alignment = getKnowledgeAlignmentDirectionalScore(part, sentence);
+        return evidence.total >= 3 && evidence.score >= 0.90 && alignment.orderedContentCoverage >= 0.90;
+    });
+};
+
 // 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
 // 避免遠處的模糊候選把播放游標推得過後，導致後面的真實句子被防回跳機制排除。
 const selectKnowledgeSubtitleMatchCluster = (matches = [], expectedSourceLine = -1) => {
@@ -6414,7 +6431,11 @@ const MarkdownView = ({
             const sentenceEnd = sentenceStart + sentence.length;
             sourceCursor = sentenceEnd;
             const overlapsExactRange = highlightRanges.some(range => sentenceStart < range.end && sentenceEnd > range.start);
-            if (!overlapsExactRange && isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText)) {
+            const hasExactBefore = highlightRanges.some(range => range.end <= sentenceStart);
+            const hasExactAfter = highlightRanges.some(range => range.start >= sentenceEnd);
+            const covered = isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText);
+            const sandwichedNearMatch = hasExactBefore && hasExactAfter && isKnowledgeSentenceSandwichedNearMatch(sentence, subtitleText);
+            if (!overlapsExactRange && (covered || sandwichedNearMatch)) {
                 highlightRanges.push({ start: sentenceStart, end: sentenceEnd });
             }
         }
