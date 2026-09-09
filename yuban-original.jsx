@@ -6400,11 +6400,31 @@ const MarkdownView = ({
         // LRC often ends a cue at a semicolon/comma even though the ebook keeps
         // the surrounding prose as one grammatical sentence. Prefer an exact
         // word-range so only the spoken cue is marked (including Mr./Ms.).
-        const exactRanges = findExactSubtitleRangesInKnowledgeLine(source, subtitleText);
-        if (exactRanges.length > 0) {
+        const highlightRanges = findExactSubtitleRangesInKnowledgeLine(source, subtitleText);
+        // An active multi-sentence subtitle may contain both verbatim text and
+        // a small transcription difference (for example `not too weak` vs
+        // ebook `not to weak`). The old early return after one exact hit meant
+        // those near-identical middle sentences were never tested at all.
+        // Keep exact word ranges, then fill only their unmatched source
+        // sentences with the existing tolerant, order-aware comparison.
+        let sourceCursor = 0;
+        for (const sentence of splitKnowledgeLineIntoSentences(source)) {
+            const sentenceStart = source.indexOf(sentence, sourceCursor);
+            if (sentenceStart < 0) continue;
+            const sentenceEnd = sentenceStart + sentence.length;
+            sourceCursor = sentenceEnd;
+            const overlapsExactRange = highlightRanges.some(range => sentenceStart < range.end && sentenceEnd > range.start);
+            if (!overlapsExactRange && isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText)) {
+                highlightRanges.push({ start: sentenceStart, end: sentenceEnd });
+            }
+        }
+        const ranges = highlightRanges
+            .sort((a, b) => a.start - b.start)
+            .filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
+        if (ranges.length > 0) {
             const nodes = [];
             let cursor = 0;
-            exactRanges.forEach((range, index) => {
+            ranges.forEach((range, index) => {
                 if (range.start > cursor) nodes.push(<React.Fragment key={`${keyPrefix}-before-${index}`}>{buildKnowledgeLinkedNodes(source.slice(cursor, range.start), `${keyPrefix}-before-${index}`)}</React.Fragment>);
                 nodes.push(<mark key={`${keyPrefix}-exact-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{buildKnowledgeLinkedNodes(source.slice(range.start, range.end), `${keyPrefix}-exact-${index}`)}</mark>);
                 cursor = range.end;
