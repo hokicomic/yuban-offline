@@ -132,15 +132,34 @@ const getPCloudPublicApiHost = (value) => {
     return "api.pcloud.com";
 };
 
+const maskPCloudPublicCode = (value) => {
+    const code = String(value || "");
+    if (!code) return "";
+    return code.length <= 10 ? `${code.slice(0, 3)}…(${code.length})` : `${code.slice(0, 6)}…${code.slice(-4)}(${code.length})`;
+};
+
 const pCloudPublicApi = async (method, params = {}, apiHost = "api.pcloud.com") => {
     const query = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
     });
-    const response = await fetch(`https://${normalizePCloudApiHost(apiHost)}/${method}?${query.toString()}`);
-    if (!response.ok) throw new Error(`pCloud 公開連結 ${method} request failed (${response.status})`);
-    const result = await response.json();
-    if (Number(result?.result) !== 0) throw new Error(result?.error || `pCloud 公開連結 ${method} failed (${result?.result ?? "unknown"})`);
+    const host = normalizePCloudApiHost(apiHost);
+    const request = { method, host, code: maskPCloudPublicCode(params?.code), fileid: params?.fileid ?? null };
+    let response;
+    try {
+        response = await fetch(`https://${host}/${method}?${query.toString()}`);
+    } catch (cause) {
+        const error = new Error(`pCloud 公開連結 ${method} 無法連線：${cause?.message || "network error"}`);
+        error.pCloudDebug = { ...request, phase: "fetch", error: String(cause?.message || cause) };
+        throw error;
+    }
+    let result = null;
+    try { result = await response.json(); } catch (_) { }
+    if (!response.ok || Number(result?.result) !== 0) {
+        const error = new Error(result?.error || `pCloud 公開連結 ${method} failed (${response.status}/${result?.result ?? "unknown"})`);
+        error.pCloudDebug = { ...request, phase: "response", httpStatus: response.status, result: result?.result ?? null, error: String(result?.error || "") };
+        throw error;
+    }
     return result;
 };
 
@@ -7043,6 +7062,7 @@ export default function GeminiPlayer() {
     const [pCloudFolderEntries, setPCloudFolderEntries] = useState([]);
     const [pCloudLoading, setPCloudLoading] = useState(false);
     const [pCloudError, setPCloudError] = useState("");
+    const [pCloudDebugLogNotice, setPCloudDebugLogNotice] = useState("");
     const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(50);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [embeddedKnowledgeAlignmentLogNotice, setEmbeddedKnowledgeAlignmentLogNotice] = useState("");
@@ -7329,6 +7349,7 @@ export default function GeminiPlayer() {
         forwardMisses: 0
     });
     const embeddedKnowledgeAlignmentLogRef = useRef([]);
+    const pCloudDebugLogRef = useRef([]);
     const embeddedKnowledgeAlignmentLogSignatureRef = useRef("");
     const embeddedKnowledgeMatchCandidatesRef = useRef([]);
     const knowledgePreviewPopupPanelRef = useRef(null);
@@ -8793,6 +8814,34 @@ export default function GeminiPlayer() {
         return { exists: false, source: "none", baseName: candidates[0] || "", triedBaseNames: candidates };
     };
 
+    const recordPCloudDebug = useCallback((event, details = {}) => {
+        const entry = { at: new Date().toISOString(), event, ...details };
+        pCloudDebugLogRef.current = [...(pCloudDebugLogRef.current || []), entry].slice(-160);
+        console.info("[Yuban pCloud]", entry);
+    }, []);
+
+    const copyPCloudDebugLog = useCallback(async () => {
+        const entries = pCloudDebugLogRef.current || [];
+        const text = JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
+        if (!entries.length) {
+            setPCloudDebugLogNotice("尚未有 pCloud 操作紀錄");
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            setPCloudDebugLogNotice(`已複製 ${entries.length} 筆 pCloud Log`);
+        } catch (_) {
+            const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "yuban-pcloud-debug.json";
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setPCloudDebugLogNotice("已下載 pCloud Log JSON");
+        }
+        setTimeout(() => setPCloudDebugLogNotice(""), 6000);
+    }, []);
+
     const loadPCloudFolder = async (folderid = 0, folderName = "pCloud") => {
         const connection = pCloudConnection || {};
         if (!connection.accessToken) {
@@ -8824,8 +8873,17 @@ export default function GeminiPlayer() {
         // falls back to the US endpoint and pCloud reports it as invalid.
         const reusingCurrentPublicLink = Boolean(pCloudPublicCode && code === pCloudPublicCode);
         const apiHost = reusingCurrentPublicLink ? pCloudPublicApiHost : getPCloudPublicApiHost(codeInput);
+        recordPCloudDebug("public_folder.open.begin", {
+            inputKind: /^https?:\/\//i.test(String(codeInput || "")) ? "url" : "code-or-empty",
+            parsedCode: maskPCloudPublicCode(code),
+            apiHost,
+            folderid: folderid === null ? null : Number(folderid),
+            reusingCurrentPublicLink,
+            cachedRoot: Boolean(pCloudPublicRoot)
+        });
         if (!code) {
             setPCloudError("請貼上 pCloud 的公開共享資料夾連結，或直接貼上其中的 code。");
+            recordPCloudDebug("public_folder.open.reject", { reason: "empty_code" });
             return;
         }
         setPCloudLoading(true);
@@ -8847,8 +8905,22 @@ export default function GeminiPlayer() {
                 isPublic: true
             });
             setPCloudFolderEntries(Array.isArray(folder?.contents) ? folder.contents : []);
+            recordPCloudDebug("public_folder.open.success", {
+                apiHost,
+                usedCachedRoot: root === pCloudPublicRoot,
+                rootFolderid: Number(root?.folderid ?? -1),
+                folderid: Number(folder?.folderid ?? -1),
+                folderName: String(folder?.name || ""),
+                directEntryCount: Array.isArray(folder?.contents) ? folder.contents.length : 0
+            });
         } catch (err) {
             setPCloudError(err?.message || "無法讀取 pCloud 公開共享資料夾。");
+            recordPCloudDebug("public_folder.open.fail", {
+                apiHost,
+                folderid: folderid === null ? null : Number(folderid),
+                error: String(err?.message || err),
+                request: err?.pCloudDebug || null
+            });
         } finally {
             setPCloudLoading(false);
         }
@@ -8893,6 +8965,14 @@ export default function GeminiPlayer() {
             setPCloudError("這個資料夾沒有可載入的檔案。請進入包含影音與字幕的資料夾後再開啟。\n");
             return;
         }
+        recordPCloudDebug("public_folder.use_as_library", {
+            isPublic,
+            apiHost: isPublic ? pCloudPublicApiHost : normalizePCloudApiHost(pCloudConnection?.apiHost),
+            code: isPublic ? maskPCloudPublicCode(pCloudPublicCode) : "",
+            folderid: Number(pCloudFolder?.folderid ?? -1),
+            folderName: String(pCloudFolder?.name || ""),
+            files: files.map(file => ({ name: file.name, fileid: file.pCloudFileId, size: file.size, type: file.type })).slice(0, 80)
+        });
         applySelectedFolderFiles(files, { folderName: `pCloud · ${pCloudFolder?.name || "資料夾"}` });
         setShowPCloudBrowser(false);
     };
@@ -9084,13 +9164,24 @@ export default function GeminiPlayer() {
         currentRepeatRef.current = 0;
         if (mediaSrc && String(mediaSrc).startsWith("blob:")) URL.revokeObjectURL(mediaSrc);
         try {
+            if (track?.mediaFile?.isRemotePCloud) {
+                recordPCloudDebug("media.stream.begin", {
+                    track: String(track?.name || ""),
+                    public: Boolean(track?.mediaFile?.isPCloudPublic),
+                    apiHost: String(track?.mediaFile?.isPCloudPublic ? pCloudPublicApiHost : track?.mediaFile?.pCloudConnection?.apiHost || ""),
+                    code: track?.mediaFile?.isPCloudPublic ? maskPCloudPublicCode(track?.mediaFile?.pCloudPublicCode) : "",
+                    fileid: Number(track?.mediaFile?.pCloudFileId ?? -1)
+                });
+            }
             const source = track?.mediaFile?.isRemotePCloud
                 ? await track.mediaFile.getStreamUrl()
                 : URL.createObjectURL(track.mediaFile);
             setMediaSrc(source);
+            if (track?.mediaFile?.isRemotePCloud) recordPCloudDebug("media.stream.success", { track: String(track?.name || ""), sourceHost: (() => { try { return new URL(source).host; } catch (_) { return ""; } })() });
         } catch (err) {
             setMediaSrc(null);
             setMediaError(err?.message || `無法載入 ${track?.name || "pCloud 媒體"}`);
+            if (track?.mediaFile?.isRemotePCloud) recordPCloudDebug("media.stream.fail", { track: String(track?.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
         }
         if (track.subFile) {
             const applySubtitleContent = (content) => {
@@ -9109,9 +9200,14 @@ export default function GeminiPlayer() {
                 setCurrentIndex(0);
             };
             if (track.subFile.isRemotePCloud && typeof track.subFile.text === "function") {
-                track.subFile.text().then(applySubtitleContent).catch((err) => {
+                if (track.subFile.isPCloudPublic) recordPCloudDebug("subtitle.fetch.begin", { name: String(track.subFile.name || ""), fileid: Number(track.subFile.pCloudFileId ?? -1), code: maskPCloudPublicCode(track.subFile.pCloudPublicCode) });
+                track.subFile.text().then((content) => {
+                    if (track.subFile.isPCloudPublic) recordPCloudDebug("subtitle.fetch.success", { name: String(track.subFile.name || ""), chars: String(content || "").length });
+                    applySubtitleContent(content);
+                }).catch((err) => {
                     setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
                     setMediaError(err?.message || "無法下載 pCloud 字幕。");
+                    if (track.subFile.isPCloudPublic) recordPCloudDebug("subtitle.fetch.fail", { name: String(track.subFile.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
                 });
             } else {
                 const reader = new FileReader();
@@ -19054,7 +19150,10 @@ ${userQ}`;
                                     <div className="font-bold text-slate-800 flex items-center gap-2"><Globe size={18} />pCloud 雲端資料庫</div>
                                     <div className="text-xs text-slate-500 mt-1">只索引目前資料夾；影音串流、字幕與知識檔按需載入。</div>
                                 </div>
-                                <button type="button" onClick={() => setShowPCloudBrowser(false)} className="p-2 rounded-full text-slate-500 hover:bg-white"><X size={18} /></button>
+                                <div className="flex items-center gap-2">
+                                    <button type="button" onClick={copyPCloudDebugLog} className="px-2.5 py-1.5 rounded-lg border border-violet-200 bg-white text-violet-700 text-xs hover:bg-violet-50">pCloud Log</button>
+                                    <button type="button" onClick={() => setShowPCloudBrowser(false)} className="p-2 rounded-full text-slate-500 hover:bg-white"><X size={18} /></button>
+                                </div>
                             </div>
                             {!pCloudFolder ? (
                                 <div className="p-5 space-y-5 overflow-y-auto">
@@ -19112,6 +19211,7 @@ ${userQ}`;
                                 </>
                             )}
                             {pCloudError && <div className="mx-5 mb-4 px-3 py-2 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs whitespace-pre-line">{pCloudError}</div>}
+                            {pCloudDebugLogNotice && <div className="mx-5 mb-4 px-3 py-2 rounded-lg bg-violet-50 border border-violet-200 text-violet-700 text-xs">{pCloudDebugLogNotice}</div>}
                         </div>
                     </div>
                 )}
