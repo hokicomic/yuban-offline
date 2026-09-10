@@ -121,12 +121,23 @@ const getPCloudPublicLinkCode = (value) => {
     return String(match?.[1] || raw).trim();
 };
 
-const pCloudPublicApi = async (method, params = {}) => {
+const getPCloudPublicApiHost = (value) => {
+    try {
+        const hostname = String(new URL(String(value || "")).hostname || "").toLowerCase();
+        // Public links use e.pcloud.link for the European data centre.  Public
+        // link codes are local to that data centre, not globally resolvable.
+        if (hostname === "e.pcloud.link" || hostname.startsWith("e.")) return "eapi.pcloud.com";
+        if (hostname === "api.pcloud.com" || hostname === "eapi.pcloud.com") return hostname;
+    } catch (_) { }
+    return "api.pcloud.com";
+};
+
+const pCloudPublicApi = async (method, params = {}, apiHost = "api.pcloud.com") => {
     const query = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
     });
-    const response = await fetch(`https://api.pcloud.com/${method}?${query.toString()}`);
+    const response = await fetch(`https://${normalizePCloudApiHost(apiHost)}/${method}?${query.toString()}`);
     if (!response.ok) throw new Error(`pCloud 公開連結 ${method} request failed (${response.status})`);
     const result = await response.json();
     if (Number(result?.result) !== 0) throw new Error(result?.error || `pCloud 公開連結 ${method} failed (${result?.result ?? "unknown"})`);
@@ -143,22 +154,22 @@ const findPCloudPublicFolder = (metadata, folderid) => {
     return null;
 };
 
-const getPCloudPublicFileUrl = async (code, fileid) => {
+const getPCloudPublicFileUrl = async (code, fileid, apiHost) => {
     // pCloud returns short-lived content-server URLs only when the user opens a
     // file.  This follows its intended public-link access pattern.
-    const result = await pCloudPublicApi("getpublinkdownload", { code, fileid });
+    const result = await pCloudPublicApi("getpublinkdownload", { code, fileid }, apiHost);
     const host = Array.isArray(result?.hosts) ? result.hosts[0] : "";
     const path = String(result?.path || "");
     if (!host || !path) throw new Error("pCloud 公開連結未回傳可播放的檔案網址。");
     return `https://${host}${path}`;
 };
 
-const makePCloudPublicRemoteFile = (metadata, code) => {
+const makePCloudPublicRemoteFile = (metadata, code, apiHost) => {
     const name = String(metadata?.name || "");
     const fileid = Number(metadata?.fileid);
     const contenttype = String(metadata?.contenttype || "");
     const modified = Date.parse(metadata?.modified || "") || Date.now();
-    const getUrl = () => getPCloudPublicFileUrl(code, fileid);
+    const getUrl = () => getPCloudPublicFileUrl(code, fileid, apiHost);
     const fetchBlob = async () => {
         const response = await fetch(await getUrl());
         if (!response.ok) throw new Error(`pCloud 無法取得 ${name} (${response.status})`);
@@ -168,7 +179,7 @@ const makePCloudPublicRemoteFile = (metadata, code) => {
         // This endpoint streams public text directly and avoids loading a media
         // object merely to obtain a subtitle/knowledge file.
         const query = new URLSearchParams({ code: String(code), fileid: String(fileid), toencoding: "utf-8" });
-        const response = await fetch(`https://api.pcloud.com/getpubtextfile?${query.toString()}`);
+        const response = await fetch(`https://${normalizePCloudApiHost(apiHost)}/getpubtextfile?${query.toString()}`);
         if (response.ok) return response.text();
         return (await fetchBlob()).text();
     };
@@ -7026,6 +7037,7 @@ export default function GeminiPlayer() {
     const [pCloudClientId, setPCloudClientId] = useState(() => String(getPCloudSavedConnection()?.clientId || ""));
     const [pCloudPublicLinkInput, setPCloudPublicLinkInput] = useState("");
     const [pCloudPublicCode, setPCloudPublicCode] = useState("");
+    const [pCloudPublicApiHost, setPCloudPublicApiHost] = useState("api.pcloud.com");
     const [pCloudPublicRoot, setPCloudPublicRoot] = useState(null);
     const [pCloudFolder, setPCloudFolder] = useState(null);
     const [pCloudFolderEntries, setPCloudFolderEntries] = useState([]);
@@ -8807,6 +8819,7 @@ export default function GeminiPlayer() {
 
     const loadPCloudPublicFolder = async (codeInput, folderid = null) => {
         const code = getPCloudPublicLinkCode(codeInput || pCloudPublicCode);
+        const apiHost = codeInput ? getPCloudPublicApiHost(codeInput) : pCloudPublicApiHost;
         if (!code) {
             setPCloudError("請貼上 pCloud 的公開共享資料夾連結，或直接貼上其中的 code。");
             return;
@@ -8816,11 +8829,12 @@ export default function GeminiPlayer() {
         try {
             const root = pCloudPublicRoot && code === pCloudPublicCode
                 ? pCloudPublicRoot
-                : (await pCloudPublicApi("showpublink", { code })).metadata;
+                : (await pCloudPublicApi("showpublink", { code }, apiHost)).metadata;
             if (!root?.isfolder) throw new Error("這個 pCloud 連結不是資料夾連結。請貼上包含影音、字幕與知識檔的公開資料夾分享連結。");
             const folder = folderid === null ? root : findPCloudPublicFolder(root, folderid);
             if (!folder?.isfolder) throw new Error("找不到此公開資料夾的子資料夾內容。");
             setPCloudPublicCode(code);
+            setPCloudPublicApiHost(apiHost);
             setPCloudPublicRoot(root);
             setPCloudFolder({
                 folderid: Number(folder?.folderid ?? 0),
@@ -8869,7 +8883,7 @@ export default function GeminiPlayer() {
         const files = pCloudFolderEntries
             .filter((entry) => entry && !entry.isfolder && Number(entry.fileid) > 0)
             .map((entry) => isPublic
-                ? makePCloudPublicRemoteFile(entry, pCloudPublicCode)
+                ? makePCloudPublicRemoteFile(entry, pCloudPublicCode, pCloudPublicApiHost)
                 : makePCloudRemoteFile(entry, pCloudConnection));
         if (!files.length) {
             setPCloudError("這個資料夾沒有可載入的檔案。請進入包含影音與字幕的資料夾後再開啟。\n");
