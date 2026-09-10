@@ -7063,6 +7063,7 @@ export default function GeminiPlayer() {
     const [pCloudLoading, setPCloudLoading] = useState(false);
     const [pCloudError, setPCloudError] = useState("");
     const [pCloudDebugLogNotice, setPCloudDebugLogNotice] = useState("");
+    const [pCloudDebugLogText, setPCloudDebugLogText] = useState("");
     const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(50);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [embeddedKnowledgeAlignmentLogNotice, setEmbeddedKnowledgeAlignmentLogNotice] = useState("");
@@ -8816,13 +8817,15 @@ export default function GeminiPlayer() {
 
     const recordPCloudDebug = useCallback((event, details = {}) => {
         const entry = { at: new Date().toISOString(), event, ...details };
-        pCloudDebugLogRef.current = [...(pCloudDebugLogRef.current || []), entry].slice(-160);
+        const entries = [...(pCloudDebugLogRef.current || []), entry].slice(-160);
+        pCloudDebugLogRef.current = entries;
+        setPCloudDebugLogText(JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2));
         console.info("[Yuban pCloud]", entry);
     }, []);
 
     const copyPCloudDebugLog = useCallback(async () => {
         const entries = pCloudDebugLogRef.current || [];
-        const text = JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
+        const text = pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
         if (!entries.length) {
             setPCloudDebugLogNotice("尚未有 pCloud 操作紀錄");
             return;
@@ -19432,14 +19435,16 @@ ${userQ}`;
                         )}
                     </div>
                     {mediaError && (
-                        <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 flex flex-wrap items-center gap-3">
-                            <span className="min-w-0 flex-1">{mediaError}</span>
-                            {pCloudDebugLogRef.current?.length > 0 && (
-                                <>
-                                    <button type="button" onClick={copyPCloudDebugLog} className="px-2.5 py-1.5 rounded-lg border border-violet-300 bg-white text-violet-700 text-xs font-medium hover:bg-violet-50 shrink-0">複製 pCloud Log</button>
-                                    <button type="button" onClick={() => setShowPCloudBrowser(true)} className="px-2.5 py-1.5 rounded-lg border border-sky-300 bg-white text-sky-700 text-xs font-medium hover:bg-sky-50 shrink-0">開啟 pCloud</button>
-                                </>
-                            )}
+                        <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 space-y-3">
+                            <div className="flex flex-wrap items-center gap-3">
+                                <span className="min-w-0 flex-1">{mediaError}</span>
+                                <button type="button" onClick={copyPCloudDebugLog} className="px-2.5 py-1.5 rounded-lg border border-violet-300 bg-white text-violet-700 text-xs font-medium hover:bg-violet-50 shrink-0">複製 pCloud Log</button>
+                                <button type="button" onClick={() => setShowPCloudBrowser(true)} className="px-2.5 py-1.5 rounded-lg border border-sky-300 bg-white text-sky-700 text-xs font-medium hover:bg-sky-50 shrink-0">開啟 pCloud</button>
+                            </div>
+                            <details open className="rounded-lg border border-amber-200 bg-white/70 px-3 py-2">
+                                <summary className="cursor-pointer font-medium text-xs text-amber-900">pCloud 診斷 Log（可手動全選複製）</summary>
+                                <textarea readOnly value={pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries: pCloudDebugLogRef.current || [] }, null, 2)} className="mt-2 w-full min-h-48 max-h-80 resize-y rounded border border-amber-200 bg-white p-2 font-mono text-[11px] leading-relaxed text-slate-700" onFocus={(e) => e.currentTarget.select()} aria-label="pCloud 診斷 Log" />
+                            </details>
                         </div>
                     )}
 
