@@ -8819,7 +8819,11 @@ export default function GeminiPlayer() {
 
     const loadPCloudPublicFolder = async (codeInput, folderid = null) => {
         const code = getPCloudPublicLinkCode(codeInput || pCloudPublicCode);
-        const apiHost = codeInput ? getPCloudPublicApiHost(codeInput) : pCloudPublicApiHost;
+        // A child-folder click passes only the saved code, not its original URL.
+        // Keep the region resolved from that URL; otherwise an EU code silently
+        // falls back to the US endpoint and pCloud reports it as invalid.
+        const reusingCurrentPublicLink = Boolean(pCloudPublicCode && code === pCloudPublicCode);
+        const apiHost = reusingCurrentPublicLink ? pCloudPublicApiHost : getPCloudPublicApiHost(codeInput);
         if (!code) {
             setPCloudError("請貼上 pCloud 的公開共享資料夾連結，或直接貼上其中的 code。");
             return;
