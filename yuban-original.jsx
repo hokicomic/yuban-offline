@@ -19432,8 +19432,14 @@ ${userQ}`;
                         )}
                     </div>
                     {mediaError && (
-                        <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                            {mediaError}
+                        <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 flex flex-wrap items-center gap-3">
+                            <span className="min-w-0 flex-1">{mediaError}</span>
+                            {pCloudDebugLogRef.current?.length > 0 && (
+                                <>
+                                    <button type="button" onClick={copyPCloudDebugLog} className="px-2.5 py-1.5 rounded-lg border border-violet-300 bg-white text-violet-700 text-xs font-medium hover:bg-violet-50 shrink-0">複製 pCloud Log</button>
+                                    <button type="button" onClick={() => setShowPCloudBrowser(true)} className="px-2.5 py-1.5 rounded-lg border border-sky-300 bg-white text-sky-700 text-xs font-medium hover:bg-sky-50 shrink-0">開啟 pCloud</button>
+                                </>
+                            )}
                         </div>
                     )}
 
