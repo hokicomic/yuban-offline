@@ -3722,8 +3722,17 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             || isCJKLine(b.charAt(0));
         return a + (noSpace ? "" : " ") + b;
     };
-    const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(String(line || "").trim())
-        || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(String(line || "").trim());
+    // Caption files often put invisible Unicode controls, WebVTT/SRT style
+    // tags, or an opening quotation mark before a continuation.  Test the
+    // spoken first character instead of character zero; otherwise
+    // "technology's" + "<i>adoption..." is incorrectly treated as two
+    // sentences and the later punctuation pass invents a full stop.
+    const cueLeadForContinuation = (line) => String(line || "")
+        .replace(/^\s*[\u200B-\u200D\uFEFF]+/u, "")
+        .replace(/^\s*(?:(?:<[^>]*>)|(?:\{\\[^}]*\})|[“‘"'([\{]+)\s*/u, "")
+        .trim();
+    const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(cueLeadForContinuation(line))
+        || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(cueLeadForContinuation(line));
     // A cue may split immediately before a value which is grammatically the
     // complement of the preceding words, e.g. "generating" + "$370bn in net
     // income".  A currency amount cannot sensibly open an English sentence,
@@ -3734,7 +3743,12 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const previousDemandsContinuation = (line, nextLine = "") => {
         const previous = String(line || "").trim();
         return /(?:[,;:—–-]|[“‘(\[{])$/.test(previous)
-            || (startsWithCurrencyAmount(nextLine) && endsWithValueIntroducingWord(previous));
+            || (startsWithCurrencyAmount(nextLine) && endsWithValueIntroducingWord(previous))
+            // A possessive ending is not a sentence ending.  This protects
+            // common LRC splits such as "the technology's" + "adoption".
+            // Restrict it to a lower-case continuation so a real next
+            // sentence beginning with a proper noun is not swallowed.
+            || (/[\p{L}\p{N}]['’]s$/u.test(previous) && /^[a-zà-öø-ÿ]/.test(cueLeadForContinuation(nextLine)));
     };
     // Keep LRC display punctuation exactly aligned with Bridge Reader.  The
     // grouping above already decides whether a cue is a continuation; every
