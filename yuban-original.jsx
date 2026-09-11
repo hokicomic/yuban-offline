@@ -3724,7 +3724,18 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     };
     const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(String(line || "").trim())
         || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(String(line || "").trim());
-    const previousDemandsContinuation = (line) => /(?:[,;:—–-]|[“‘(\[{])$/.test(String(line || "").trim());
+    // A cue may split immediately before a value which is grammatically the
+    // complement of the preceding words, e.g. "generating" + "$370bn in net
+    // income".  A currency amount cannot sensibly open an English sentence,
+    // so do not turn the preceding cue into a synthetic full stop merely
+    // because the amount starts with a symbol rather than lower-case text.
+    const startsWithCurrencyAmount = (line) => /^\s*[$€£¥]\s*\d/.test(String(line || ""));
+    const endsWithValueIntroducingWord = (line) => /\b(?:generating|reaching|hitting|earning|making|bringing\s+in|raising|cutting|losing|saving|costing|worth|valued|valuing|amounting\s+to|totalling|totaling|numbering)\s*$/i.test(String(line || "").trim());
+    const previousDemandsContinuation = (line, nextLine = "") => {
+        const previous = String(line || "").trim();
+        return /(?:[,;:—–-]|[“‘(\[{])$/.test(previous)
+            || (startsWithCurrencyAmount(nextLine) && endsWithValueIntroducingWord(previous));
+    };
     // Keep LRC display punctuation exactly aligned with Bridge Reader.  The
     // grouping above already decides whether a cue is a continuation; every
     // remaining spoken group is displayed as a sentence when source captions
@@ -3766,7 +3777,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             && !endsCompleteSentence(previous.text)
             && previous.sourceLineCount < maxMergedLines
             && (isAbbreviationEnding(previous.text)
-                || previousDemandsContinuation(previous.text)
+                || previousDemandsContinuation(previous.text, text)
                 || startsClearlyAsContinuation(text));
         if (continuesPrevious) {
             previous.text = joinWithNaturalSpacing(previous.text, text);
