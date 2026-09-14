@@ -37,6 +37,9 @@ const FLASHCARD_MASTERY_AUTOSAVE_DEBOUNCE_MS = 1500;
 const FLASHCARD_MASTERY_FORCE_FLUSH_EVERY = 5;
 const PCLOUD_STORAGE_KEY = "yuban_pcloud_connection_v1";
 const PCLOUD_OAUTH_STATE_KEY = "yuban_pcloud_oauth_state_v1";
+// The pCloud console must contain this exact URL.  Deliberately omit query and
+// fragment values: OAuth providers compare redirect URIs literally.
+const getPCloudRedirectUri = () => `${window.location.origin}${window.location.pathname}`;
 // Flashcard review data is global by normalized front/head + back/explanation.
 // MacBook Chrome can auto-sync flashcard_mastery.json after the user chooses a folder.
 // iPhone/iPad Chrome may not support folder writes, so it falls back to localStorage + JSON import/export.
@@ -102,117 +105,6 @@ const makePCloudRemoteFile = (metadata, connection) => {
         pCloudConnection: connection,
         getStreamUrl: getUrl,
         text: async () => (await fetchBlob()).text(),
-        arrayBuffer: async () => (await fetchBlob()).arrayBuffer()
-    };
-};
-
-// Public links deliberately stay in memory only.  A link code is equivalent to
-// read access for everyone who has it, so it must never be added to the saved
-// private-account connection in localStorage.
-const getPCloudPublicLinkCode = (value) => {
-    const raw = String(value || "").trim();
-    if (!raw) return "";
-    try {
-        const url = new URL(raw);
-        const queryCode = url.searchParams.get("code") || new URLSearchParams(url.hash.replace(/^#/, "")).get("code");
-        if (queryCode) return String(queryCode).trim();
-    } catch (_) { }
-    const match = raw.match(/[?&#]code=([^&#\s]+)/i);
-    return String(match?.[1] || raw).trim();
-};
-
-const getPCloudPublicApiHost = (value) => {
-    try {
-        const hostname = String(new URL(String(value || "")).hostname || "").toLowerCase();
-        // Public links use e.pcloud.link for the European data centre.  Public
-        // link codes are local to that data centre, not globally resolvable.
-        if (hostname === "e.pcloud.link" || hostname.startsWith("e.")) return "eapi.pcloud.com";
-        if (hostname === "api.pcloud.com" || hostname === "eapi.pcloud.com") return hostname;
-    } catch (_) { }
-    return "api.pcloud.com";
-};
-
-const maskPCloudPublicCode = (value) => {
-    const code = String(value || "");
-    if (!code) return "";
-    return code.length <= 10 ? `${code.slice(0, 3)}…(${code.length})` : `${code.slice(0, 6)}…${code.slice(-4)}(${code.length})`;
-};
-
-const pCloudPublicApi = async (method, params = {}, apiHost = "api.pcloud.com") => {
-    const query = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
-    });
-    const host = normalizePCloudApiHost(apiHost);
-    const request = { method, host, code: maskPCloudPublicCode(params?.code), fileid: params?.fileid ?? null };
-    let response;
-    try {
-        response = await fetch(`https://${host}/${method}?${query.toString()}`);
-    } catch (cause) {
-        const error = new Error(`pCloud 公開連結 ${method} 無法連線：${cause?.message || "network error"}`);
-        error.pCloudDebug = { ...request, phase: "fetch", error: String(cause?.message || cause) };
-        throw error;
-    }
-    let result = null;
-    try { result = await response.json(); } catch (_) { }
-    if (!response.ok || Number(result?.result) !== 0) {
-        const error = new Error(result?.error || `pCloud 公開連結 ${method} failed (${response.status}/${result?.result ?? "unknown"})`);
-        error.pCloudDebug = { ...request, phase: "response", httpStatus: response.status, result: result?.result ?? null, error: String(result?.error || "") };
-        throw error;
-    }
-    return result;
-};
-
-const findPCloudPublicFolder = (metadata, folderid) => {
-    if (!metadata || !Number.isFinite(Number(folderid))) return null;
-    if (Number(metadata?.folderid) === Number(folderid)) return metadata;
-    for (const entry of (Array.isArray(metadata?.contents) ? metadata.contents : [])) {
-        const found = findPCloudPublicFolder(entry, folderid);
-        if (found) return found;
-    }
-    return null;
-};
-
-const getPCloudPublicFileUrl = async (code, fileid, apiHost) => {
-    // pCloud returns short-lived content-server URLs only when the user opens a
-    // file.  This follows its intended public-link access pattern.
-    const result = await pCloudPublicApi("getpublinkdownload", { code, fileid }, apiHost);
-    const host = Array.isArray(result?.hosts) ? result.hosts[0] : "";
-    const path = String(result?.path || "");
-    if (!host || !path) throw new Error("pCloud 公開連結未回傳可播放的檔案網址。");
-    return `https://${host}${path}`;
-};
-
-const makePCloudPublicRemoteFile = (metadata, code, apiHost) => {
-    const name = String(metadata?.name || "");
-    const fileid = Number(metadata?.fileid);
-    const contenttype = String(metadata?.contenttype || "");
-    const modified = Date.parse(metadata?.modified || "") || Date.now();
-    const getUrl = () => getPCloudPublicFileUrl(code, fileid, apiHost);
-    const fetchBlob = async () => {
-        const response = await fetch(await getUrl());
-        if (!response.ok) throw new Error(`pCloud 無法取得 ${name} (${response.status})`);
-        return response.blob();
-    };
-    const getText = async () => {
-        // This endpoint streams public text directly and avoids loading a media
-        // object merely to obtain a subtitle/knowledge file.
-        const query = new URLSearchParams({ code: String(code), fileid: String(fileid), toencoding: "utf-8" });
-        const response = await fetch(`https://${normalizePCloudApiHost(apiHost)}/getpubtextfile?${query.toString()}`);
-        if (response.ok) return response.text();
-        return (await fetchBlob()).text();
-    };
-    return {
-        name,
-        size: Number(metadata?.size || 0),
-        type: contenttype,
-        lastModified: modified,
-        isRemotePCloud: true,
-        isPCloudPublic: true,
-        pCloudFileId: fileid,
-        pCloudPublicCode: String(code),
-        getStreamUrl: getUrl,
-        text: getText,
         arrayBuffer: async () => (await fetchBlob()).arrayBuffer()
     };
 };
@@ -7079,10 +6971,6 @@ export default function GeminiPlayer() {
     const [showPCloudBrowser, setShowPCloudBrowser] = useState(false);
     const [pCloudConnection, setPCloudConnection] = useState(() => getPCloudSavedConnection());
     const [pCloudClientId, setPCloudClientId] = useState(() => String(getPCloudSavedConnection()?.clientId || ""));
-    const [pCloudPublicLinkInput, setPCloudPublicLinkInput] = useState("");
-    const [pCloudPublicCode, setPCloudPublicCode] = useState("");
-    const [pCloudPublicApiHost, setPCloudPublicApiHost] = useState("api.pcloud.com");
-    const [pCloudPublicRoot, setPCloudPublicRoot] = useState(null);
     const [pCloudFolder, setPCloudFolder] = useState(null);
     const [pCloudFolderEntries, setPCloudFolderEntries] = useState([]);
     const [pCloudLoading, setPCloudLoading] = useState(false);
@@ -8894,66 +8782,6 @@ export default function GeminiPlayer() {
         }
     };
 
-    const loadPCloudPublicFolder = async (codeInput, folderid = null) => {
-        const code = getPCloudPublicLinkCode(codeInput || pCloudPublicCode);
-        // A child-folder click passes only the saved code, not its original URL.
-        // Keep the region resolved from that URL; otherwise an EU code silently
-        // falls back to the US endpoint and pCloud reports it as invalid.
-        const reusingCurrentPublicLink = Boolean(pCloudPublicCode && code === pCloudPublicCode);
-        const apiHost = reusingCurrentPublicLink ? pCloudPublicApiHost : getPCloudPublicApiHost(codeInput);
-        recordPCloudDebug("public_folder.open.begin", {
-            inputKind: /^https?:\/\//i.test(String(codeInput || "")) ? "url" : "code-or-empty",
-            parsedCode: maskPCloudPublicCode(code),
-            apiHost,
-            folderid: folderid === null ? null : Number(folderid),
-            reusingCurrentPublicLink,
-            cachedRoot: Boolean(pCloudPublicRoot)
-        });
-        if (!code) {
-            setPCloudError("請貼上 pCloud 的公開共享資料夾連結，或直接貼上其中的 code。");
-            recordPCloudDebug("public_folder.open.reject", { reason: "empty_code" });
-            return;
-        }
-        setPCloudLoading(true);
-        setPCloudError("");
-        try {
-            const root = pCloudPublicRoot && code === pCloudPublicCode
-                ? pCloudPublicRoot
-                : (await pCloudPublicApi("showpublink", { code }, apiHost)).metadata;
-            if (!root?.isfolder) throw new Error("這個 pCloud 連結不是資料夾連結。請貼上包含影音、字幕與知識檔的公開資料夾分享連結。");
-            const folder = folderid === null ? root : findPCloudPublicFolder(root, folderid);
-            if (!folder?.isfolder) throw new Error("找不到此公開資料夾的子資料夾內容。");
-            setPCloudPublicCode(code);
-            setPCloudPublicApiHost(apiHost);
-            setPCloudPublicRoot(root);
-            setPCloudFolder({
-                folderid: Number(folder?.folderid ?? 0),
-                name: String(folder?.name || "pCloud 公開資料夾"),
-                parentfolderid: Number(folder?.parentfolderid ?? -1),
-                isPublic: true
-            });
-            setPCloudFolderEntries(Array.isArray(folder?.contents) ? folder.contents : []);
-            recordPCloudDebug("public_folder.open.success", {
-                apiHost,
-                usedCachedRoot: root === pCloudPublicRoot,
-                rootFolderid: Number(root?.folderid ?? -1),
-                folderid: Number(folder?.folderid ?? -1),
-                folderName: String(folder?.name || ""),
-                directEntryCount: Array.isArray(folder?.contents) ? folder.contents.length : 0
-            });
-        } catch (err) {
-            setPCloudError(err?.message || "無法讀取 pCloud 公開共享資料夾。");
-            recordPCloudDebug("public_folder.open.fail", {
-                apiHost,
-                folderid: folderid === null ? null : Number(folderid),
-                error: String(err?.message || err),
-                request: err?.pCloudDebug || null
-            });
-        } finally {
-            setPCloudLoading(false);
-        }
-    };
-
     const beginPCloudLogin = () => {
         const clientId = String(pCloudClientId || "").trim();
         if (!clientId) {
@@ -8965,7 +8793,8 @@ export default function GeminiPlayer() {
             localStorage.setItem(PCLOUD_OAUTH_STATE_KEY, state);
             localStorage.setItem(PCLOUD_STORAGE_KEY, JSON.stringify({ clientId, apiHost: "api.pcloud.com" }));
         } catch (_) { }
-        const redirectUri = window.location.href.split("#")[0];
+        const redirectUri = getPCloudRedirectUri();
+        recordPCloudDebug("oauth.authorize.begin", { redirectUri, clientId: `${clientId.slice(0, 6)}…` });
         const url = new URL("https://my.pcloud.com/oauth2/authorize");
         url.searchParams.set("client_id", clientId);
         url.searchParams.set("response_type", "token");
@@ -8983,20 +8812,15 @@ export default function GeminiPlayer() {
     };
 
     const openPCloudFolderAsLibrary = () => {
-        const isPublic = Boolean(pCloudFolder?.isPublic && pCloudPublicCode);
         const files = pCloudFolderEntries
             .filter((entry) => entry && !entry.isfolder && Number(entry.fileid) > 0)
-            .map((entry) => isPublic
-                ? makePCloudPublicRemoteFile(entry, pCloudPublicCode, pCloudPublicApiHost)
-                : makePCloudRemoteFile(entry, pCloudConnection));
+            .map((entry) => makePCloudRemoteFile(entry, pCloudConnection));
         if (!files.length) {
             setPCloudError("這個資料夾沒有可載入的檔案。請進入包含影音與字幕的資料夾後再開啟。\n");
             return;
         }
-        recordPCloudDebug("public_folder.use_as_library", {
-            isPublic,
-            apiHost: isPublic ? pCloudPublicApiHost : normalizePCloudApiHost(pCloudConnection?.apiHost),
-            code: isPublic ? maskPCloudPublicCode(pCloudPublicCode) : "",
+        recordPCloudDebug("folder.use_as_library", {
+            apiHost: normalizePCloudApiHost(pCloudConnection?.apiHost),
             folderid: Number(pCloudFolder?.folderid ?? -1),
             folderName: String(pCloudFolder?.name || ""),
             files: files.map(file => ({ name: file.name, fileid: file.pCloudFileId, size: file.size, type: file.type })).slice(0, 80)
@@ -9193,13 +9017,7 @@ export default function GeminiPlayer() {
         if (mediaSrc && String(mediaSrc).startsWith("blob:")) URL.revokeObjectURL(mediaSrc);
         try {
             if (track?.mediaFile?.isRemotePCloud) {
-                recordPCloudDebug("media.stream.begin", {
-                    track: String(track?.name || ""),
-                    public: Boolean(track?.mediaFile?.isPCloudPublic),
-                    apiHost: String(track?.mediaFile?.isPCloudPublic ? pCloudPublicApiHost : track?.mediaFile?.pCloudConnection?.apiHost || ""),
-                    code: track?.mediaFile?.isPCloudPublic ? maskPCloudPublicCode(track?.mediaFile?.pCloudPublicCode) : "",
-                    fileid: Number(track?.mediaFile?.pCloudFileId ?? -1)
-                });
+                recordPCloudDebug("media.stream.begin", { track: String(track?.name || ""), apiHost: String(track?.mediaFile?.pCloudConnection?.apiHost || ""), fileid: Number(track?.mediaFile?.pCloudFileId ?? -1) });
             }
             const source = track?.mediaFile?.isRemotePCloud
                 ? await track.mediaFile.getStreamUrl()
@@ -9228,14 +9046,14 @@ export default function GeminiPlayer() {
                 setCurrentIndex(0);
             };
             if (track.subFile.isRemotePCloud && typeof track.subFile.text === "function") {
-                if (track.subFile.isPCloudPublic) recordPCloudDebug("subtitle.fetch.begin", { name: String(track.subFile.name || ""), fileid: Number(track.subFile.pCloudFileId ?? -1), code: maskPCloudPublicCode(track.subFile.pCloudPublicCode) });
+                recordPCloudDebug("subtitle.fetch.begin", { name: String(track.subFile.name || ""), fileid: Number(track.subFile.pCloudFileId ?? -1) });
                 track.subFile.text().then((content) => {
-                    if (track.subFile.isPCloudPublic) recordPCloudDebug("subtitle.fetch.success", { name: String(track.subFile.name || ""), chars: String(content || "").length });
+                    recordPCloudDebug("subtitle.fetch.success", { name: String(track.subFile.name || ""), chars: String(content || "").length });
                     applySubtitleContent(content);
                 }).catch((err) => {
                     setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
                     setMediaError(err?.message || "無法下載 pCloud 字幕。");
-                    if (track.subFile.isPCloudPublic) recordPCloudDebug("subtitle.fetch.fail", { name: String(track.subFile.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
+                    recordPCloudDebug("subtitle.fetch.fail", { name: String(track.subFile.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
                 });
             } else {
                 const reader = new FileReader();
@@ -19186,15 +19004,6 @@ ${userQ}`;
                             {!pCloudFolder ? (
                                 <div className="p-5 space-y-5 overflow-y-auto">
                                     <div className="space-y-3">
-                                        <div className="font-semibold text-sm text-slate-800">公開共享資料夾（不需登入）</div>
-                                        <p className="text-sm text-slate-700">貼上 pCloud 的「分享資料夾」連結即可讀取。連結只留在目前記憶體，不會儲存到語伴或瀏覽器設定。</p>
-                                        <div className="flex flex-col sm:flex-row gap-2">
-                                            <input value={pCloudPublicLinkInput} onChange={(e) => setPCloudPublicLinkInput(e.target.value)} placeholder="https://e.pcloud.link/publink/show?code=..." className="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm" />
-                                            <button type="button" onClick={() => loadPCloudPublicFolder(pCloudPublicLinkInput)} disabled={pCloudLoading} className="px-4 py-2 rounded-lg bg-sky-600 text-white text-sm font-medium hover:bg-sky-700 disabled:opacity-60">開啟共享資料夾</button>
-                                        </div>
-                                        <p className="text-xs text-amber-700">請只使用你願意讓持有連結者讀取的公開資料夾；若連結受密碼、流量或下載上限限制，pCloud 可能拒絕存取。</p>
-                                    </div>
-                                    <div className="border-t border-slate-200 pt-5 space-y-3">
                                         <div className="font-semibold text-sm text-slate-800">私人 pCloud 帳戶（OAuth）</div>
                                         {pCloudConnection?.accessToken ? (
                                             <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -19206,7 +19015,8 @@ ${userQ}`;
                                             <>
                                                 <p className="text-sm text-slate-700">若要瀏覽私人資料夾，請填入你在 pCloud Developers 建立的純前端 App Client ID。語伴不會要求或保存 client secret。</p>
                                                 <input value={pCloudClientId} onChange={(e) => setPCloudClientId(e.target.value)} placeholder="pCloud App Client ID" className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" />
-                                                <p className="text-xs text-slate-500">請把此 GitHub Pages 網址設為 pCloud App 的 Redirect URI。登入 token 只保存在目前 iPad/iPhone/電腦的瀏覽器。</p>
+                                                <p className="text-xs text-slate-500">請在 pCloud App 的 Redirect URI 登記下列完整網址（不可加 query 或 #）：</p>
+                                                <code className="block break-all rounded bg-slate-100 px-2 py-1.5 text-xs text-slate-700">{getPCloudRedirectUri()}</code>
                                                 <button type="button" onClick={beginPCloudLogin} className="px-4 py-2 rounded-lg bg-slate-700 text-white text-sm font-medium hover:bg-slate-800">登入並授權 pCloud</button>
                                             </>
                                         )}
@@ -19215,9 +19025,9 @@ ${userQ}`;
                             ) : (
                                 <>
                                     <div className="px-5 py-3 border-b border-slate-100 flex flex-wrap items-center gap-2 text-xs">
-                                        <span className={pCloudFolder?.isPublic ? "text-sky-700 font-medium" : "text-emerald-700 font-medium"}>{pCloudFolder?.isPublic ? "公開共享資料夾" : `已登入 pCloud${pCloudConnection?.uid ? ` · ${pCloudConnection.uid}` : ""}`}</span>
-                                        {!pCloudFolder?.isPublic && <span className="text-slate-400">{pCloudConnection?.apiHost}</span>}
-                                        <button type="button" onClick={() => pCloudFolder?.isPublic ? loadPCloudPublicFolder(pCloudPublicCode) : loadPCloudFolder(0, "pCloud")} className="ml-auto px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50">{pCloudFolder?.isPublic ? "共享資料夾根目錄" : "根目錄"}</button>
+                                        <span className="text-emerald-700 font-medium">已登入 pCloud{pCloudConnection?.uid ? ` · ${pCloudConnection.uid}` : ""}</span>
+                                        <span className="text-slate-400">{pCloudConnection?.apiHost}</span>
+                                        <button type="button" onClick={() => loadPCloudFolder(0, "pCloud")} className="ml-auto px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50">根目錄</button>
                                         <button type="button" onClick={() => { setPCloudFolder(null); setPCloudFolderEntries([]); setPCloudError(""); }} className="px-2.5 py-1 rounded border border-slate-200 hover:bg-slate-50">換資料夾</button>
                                     </div>
                                     <div className="px-5 py-3 border-b border-slate-100 flex items-center gap-2 min-h-12">
@@ -19228,7 +19038,7 @@ ${userQ}`;
                                     </div>
                                     <div className="overflow-y-auto p-2 min-h-48">
                                         {pCloudFolderEntries.map((entry) => (
-                                            <button key={`${entry?.isfolder ? "d" : "f"}-${entry?.folderid || entry?.fileid}`} type="button" disabled={!entry?.isfolder} onClick={() => entry?.isfolder && (pCloudFolder?.isPublic ? loadPCloudPublicFolder(pCloudPublicCode, entry.folderid) : loadPCloudFolder(entry.folderid, entry.name))} className={`w-full text-left flex items-center gap-3 px-3 py-2 rounded-lg ${entry?.isfolder ? "hover:bg-sky-50" : "cursor-default"}`}>
+                                            <button key={`${entry?.isfolder ? "d" : "f"}-${entry?.folderid || entry?.fileid}`} type="button" disabled={!entry?.isfolder} onClick={() => entry?.isfolder && loadPCloudFolder(entry.folderid, entry.name)} className={`w-full text-left flex items-center gap-3 px-3 py-2 rounded-lg ${entry?.isfolder ? "hover:bg-sky-50" : "cursor-default"}`}>
                                                 {entry?.isfolder ? <FolderOpen size={17} className="text-amber-500 shrink-0" /> : <span className="w-[17px] text-center text-slate-400 shrink-0">{String(entry?.name || "").match(/\.(mp3|m4a|mp4|webm|ogg)$/i) ? "▶" : "▤"}</span>}
                                                 <span className="min-w-0 flex-1 truncate text-sm text-slate-700">{entry?.name}</span>
                                                 {!entry?.isfolder && <span className="text-[11px] text-slate-400 shrink-0">{Math.max(0, Number(entry?.size || 0) / 1024 / 1024).toFixed(1)} MB</span>}
