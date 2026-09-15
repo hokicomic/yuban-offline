@@ -8860,7 +8860,13 @@ export default function GeminiPlayer() {
     useEffect(() => {
         if (typeof window === "undefined" || !window.location.hash) return;
         const params = new URLSearchParams(window.location.hash.slice(1));
-        const accessToken = String(params.get("access_token") || "").trim();
+        // OAuth access tokens are opaque.  URLSearchParams applies HTML form
+        // decoding and turns a literal `+` into a space, corrupting some valid
+        // pCloud tokens.  Read the raw fragment value and percent-decode only.
+        const rawAccessToken = String(window.location.hash.match(/(?:^|[&#])access_token=([^&]*)/i)?.[1] || "");
+        let accessToken = rawAccessToken;
+        try { accessToken = decodeURIComponent(rawAccessToken); } catch (_) { }
+        accessToken = accessToken.trim();
         if (!accessToken) return;
         const receivedState = String(params.get("state") || "");
         const expectedState = String(localStorage.getItem(PCLOUD_OAUTH_STATE_KEY) || "");
