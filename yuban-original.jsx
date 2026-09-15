@@ -65,10 +65,10 @@ const pCloudApi = async (connection, method, params = {}) => {
     Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
     });
-    // pCloud's HTTP/JSON API accepts the OAuth bearer token as `auth`.
-    // Keeping it in the query avoids a browser CORS preflight caused by a
-    // custom Authorization header.
-    query.set("auth", accessToken);
+    // pCloud's OAuth SDK sends OAuth tokens as `access_token`; `auth` is for
+    // ordinary pCloud login-session tokens.  Keep it in the query to avoid a
+    // browser CORS preflight caused by a custom Authorization header.
+    query.set("access_token", accessToken);
     const apiHost = normalizePCloudApiHost(connection?.apiHost);
     const request = { method, apiHost, tokenLength: accessToken.length, parameters: Object.keys(params).sort() };
     let response;
