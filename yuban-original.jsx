@@ -70,10 +70,22 @@ const pCloudApi = async (connection, method, params = {}) => {
     // custom Authorization header.
     query.set("auth", accessToken);
     const apiHost = normalizePCloudApiHost(connection?.apiHost);
-    const response = await fetch(`https://${apiHost}/${method}?${query.toString()}`);
-    if (!response.ok) throw new Error(`pCloud ${method} request failed (${response.status})`);
-    const result = await response.json();
-    if (Number(result?.result) !== 0) throw new Error(result?.error || `pCloud ${method} failed (${result?.result ?? "unknown"})`);
+    const request = { method, apiHost, tokenLength: accessToken.length, parameters: Object.keys(params).sort() };
+    let response;
+    try {
+        response = await fetch(`https://${apiHost}/${method}?${query.toString()}`);
+    } catch (cause) {
+        const error = new Error(`pCloud ${method} 無法連線：${cause?.message || "network error"}`);
+        error.pCloudDebug = { ...request, phase: "fetch", error: String(cause?.message || cause) };
+        throw error;
+    }
+    let result = null;
+    try { result = await response.json(); } catch (_) { }
+    if (!response.ok || Number(result?.result) !== 0) {
+        const error = new Error(result?.error || `pCloud ${method} request failed (${response.status}/${result?.result ?? "unknown"})`);
+        error.pCloudDebug = { ...request, phase: "response", httpStatus: response.status, result: result?.result ?? null, error: String(result?.error || "") };
+        throw error;
+    }
     return result;
 };
 
@@ -8768,6 +8780,11 @@ export default function GeminiPlayer() {
         }
         setPCloudLoading(true);
         setPCloudError("");
+        recordPCloudDebug("folder.open.begin", {
+            folderid: Number(folderid),
+            apiHost: normalizePCloudApiHost(connection?.apiHost),
+            tokenLength: String(connection?.accessToken || "").length
+        });
         try {
             const result = await pCloudApi(connection, "listfolder", { folderid });
             const metadata = result?.metadata || {};
@@ -8777,8 +8794,10 @@ export default function GeminiPlayer() {
                 parentfolderid: Number(metadata?.parentfolderid ?? -1)
             });
             setPCloudFolderEntries(Array.isArray(metadata?.contents) ? metadata.contents : []);
+            recordPCloudDebug("folder.open.success", { folderid: Number(metadata?.folderid ?? folderid), entryCount: Array.isArray(metadata?.contents) ? metadata.contents.length : 0 });
         } catch (err) {
             setPCloudError(err?.message || "無法讀取 pCloud 資料夾。");
+            recordPCloudDebug("folder.open.fail", { folderid: Number(folderid), error: String(err?.message || err), request: err?.pCloudDebug || null });
         } finally {
             setPCloudLoading(false);
         }
