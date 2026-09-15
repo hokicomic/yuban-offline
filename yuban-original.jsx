@@ -65,10 +65,12 @@ const pCloudApi = async (connection, method, params = {}) => {
     Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
     });
+    // pCloud's HTTP/JSON API accepts the OAuth bearer token as `auth`.
+    // Keeping it in the query avoids a browser CORS preflight caused by a
+    // custom Authorization header.
+    query.set("auth", accessToken);
     const apiHost = normalizePCloudApiHost(connection?.apiHost);
-    const response = await fetch(`https://${apiHost}/${method}?${query.toString()}`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const response = await fetch(`https://${apiHost}/${method}?${query.toString()}`);
     if (!response.ok) throw new Error(`pCloud ${method} request failed (${response.status})`);
     const result = await response.json();
     if (Number(result?.result) !== 0) throw new Error(result?.error || `pCloud ${method} failed (${result?.result ?? "unknown"})`);
