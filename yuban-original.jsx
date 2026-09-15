@@ -70,10 +70,22 @@ const pCloudApi = async (connection, method, params = {}) => {
     // browser CORS preflight caused by a custom Authorization header.
     query.set("access_token", accessToken);
     const apiHost = normalizePCloudApiHost(connection?.apiHost);
-    const request = { method, apiHost, tokenLength: accessToken.length, parameters: Object.keys(params).sort() };
+    // pCloud blocks getfilelink when a third-party web page is sent as Referer.
+    // Do not disclose the GitHub Pages URL for the short-lived content-link request.
+    const suppressReferer = method === "getfilelink";
+    const request = {
+        method,
+        apiHost,
+        tokenLength: accessToken.length,
+        parameters: Object.keys(params).sort(),
+        ...(suppressReferer ? { referrerPolicy: "no-referrer" } : {}),
+    };
     let response;
     try {
-        response = await fetch(`https://${apiHost}/${method}?${query.toString()}`);
+        response = await fetch(
+            `https://${apiHost}/${method}?${query.toString()}`,
+            suppressReferer ? { referrerPolicy: "no-referrer" } : undefined,
+        );
     } catch (cause) {
         const error = new Error(`pCloud ${method} 無法連線：${cause?.message || "network error"}`);
         error.pCloudDebug = { ...request, phase: "fetch", error: String(cause?.message || cause) };
