@@ -5937,6 +5937,57 @@ const isKnowledgeSentenceSandwichedNearMatch = (sentence = "", subtitleText = ""
     });
 };
 
+// Return source-character ranges for a verbatim spoken cue.  Exact here means
+// the same ordered words, not identical punctuation: ebook conversions often
+// change `drinks-makers` into `drinksmakers` (or the reverse).
+const findKnowledgeExactSubtitleRanges = (text, subtitleText) => {
+    const source = String(text || "");
+    const tokenRe = /[\p{L}\p{N}]+/gu;
+    const sourceTokens = Array.from(source.matchAll(tokenRe)).map(match => ({
+        start: Number(match.index || 0),
+        end: Number(match.index || 0) + String(match[0] || "").length,
+        value: normalizeKnowledgeAlignmentText(match[0])
+    })).filter(token => token.value);
+    if (sourceTokens.length < 2) return [];
+    const ranges = [];
+    for (const subtitlePart of splitKnowledgeLineIntoSentences(subtitleText)) {
+        const targetWords = normalizeKnowledgeAlignmentText(subtitlePart).match(/[\p{L}\p{N}]+/gu) || [];
+        if (targetWords.length < 2) continue;
+        for (let startToken = 0; startToken < sourceTokens.length; startToken += 1) {
+            let sourceIndex = startToken;
+            let targetIndex = 0;
+            while (sourceIndex < sourceTokens.length && targetIndex < targetWords.length) {
+                const sourceWord = sourceTokens[sourceIndex].value;
+                const targetWord = targetWords[targetIndex];
+                if (areKnowledgeAlignmentWordsEquivalent(sourceWord, targetWord)) {
+                    sourceIndex += 1;
+                    targetIndex += 1;
+                } else if (targetWords[targetIndex + 1] &&
+                    areKnowledgeAlignmentWordsEquivalent(sourceWord, `${targetWord}${targetWords[targetIndex + 1]}`)) {
+                    sourceIndex += 1;
+                    targetIndex += 2;
+                } else if (sourceTokens[sourceIndex + 1] &&
+                    areKnowledgeAlignmentWordsEquivalent(`${sourceWord}${sourceTokens[sourceIndex + 1].value}`, targetWord)) {
+                    sourceIndex += 2;
+                    targetIndex += 1;
+                } else {
+                    break;
+                }
+            }
+            if (targetIndex !== targetWords.length) continue;
+            const first = sourceTokens[startToken];
+            const last = sourceTokens[sourceIndex - 1];
+            let end = last.end;
+            const punctuation = source.slice(end).match(/^[\s]*[,.!?;:。！？]+(?:[”’"')\]\}]*)?/u);
+            if (punctuation) end += punctuation[0].length;
+            ranges.push({ start: first.start, end });
+            break;
+        }
+    }
+    return ranges.sort((a, b) => a.start - b.start)
+        .filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
+};
+
 // 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
 // 避免遠處的模糊候選把播放游標推得過後，導致後面的真實句子被防回跳機制排除。
 const selectKnowledgeSubtitleMatchCluster = (matches = [], expectedSourceLine = -1) => {
@@ -6457,49 +6508,12 @@ const MarkdownView = ({
         return nodes.length > 0 ? nodes : source;
     };
 
-    const findExactSubtitleRangesInKnowledgeLine = (text, subtitleText) => {
-        const source = String(text || "");
-        // Match the same word units as normalizeKnowledgeAlignmentText:
-        // apostrophes and hyphens separate units there (Dursley's -> dursley s).
-        const tokenRe = /[\p{L}\p{N}]+/gu;
-        const sourceTokens = Array.from(source.matchAll(tokenRe)).map(match => ({
-            start: Number(match.index || 0),
-            end: Number(match.index || 0) + String(match[0] || "").length,
-            value: normalizeKnowledgeAlignmentText(match[0])
-        })).filter(token => token.value);
-        if (sourceTokens.length < 2) return [];
-        const ranges = [];
-        for (const subtitlePart of splitKnowledgeLineIntoSentences(subtitleText)) {
-            const targetWords = normalizeKnowledgeAlignmentText(subtitlePart).match(/[\p{L}\p{N}]+/gu) || [];
-            // A one-word cue is too ambiguous inside a long ebook paragraph.
-            if (targetWords.length < 2) continue;
-            for (let startToken = 0; startToken <= sourceTokens.length - targetWords.length; startToken += 1) {
-                let same = true;
-                for (let wordIndex = 0; wordIndex < targetWords.length; wordIndex += 1) {
-                    if (sourceTokens[startToken + wordIndex].value !== targetWords[wordIndex]) {
-                        same = false;
-                        break;
-                    }
-                }
-                if (!same) continue;
-                const first = sourceTokens[startToken];
-                const last = sourceTokens[startToken + targetWords.length - 1];
-                let end = last.end;
-                const punctuation = source.slice(end).match(/^[\s]*[,.!?;:。！？]+(?:[”’"')\]\}]*)?/u);
-                if (punctuation) end += punctuation[0].length;
-                ranges.push({ start: first.start, end });
-                break;
-            }
-        }
-        return ranges.sort((a, b) => a.start - b.start).filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
-    };
-
     const buildSentenceHighlightedKnowledgeNodes = (text, subtitleText, keyPrefix = "mdk-active") => {
         const source = String(text || "");
         // LRC often ends a cue at a semicolon/comma even though the ebook keeps
         // the surrounding prose as one grammatical sentence. Prefer an exact
         // word-range so only the spoken cue is marked (including Mr./Ms.).
-        const highlightRanges = findExactSubtitleRangesInKnowledgeLine(source, subtitleText);
+        const highlightRanges = findKnowledgeExactSubtitleRanges(source, subtitleText);
         // An active multi-sentence subtitle may contain both verbatim text and
         // a small transcription difference (for example `not too weak` vs
         // ebook `not to weak`). The old early return after one exact hit meant
@@ -16932,11 +16946,15 @@ ${userQ}`;
                 anchorEvent = "untrusted_opening_match";
             }
         }
-        // A provisional opening match is diagnostic data only.  It must never
-        // drive MarkdownView's active-line rendering or automatic scroll: a
-        // title/credits cue can be a convincing but unrelated match.
+        // A provisional exact match may be rendered immediately, but it does
+        // not establish the reading cursor or trigger an automatic scroll.
+        // This prevents the first several correct lines from appearing plain
+        // while still requiring sequential confirmation before navigation.
         const hasConfirmedAnchor = progress.anchorState === "anchored";
-        const visibleMatches = hasConfirmedAnchor ? matches : [];
+        const provisionalExactMatch = !hasConfirmedAnchor && bestMatch && Number(bestMatch.score || 0) >= 0.98
+            ? [bestMatch]
+            : [];
+        const visibleMatches = hasConfirmedAnchor ? matches : provisionalExactMatch;
         embeddedKnowledgeMatchCandidatesRef.current = visibleMatches.length > 0
             ? []
             : (diagnostics.nearLines || []).map(item => ({
@@ -17008,7 +17026,7 @@ ${userQ}`;
         setTimeout(() => setEmbeddedKnowledgeAlignmentLogNotice(""), 5000);
     }, []);
     useEffect(() => {
-        if (topPanelMode !== 'document' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
+        if (topPanelMode !== 'document' || embeddedKnowledgePlaybackProgressRef.current.anchorState !== 'anchored' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
         const timer = setTimeout(() => {
             const container = embeddedKnowledgeContentRef.current;
             const firstLine = embeddedKnowledgeSubtitleMatches[0]?.sourceLine;

@@ -6,6 +6,12 @@ import vm from 'node:vm';
 const source = readFileSync(new URL('../yuban-original.jsx', import.meta.url), 'utf8');
 const helpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
 const generate = vm.runInNewContext(helpers + '\n generateSmartSubtitles');
+const alignmentHelpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
+const alignmentPrefix = `
+const KNOWLEDGE_ORIGINAL_MARKER_RE = /^(\\[\\s*原文\\s*\\]|\\[\\s*original\\s*\\]|原文\\s*[:：]?|original\\s*[:：]?)/i;
+const isAbbreviation = (text) => /(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Vs|etc|e\\.g|i\\.e|No|Fig|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\.$/i.test(text) || /(?:^|\\s)[a-zA-Z]\\.$/.test(text) || /(?:[a-zA-Z]\\.){2,}$/.test(text);
+`;
+const alignment = vm.runInNewContext(alignmentPrefix + alignmentHelpers + '\n ({ findKnowledgeExactSubtitleRanges, findKnowledgeSubtitleMatches })');
 const cue = (start, end, text) => ({ start, end, text });
 const split = (cues, mode = 'covered', overlap = 0, cap = 8) =>
     generate(cues, overlap, 3, cap, 'en-US', mode);
@@ -65,4 +71,14 @@ test('abbreviations remain intact, and curly quotes and CJK sentence marks split
     assert.equal(result.length, 2);
     assert.equal(result[0].text, 'Dr. Smith said “Hello.”');
     assert.equal(split([cue(0, 4, '你好。再見。')]).length, 2);
+});
+
+test('knowledge highlighting accepts ebook hyphenation differences', () => {
+    const book = 'Some consumers defied convention, but drinksmakers themselves stuck to their terroir. No more.';
+    const lrc = 'Some consumers defied convention, but drinks-makers themselves stuck to their terroir. No more.';
+    assert.equal(JSON.stringify(alignment.findKnowledgeSubtitleMatches(`[原文]\n${book}`, lrc)), JSON.stringify([{ sourceLine: 1, score: 1 }]));
+    assert.equal(JSON.stringify(alignment.findKnowledgeExactSubtitleRanges(book, lrc)), JSON.stringify([
+        { start: 0, end: 85 },
+        { start: 86, end: 94 }
+    ]));
 });
