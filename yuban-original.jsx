@@ -3602,7 +3602,7 @@ const estimateSubtitleTailPadding = (text, durationSec) => {
 
 const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.0, maxMergeCount = 3, trackLanguage = "en-US", timingMode = "covered") => {
     if (!rawSubtitles || rawSubtitles.length === 0) return [];
-    const punctuationRegex = /([.?!。！？]["']?)(?=\s|$)/g;
+    const punctuationRegex = /([.?!][”’"'）)\]]*)(?=\s|$)|([。！？][”’"'）)\]]*)/g;
     const sentenceEndRegex = /[.?!。！？]["']?\s*$/;
     const isCJKLine = (text) => /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(String(text || ""));
     const stripLeadingListMarker = (text) => String(text || "")
@@ -3668,35 +3668,11 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             // sentence beginning with a proper noun is not swallowed.
             || (/[\p{L}\p{N}]['’]s$/u.test(previous) && /^[a-zà-öø-ÿ]/.test(cueLeadForContinuation(nextLine)));
     };
-    // Keep LRC display punctuation exactly aligned with Bridge Reader.  The
-    // grouping above already decides whether a cue is a continuation; every
-    // remaining spoken group is displayed as a sentence when source captions
-    // omitted punctuation.
-    const appendTerminalPunctuation = (line, punctuation) => {
-        const value = String(line || "").trim();
-        if (!value || endsCompleteSentence(value)) return value;
-        const closingMatch = value.match(/([”’"')\]\}]+)$/);
-        const closing = closingMatch ? closingMatch[1] : "";
-        const body = closing ? value.slice(0, -closing.length).trimEnd() : value;
-        return `${body}${punctuation}${closing}`;
-    };
-    const addReaderStyleLrcPunctuation = (line) => {
-        const value = String(line || "").trim();
-        if (!value || endsCompleteSentence(value)) return value;
-        if (/^you$/i.test(value)) return appendTerminalPunctuation(value, "…");
-        if (/^(?:oh|wow|hey|look(?:\s|$)|come on(?:\s|$)|give it up(?:\s|$)|thank you(?:\s|$)|please(?:\s|$)|congratulations(?:\s|$))/i.test(value)) {
-            return appendTerminalPunctuation(value, "!");
-        }
-        return appendTerminalPunctuation(value, ".");
-    };
     // An LRC line start is an actual timing observation. Punctuation inside a
     // line is not. Keep a bounded number of original cues together only when
     // they are clearly a continuation; the limit is exposed as Max Merge Lines.
     const useCueMergedTiming = timingMode === "cue-merged";
-    // The explicitly named Reader-style mode must not silently split a long
-    // chain of lower-case continuation cues.  The adjustable cap remains for
-    // estimated, sentence-learning timing only.
-    const maxMergedLines = useCueMergedTiming ? Number.POSITIVE_INFINITY : Math.max(1, Math.round(Number(maxMergeCount) || 1));
+    const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
 
     const logicalSubtitles = [];
     for (const rawSub of rawSubtitles) {
@@ -3708,6 +3684,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             && !isStandaloneHeadingCue(previous.text)
             && !endsCompleteSentence(previous.text)
             && previous.sourceLineCount < maxMergedLines
+            && Number(rawSub.start) - Number(previous.end) <= 0.8
             && (isAbbreviationEnding(previous.text)
                 || previousDemandsContinuation(previous.text, text)
                 || startsClearlyAsContinuation(text));
@@ -3720,15 +3697,8 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         }
     }
 
-    // Apply the same post-group punctuation policy as Reader.  These marks do
-    // not alter cue timestamps; they simply make continuous playback readable
-    // and prevent several stand-alone lines from becoming one unpunctuated UI
-    // sentence in the covered timing mode.
-    for (const subtitle of logicalSubtitles) {
-        if (!isStandaloneHeadingCue(subtitle?.text)) {
-            subtitle.text = addReaderStyleLrcPunctuation(subtitle?.text);
-        }
-    }
+    // Timing boundaries and capitalization do not prove grammatical completion.
+    // Preserve source punctuation, including incomplete fragments.
 
     // Timestamp-only mode uses the same reconstruction rules as Bridge
     // Reader: first join the LRC cues that demonstrably form one text unit,
@@ -3750,10 +3720,8 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const maxUnpunctuatedUnits = 58;
 
     const sentences = [];
-    // A punctuation split within one LRC cue has no real timestamp. Estimate
-    // its centre, then widen it rather than trimming it. This deliberately
-    // favours replaying a little neighbouring speech over losing displayed
-    // sentence's first or last words.
+    // Internal punctuation has no observed timestamp. Only an explicitly
+    // selected, bounded overlap may widen that estimate; zero means zero.
     const pushCoveredSentence = (sentence, options = {}) => {
         const sourceStart = Number.isFinite(Number(options.sourceStart)) ? Number(options.sourceStart) : Number(sentence.start || 0);
         const sourceEnd = Number.isFinite(Number(options.sourceEnd)) ? Number(options.sourceEnd) : Number(sentence.end || sourceStart);
@@ -3765,24 +3733,9 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         const sourceDuration = sourceEnd - sourceStart;
         // `timeBuffer` used to cut time off the first sentence. It now means
         // safety overlap around uncertain internal boundaries.
-        const overlap = Math.min(1.4, Math.max(0.12, Number(bufferTime) || 0, sourceDuration * 0.12));
-        let start = exactStart ? nominalStart : Math.max(sourceStart, nominalStart - overlap);
-        let end = exactEnd ? nominalEnd : Math.min(sourceEnd, nominalEnd + overlap);
-        // Retain short grammatical sentences in the UI, but give shadowing a
-        // usable audio window by expanding inside known cue bounds only.
-        const targetDuration = Math.min(Math.max(0, Number(minDuration) || 0), sourceDuration);
-        if (targetDuration > 0 && end - start < targetDuration) {
-            const deficit = targetDuration - (end - start);
-            const growBefore = Math.min(start - sourceStart, deficit / 2);
-            const growAfter = Math.min(sourceEnd - end, deficit - growBefore);
-            start -= growBefore;
-            end += growAfter;
-            if (end - start < targetDuration) {
-                const remaining = targetDuration - (end - start);
-                start = Math.max(sourceStart, start - remaining);
-                end = Math.min(sourceEnd, end + Math.max(0, targetDuration - (end - start)));
-            }
-        }
+        const overlap = Math.min(0.35, Math.max(0, Number(bufferTime) || 0), sourceDuration * 0.1);
+        const start = exactStart ? nominalStart : Math.max(sourceStart, nominalStart - overlap);
+        const end = exactEnd ? nominalEnd : Math.min(sourceEnd, nominalEnd + overlap);
         sentences.push({ start, end: Math.max(start + 0.01, end), text: String(sentence.text || "").trim() });
     };
     // When a sentence ends exactly at an original segment boundary, the next sentence MUST start at the next segment's start.
@@ -3796,7 +3749,9 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         startIsExact: true
     };
 
-    logicalSubtitles.forEach((sub, index) => {
+    // Estimate only inside the original cue that contains the punctuation.
+    // Merging first would discard observed timestamps and redistribute pauses.
+    rawSubtitles.forEach((sub, index) => {
         let text = sub.text.trim();
         if (!text) return;
         const punctCheckText = stripLeadingListMarker(text) || text;
@@ -3834,11 +3789,11 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         let lastIndex = 0;
 
         while ((match = regex.exec(text)) !== null) {
-            const punct = match[1];
+            const punct = match[0];
             const endIdx = match.index + punct.length;
 
             const textToCheck = text.substring(lastIndex, endIdx).trim();
-            if (isAbbreviation(textToCheck)) {
+            if (isAbbreviation(textToCheck.replace(/[”’"'）)\]]+$/, ""))) {
                 continue;
             }
 
@@ -3859,9 +3814,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             // Requirement #1: if the sentence ends exactly at the original segment end, use sub.end exactly
             const estimatedEnd = (splitPos >= lineLength) ? sub.end : (sub.start + (lineDuration * ratio));
 
-            // Preserve a short sentence as text. The coverage helper expands
-            // only its audio range; it never merges the words into the next
-            // grammatical sentence.
+            // Short sentences retain their own interval, without minimum-duration expansion.
             if (splitPos >= lineLength) {
                 currentSentence.end = sub.end;
                 pushCoveredSentence(currentSentence, {
@@ -3921,7 +3874,8 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         const currentDuration = currentSentence.start === null ? 0 : (currentSentence.end - currentSentence.start);
         if (currentSentence.text
             && !sentenceEndRegex.test(currentSentence.text)
-            && (currentDuration >= maxUnpunctuatedDuration
+            && (Number(rawSubtitles[index + 1]?.start) - Number(sub.end) > 0.8
+                || currentDuration >= maxUnpunctuatedDuration
                 || countTimelineUnits(currentSentence.text) >= maxUnpunctuatedUnits)) {
             pushCoveredSentence(currentSentence, {
                 sourceStart: currentSentence.sourceStart,
@@ -6971,14 +6925,13 @@ export default function GeminiPlayer() {
     const [playbackRate, setPlaybackRate] = useState(1.0);
 
     // [NEW] Customizable Timing
-    const [timePadding, setTimePadding] = useState(0.2);
-    const [timeBuffer, setTimeBuffer] = useState(0.2);
+    const [timePadding, setTimePadding] = useState(0);
+    const [timeBuffer, setTimeBuffer] = useState(0);
     const [minDuration, setMinDuration] = useState(3.0);
-    // Eight preserves ordinary multi-cue news paragraphs in timestamp-only
-    // mode; users can lower it when they prefer shorter shadowing turns.
+    // Reader groups stop at this cap without inventing terminal punctuation.
     const [maxMergeCount, setMaxMergeCount] = useState(8);
-    // "covered" estimates punctuation inside an LRC cue with protective
-    // overlap; "cue-merged" only uses original LRC timestamp boundaries.
+    // "covered" estimates inside each original cue, with optional overlap;
+    // "cue-merged" only uses original timestamp boundaries.
     const [smartTimingMode, setSmartTimingMode] = useState("covered");
 
     // [NEW] Subtitle Font Size (Independent of Modal)
@@ -7871,39 +7824,31 @@ export default function GeminiPlayer() {
 
     const getBufferedRange = (sub) => {
         if (!sub) return { start: 0, end: 0 };
-        // IMPORTANT: iOS/WebKit MP3 seeking is often imprecise.
-        // Removing start padding avoids accidentally including the previous sentence tail.
-        const pad = timePadding;
+        const pad = Math.max(0, Number(timePadding) || 0);
         const baseEnd = Number(sub.end || 0);
         const subDuration = Math.max(0, baseEnd - Number(sub.start || 0));
-        const desiredTailPad = estimateSubtitleTailPadding(sub.text || "", subDuration);
+        const desiredTailPad = isSmartMode ? 0 : estimateSubtitleTailPadding(sub.text || "", subDuration);
         const list = Array.isArray(subtitlesRef.current) ? subtitlesRef.current : [];
         const idx = list.findIndex((item) => (
             item === sub ||
-            String(item?.id || "") === String(sub?.id || "") ||
+            (sub.id != null && item?.id === sub.id) ||
             (Math.abs(Number(item?.start || 0) - Number(sub?.start || 0)) < 0.005 &&
                 Math.abs(Number(item?.end || 0) - baseEnd) < 0.005)
         ));
         const nextSub = idx >= 0 ? list[idx + 1] : null;
+        const previousSub = idx > 0 ? list[idx - 1] : null;
         let allowedTailPad = desiredTailPad;
         if (nextSub && Number.isFinite(Number(nextSub.start))) {
             const gapToNext = Number(nextSub.start || 0) - baseEnd;
             if (gapToNext > 0.05) {
                 allowedTailPad = Math.min(desiredTailPad, Math.max(0, gapToNext - 0.03));
             } else {
-                const overlapCap = subDuration <= 1.4
-                    ? 0.28
-                    : subDuration <= 2.4
-                        ? 0.20
-                        : subDuration <= 4.0
-                            ? 0.14
-                            : 0.08;
-                allowedTailPad = Math.min(desiredTailPad, overlapCap);
+                allowedTailPad = 0;
             }
         }
         const durationCap = Number(duration || 0) > 0 ? Number(duration) : Number.POSITIVE_INFINITY;
         return {
-            start: Math.max(0, sub.start - pad),
+            start: Math.max(0, sub.start - pad, Math.min(Number(sub.start), Number(previousSub?.end) || 0)),
             end: Math.min(durationCap, baseEnd + Math.max(0, allowedTailPad))
         };
     };
@@ -18973,13 +18918,13 @@ ${userQ}`;
                                 onChange={(e) => setSmartTimingMode(e.target.value === "cue-merged" ? "cue-merged" : "covered")}
                                 className="w-full border border-gray-300 rounded p-2 text-xs"
                             >
-                                <option value="covered">Coverage-first estimate (recommended)</option>
+                                <option value="covered">Coverage-first (cue-local estimate)</option>
                                 <option value="cue-merged">Reader-style LRC sentence groups (no internal estimate)</option>
                             </select>
                             <p className="mt-1 text-[10px] leading-relaxed text-gray-500">
                                 {smartTimingMode === "cue-merged"
-                                    ? "The same continuation/abbreviation rules as Reader first rebuild each text group. The group then uses its first LRC cue start and last LRC cue end; punctuation inside is never assigned a guessed time."
-                                    : "Punctuation inside a cue is estimated, then widened to avoid clipping the sentence's first or last words."}
+                                    ? "保留原始字幕時間，只合併明顯延續的片段；不補句點。原始 LRC 時間若有偏差，此模式無法自動校正。"
+                                    : "保留每條原始時間點，僅在同一條字幕內估算句界；不補句點、不強制拉長短句。精確句界仍需音訊逐字對齊。"}
                             </p>
                         </div>
                         <div className="mb-3">
@@ -18993,15 +18938,15 @@ ${userQ}`;
                             <>
                                 <div className="mb-3">
                                     <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                        <span>Internal Split Safety Overlap</span>
+                                        <span>內部估算邊界重疊（0 = 不多播鄰句）</span>
                                         <span>{timeBuffer.toFixed(2)}s</span>
                                     </div>
-                                    <input type="range" min="0" max="2.0" step="0.1" value={timeBuffer} onChange={(e) => setTimeBuffer(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
+                                    <input type="range" min="0" max="0.35" step="0.05" value={timeBuffer} onChange={(e) => setTimeBuffer(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
                                 </div>
                                 <div className="mb-3">
                                     <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                        <span>Min Segment Duration</span>
-                                        <span>{minDuration.toFixed(1)}s</span>
+                                        <span>無標點片段分組上限（不補句點）</span>
+                                        <span>{Math.max(12, minDuration * 4).toFixed(1)}s</span>
                                     </div>
                                     <input type="range" min="0.5" max="10.0" step="0.5" value={minDuration} onChange={(e) => setMinDuration(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
                                 </div>
@@ -19009,7 +18954,7 @@ ${userQ}`;
                         )}
                         <div className="mb-3">
                             <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                <span>Max Merge Lines</span>
+                                <span>Reader-style 最多合併行數</span>
                                 <span>{maxMergeCount}</span>
                             </div>
                             <input
