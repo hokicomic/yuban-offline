@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.172 · follow-sync";
+const APP_VERSION = "v5.173 · multi-link-sync";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20260305.6";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6657,6 +6657,8 @@ const MarkdownView = ({
         if (activeLines.length === 0) return;
         const activeLineSet = new Set(activeLines);
         const activeSegments = segments.filter((segment) => activeLineSet.has(segment?.sourceLine));
+        const linkedGroups = [];
+        const seenLinkTerms = new Set();
         for (const segment of activeSegments) {
             const source = stripTargetTagsForDisplay(String(segment?.content || ""))
                 .replace(/\{\{(.*?)\}\}/g, '$1')
@@ -6672,37 +6674,57 @@ const MarkdownView = ({
                 : splitKnowledgeLineIntoSentences(source).filter((sentence) => isKnowledgeSentenceCoveredBySubtitle(sentence, activeKnowledgeSubtitleText));
             for (const fragment of highlightedFragments) {
                 for (let pos = 0; pos < fragment.length; pos += 1) {
-                const matches = [];
-                for (const entry of knowledgeTermEntries) {
-                    const matchLen = getKnowledgeTermMatchLengthAt(fragment, pos, entry);
-                    if (matchLen <= 0) continue;
-                    const entryIsMultiPart = isMultiPartKnowledgeTerm(entry?.term || "");
-                    const visibleItems = (Array.isArray(entry?.items) ? entry.items : [])
-                        .filter((item) => entryIsMultiPart || String(item?.category || "").trim() !== "usage" || !matchedMultiUsageItemKeysForPreview.has(getKnowledgePopupItemKey(item)));
-                    if (visibleItems.length > 0) matches.push({ entry: { ...entry, items: visibleItems }, matchLen });
-                }
-                if (matches.length === 0) continue;
-                matches.sort((a, b) => Number(b.matchLen || 0) - Number(a.matchLen || 0) || String(b.entry?.term || "").length - String(a.entry?.term || "").length);
-                const longest = matches[0];
-                const itemSeen = new Set();
-                const items = [];
-                for (const match of matches) {
-                    for (const item of match.entry?.items || []) {
-                        const key = getKnowledgePopupItemKey(item);
-                        if (!key || itemSeen.has(key)) continue;
-                        itemSeen.add(key);
-                        items.push(item);
+                    const matches = [];
+                    for (const entry of knowledgeTermEntries) {
+                        const matchLen = getKnowledgeTermMatchLengthAt(fragment, pos, entry);
+                        if (matchLen <= 0) continue;
+                        const entryIsMultiPart = isMultiPartKnowledgeTerm(entry?.term || "");
+                        const visibleItems = (Array.isArray(entry?.items) ? entry.items : [])
+                            .filter((item) => entryIsMultiPart || String(item?.category || "").trim() !== "usage" || !matchedMultiUsageItemKeysForPreview.has(getKnowledgePopupItemKey(item)));
+                        if (visibleItems.length > 0) matches.push({ entry: { ...entry, items: visibleItems }, matchLen });
                     }
-                }
-                if (items.length > 0) {
-                    onActiveKnowledgeTermsChange({
-                        term: cleanQuizDisplayText(fragment.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || ""),
-                        items
-                    });
-                    return;
-                }
+                    if (matches.length === 0) continue;
+                    matches.sort((a, b) => Number(b.matchLen || 0) - Number(a.matchLen || 0) || String(b.entry?.term || "").length - String(a.entry?.term || "").length);
+                    const longest = matches[0];
+                    const term = cleanQuizDisplayText(fragment.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || "");
+                    const termKey = term.toLowerCase();
+                    if (!term || seenLinkTerms.has(termKey)) continue;
+                    const itemSeen = new Set();
+                    const items = [];
+                    for (const match of matches) {
+                        for (const item of match.entry?.items || []) {
+                            const key = getKnowledgePopupItemKey(item);
+                            if (!key || itemSeen.has(key)) continue;
+                            itemSeen.add(key);
+                            items.push(item);
+                        }
+                    }
+                    if (items.length > 0) {
+                        seenLinkTerms.add(termKey);
+                        linkedGroups.push({ term, items });
+                    }
+                    // The next character cannot begin another link inside this
+                    // one; skip it so a multi-word link is listed once only.
+                    pos += Math.max(0, Number(longest.matchLen || 1) - 1);
                 }
             }
+        }
+        if (linkedGroups.length > 0) {
+            const itemSeen = new Set();
+            const items = [];
+            for (const group of linkedGroups) {
+                for (const item of group.items) {
+                    const key = getKnowledgePopupItemKey(item);
+                    if (!key || itemSeen.has(key)) continue;
+                    itemSeen.add(key);
+                    items.push(item);
+                }
+            }
+            onActiveKnowledgeTermsChange({
+                term: linkedGroups.length === 1 ? linkedGroups[0].term : `本句知識點：${linkedGroups.map((group) => group.term).join(" · ")}`,
+                items,
+                groups: linkedGroups
+            });
         }
     }, [activeKnowledgeSourceLines, activeKnowledgeSubtitleText, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
 
@@ -7297,6 +7319,10 @@ export default function GeminiPlayer() {
     const manualKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeContentRef = useRef(null);
+    // A learner may choose a different link inside the current highlighted
+    // sentence.  Keep that explicit choice until playback advances to another
+    // LRC cue; automatic sync must never immediately overwrite it.
+    const knowledgePreviewManualOverrideRef = useRef({ documentKey: "", subtitleIndex: -1 });
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
     // Multiple reference TXT files are common for long audiobooks.  Keep the
@@ -17452,6 +17478,10 @@ ${userQ}`;
             if (items.length >= 12) break;
         }
         if (!term || items.length === 0) return;
+        knowledgePreviewManualOverrideRef.current = {
+            documentKey: embeddedKnowledgeDocumentKey,
+            subtitleIndex: currentIndex
+        };
         const nextPos = !knowledgePreviewTermPopup
             ? getKnowledgePreviewPopupDefaultPos()
             : {
@@ -17460,12 +17490,14 @@ ${userQ}`;
             };
         setKnowledgePreviewPopupPos(clampKnowledgePreviewPopupPos(nextPos.x, nextPos.y));
         setKnowledgePreviewTermPopup({ term, items });
-    }, [clampKnowledgePreviewPopupPos, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
+    }, [clampKnowledgePreviewPopupPos, currentIndex, embeddedKnowledgeDocumentKey, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
     const syncOpenKnowledgePreviewToActiveTerm = useCallback((payload) => {
         // Do not create a popup during playback.  This only keeps a preview
         // that the learner has explicitly opened in sync with the highlighted
         // source sentence, whether it is floating or docked on the right.
         if (!knowledgePreviewTermPopup) return;
+        const manualOverride = knowledgePreviewManualOverrideRef.current || {};
+        if (manualOverride.documentKey === embeddedKnowledgeDocumentKey && manualOverride.subtitleIndex === currentIndex) return;
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const items = Array.isArray(payload?.items) ? payload.items : [];
         if (!term || items.length === 0) return;
@@ -17473,7 +17505,7 @@ ${userQ}`;
         const nextKey = `${term}::${items.map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
         if (currentKey === nextKey) return;
         setKnowledgePreviewTermPopup({ term, items });
-    }, [knowledgePreviewTermPopup]);
+    }, [currentIndex, embeddedKnowledgeDocumentKey, knowledgePreviewTermPopup]);
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
         
