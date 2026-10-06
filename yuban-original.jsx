@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.171 (Better Heuristic Examples)";
+const APP_VERSION = "v5.172 · follow-sync";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20260305.6";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6544,7 +6544,7 @@ const MarkdownView = ({
             let cursor = 0;
             ranges.forEach((range, index) => {
                 if (range.start > cursor) nodes.push(<React.Fragment key={`${keyPrefix}-before-${index}`}>{buildKnowledgeLinkedNodes(source.slice(cursor, range.start), `${keyPrefix}-before-${index}`)}</React.Fragment>);
-                nodes.push(<mark key={`${keyPrefix}-exact-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{buildKnowledgeLinkedNodes(source.slice(range.start, range.end), `${keyPrefix}-exact-${index}`)}</mark>);
+                nodes.push(<mark key={`${keyPrefix}-exact-${index}`} data-active-knowledge-highlight="true" className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{buildKnowledgeLinkedNodes(source.slice(range.start, range.end), `${keyPrefix}-exact-${index}`)}</mark>);
                 cursor = range.end;
             });
             if (cursor < source.length) nodes.push(<React.Fragment key={`${keyPrefix}-after`}>{buildKnowledgeLinkedNodes(source.slice(cursor), `${keyPrefix}-after`)}</React.Fragment>);
@@ -6557,7 +6557,7 @@ const MarkdownView = ({
             if (!isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText)) {
                 return <React.Fragment key={`${keyPrefix}-${index}`}>{children}</React.Fragment>;
             }
-            return <mark key={`${keyPrefix}-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{children}</mark>;
+            return <mark key={`${keyPrefix}-${index}`} data-active-knowledge-highlight="true" className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{children}</mark>;
         });
     };
 
@@ -6662,10 +6662,19 @@ const MarkdownView = ({
                 .replace(/\{\{(.*?)\}\}/g, '$1')
                 .trim();
             if (!source) continue;
-            for (let pos = 0; pos < source.length; pos += 1) {
+            // A source line can contain several spoken sentences.  Search only
+            // the exact yellow range(s), never an earlier link in the same
+            // paragraph.  For example, this prevents `accountability` from
+            // winning when the current highlighted cue contains `misconduct`.
+            const exactRanges = findKnowledgeExactSubtitleRanges(source, activeKnowledgeSubtitleText);
+            const highlightedFragments = exactRanges.length > 0
+                ? exactRanges.map((range) => source.slice(range.start, range.end))
+                : splitKnowledgeLineIntoSentences(source).filter((sentence) => isKnowledgeSentenceCoveredBySubtitle(sentence, activeKnowledgeSubtitleText));
+            for (const fragment of highlightedFragments) {
+                for (let pos = 0; pos < fragment.length; pos += 1) {
                 const matches = [];
                 for (const entry of knowledgeTermEntries) {
-                    const matchLen = getKnowledgeTermMatchLengthAt(source, pos, entry);
+                    const matchLen = getKnowledgeTermMatchLengthAt(fragment, pos, entry);
                     if (matchLen <= 0) continue;
                     const entryIsMultiPart = isMultiPartKnowledgeTerm(entry?.term || "");
                     const visibleItems = (Array.isArray(entry?.items) ? entry.items : [])
@@ -6687,14 +6696,15 @@ const MarkdownView = ({
                 }
                 if (items.length > 0) {
                     onActiveKnowledgeTermsChange({
-                        term: cleanQuizDisplayText(source.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || ""),
+                        term: cleanQuizDisplayText(fragment.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || ""),
                         items
                     });
                     return;
                 }
+                }
             }
         }
-    }, [activeKnowledgeSourceLines, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
+    }, [activeKnowledgeSourceLines, activeKnowledgeSubtitleText, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
 
     if (!sourceContent) return null;
 
@@ -17091,7 +17101,11 @@ ${userQ}`;
         const revealActiveLine = () => {
             const container = embeddedKnowledgeContentRef.current;
             const firstLine = embeddedKnowledgeSubtitleMatches[0]?.sourceLine;
-            const target = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
+            const line = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
+            // The line wrapper may be a long paragraph.  Its top can already
+            // be visible while the yellow sentence is below the fold, so use
+            // the actual rendered mark for the viewport calculation.
+            const target = line?.querySelector?.('mark[data-active-knowledge-highlight="true"]') || line;
             if (!container || !target) return;
             const containerRect = container.getBoundingClientRect();
             const targetRect = target.getBoundingClientRect();
@@ -18903,7 +18917,10 @@ ${userQ}`;
                         <div className="flex items-center justify-between p-3">
                             <div className="flex items-center gap-2">
                                 <div className="bg-black text-white p-1.5 rounded-lg"><span className="text-xl">🎧</span></div>
-                                <h1 className="text-lg font-bold text-gray-900 tracking-tight">語伴</h1>
+                                <div className="flex items-baseline gap-2">
+                                    <h1 className="text-lg font-bold text-gray-900 tracking-tight">語伴</h1>
+                                    <span className="text-[10px] font-mono text-slate-400 select-all" title="目前載入的發布版本">{APP_VERSION}</span>
+                                </div>
                             </div>
                             <button onClick={() => setIsHeaderExpanded(!isHeaderExpanded)} className="p-2 text-gray-500 hover:bg-gray-100 rounded-full">
                                 {isHeaderExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
