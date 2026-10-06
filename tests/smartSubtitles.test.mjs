@@ -82,3 +82,13 @@ test('knowledge highlighting accepts ebook hyphenation differences', () => {
         { start: 86, end: 94 }
     ]));
 });
+
+test('long cue rejects an earlier partial name-and-topic overlap', () => {
+    const book = `[原文]
+The New York State Attorney General, Leticia James, says her office has officially now opened a criminal investigation into the alleged 2024 gang rape at Cornell University.
+The governor called it disturbing and the state attorney general, Leticia James, said this was now officially a criminal investigation.`;
+    const lrc = 'The governor calling it disturbing and the state attorney general, Leticia James, is saying that this is now officially a criminal investigation.';
+    const matches = alignment.findKnowledgeSubtitleMatches(book, lrc);
+    assert.equal(matches.some((match) => match.sourceLine === 1), false);
+    assert.equal(matches.some((match) => match.sourceLine === 2), true);
+});

@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.173 · multi-link-sync";
+const APP_VERSION = "v5.174 · strict-long-cue";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20260305.6";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -5807,15 +5807,17 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
                 bestObservedAlignment = alignment;
             }
             const canFuzzyMatch = Math.min(targetWords.length, candidateWords.length) >= 4;
-            const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
-            const fuzzyPasses = canFuzzyMatch && alignment.targetCoverage >= 0.70 &&
-                alignment.orderedMatched >= 2 && alignment.orderedContentCoverage >= orderThreshold;
+            const isLongCue = targetWords.length >= 12;
+            const orderThreshold = isLongCue ? 0.72 : (alignment.orderedContentTotal <= 3 ? 0.65 : 0.75);
+            const fuzzyPasses = canFuzzyMatch && alignment.targetCoverage >= (isLongCue ? 0.76 : 0.70) &&
+                alignment.orderedMatched >= (isLongCue ? 3 : 2) && alignment.orderedContentCoverage >= orderThreshold;
             // ASR occasionally mangles a name or a verb, but a consecutive
             // two-word content phrase (for example "following facts") remains
             // strong evidence of the next spoken sentence.
             const transcriptionRecoveryPasses = canFuzzyMatch && targetWords.length >= 6 &&
-                alignment.targetCoverage >= 0.50 && alignment.orderedContentCoverage >= 0.50 &&
-                alignment.orderedLongestRun >= 2;
+                alignment.targetCoverage >= (isLongCue ? 0.66 : 0.50) &&
+                alignment.orderedContentCoverage >= (isLongCue ? 0.66 : 0.50) &&
+                alignment.orderedLongestRun >= (isLongCue ? 3 : 2);
             if (exact || fuzzyPasses || transcriptionRecoveryPasses || longCueSourceSegment) {
                 bestScore = Math.max(bestScore, score);
             }
@@ -5896,13 +5898,15 @@ const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = 
         (Math.min(candidateWords.length, targetWords.length) >= 4 && (candidate.includes(target) || target.includes(candidate)))) return true;
     const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
     const longCueSourceSegment = getKnowledgeLongCueSourceSegmentMatch(candidate, target);
-    const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
+    const isLongCue = targetWords.length >= 12;
+    const orderThreshold = isLongCue ? 0.72 : (alignment.orderedContentTotal <= 3 ? 0.65 : 0.75);
     const fuzzyPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
-        alignment.targetCoverage >= 0.70 && alignment.orderedMatched >= 2 &&
+        alignment.targetCoverage >= (isLongCue ? 0.76 : 0.70) && alignment.orderedMatched >= (isLongCue ? 3 : 2) &&
         alignment.orderedContentCoverage >= orderThreshold;
     const transcriptionRecoveryPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
-        targetWords.length >= 6 && alignment.targetCoverage >= 0.50 &&
-        alignment.orderedContentCoverage >= 0.50 && alignment.orderedLongestRun >= 2;
+        targetWords.length >= 6 && alignment.targetCoverage >= (isLongCue ? 0.66 : 0.50) &&
+        alignment.orderedContentCoverage >= (isLongCue ? 0.66 : 0.50) &&
+        alignment.orderedLongestRun >= (isLongCue ? 3 : 2);
     const shortDialogueCuePasses = targetWords.length >= 2 && targetWords.length <= 3 &&
         candidateWords.length >= 4 && candidate.startsWith(target) &&
         alignment.targetCoverage >= 0.90;
