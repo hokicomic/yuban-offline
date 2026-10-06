@@ -6073,7 +6073,8 @@ const MarkdownView = ({
     activeKnowledgeSubtitleText = "",
     treatWholeDocumentAsOriginal = false,
     manualKnowledgeAnchorMode = false,
-    onKnowledgeSourceLineConfirm = null
+    onKnowledgeSourceLineConfirm = null,
+    onActiveKnowledgeTermsChange = null
 }) => {
     const sourceContent = typeof content === 'string' ? content : '';
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
@@ -6641,6 +6642,59 @@ const MarkdownView = ({
         const end = anchor + 240;
         return segments.filter((segment) => Number.isFinite(segment?.sourceLine) && segment.sourceLine >= start && segment.sourceLine <= end);
     }, [segments, activeKnowledgeSourceLines, treatWholeDocumentAsOriginal, manualKnowledgeAnchorMode]);
+
+    // The clickable knowledge links in the active source sentence should also
+    // drive an already-open knowledge preview.  This intentionally reports
+    // only the first visible link, using exactly the same matching and item
+    // filtering as buildKnowledgeLinkedNodes below.  It does not open a panel
+    // by itself, so normal reading remains uninterrupted.
+    useEffect(() => {
+        if (typeof onActiveKnowledgeTermsChange !== 'function' || !enableKnowledgeTermLinks) return;
+        if (!Array.isArray(knowledgeTermEntries) || knowledgeTermEntries.length === 0) return;
+        const activeLines = Array.isArray(activeKnowledgeSourceLines)
+            ? activeKnowledgeSourceLines.filter(Number.isFinite)
+            : [];
+        if (activeLines.length === 0) return;
+        const activeLineSet = new Set(activeLines);
+        const activeSegments = segments.filter((segment) => activeLineSet.has(segment?.sourceLine));
+        for (const segment of activeSegments) {
+            const source = stripTargetTagsForDisplay(String(segment?.content || ""))
+                .replace(/\{\{(.*?)\}\}/g, '$1')
+                .trim();
+            if (!source) continue;
+            for (let pos = 0; pos < source.length; pos += 1) {
+                const matches = [];
+                for (const entry of knowledgeTermEntries) {
+                    const matchLen = getKnowledgeTermMatchLengthAt(source, pos, entry);
+                    if (matchLen <= 0) continue;
+                    const entryIsMultiPart = isMultiPartKnowledgeTerm(entry?.term || "");
+                    const visibleItems = (Array.isArray(entry?.items) ? entry.items : [])
+                        .filter((item) => entryIsMultiPart || String(item?.category || "").trim() !== "usage" || !matchedMultiUsageItemKeysForPreview.has(getKnowledgePopupItemKey(item)));
+                    if (visibleItems.length > 0) matches.push({ entry: { ...entry, items: visibleItems }, matchLen });
+                }
+                if (matches.length === 0) continue;
+                matches.sort((a, b) => Number(b.matchLen || 0) - Number(a.matchLen || 0) || String(b.entry?.term || "").length - String(a.entry?.term || "").length);
+                const longest = matches[0];
+                const itemSeen = new Set();
+                const items = [];
+                for (const match of matches) {
+                    for (const item of match.entry?.items || []) {
+                        const key = getKnowledgePopupItemKey(item);
+                        if (!key || itemSeen.has(key)) continue;
+                        itemSeen.add(key);
+                        items.push(item);
+                    }
+                }
+                if (items.length > 0) {
+                    onActiveKnowledgeTermsChange({
+                        term: cleanQuizDisplayText(source.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || ""),
+                        items
+                    });
+                    return;
+                }
+            }
+        }
+    }, [activeKnowledgeSourceLines, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
 
     if (!sourceContent) return null;
 
@@ -17026,20 +17080,36 @@ ${userQ}`;
         setTimeout(() => setEmbeddedKnowledgeAlignmentLogNotice(""), 5000);
     }, []);
     useEffect(() => {
-        if (topPanelMode !== 'document' || embeddedKnowledgePlaybackProgressRef.current.anchorState !== 'anchored' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
-        const timer = setTimeout(() => {
+        // A visibly matched line is enough to follow during reading.  Waiting
+        // for the two-cue "anchored" state meant the first correct highlight
+        // often stayed outside the viewport.  Use an immediate, deterministic
+        // scroll rather than smooth scrolling: LRC cues can change before a
+        // previous smooth animation ends, leaving the new highlight offscreen.
+        if (topPanelMode !== 'document' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
+        let outerFrame = 0;
+        let revealFrame = 0;
+        const revealActiveLine = () => {
             const container = embeddedKnowledgeContentRef.current;
             const firstLine = embeddedKnowledgeSubtitleMatches[0]?.sourceLine;
             const target = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
             if (!container || !target) return;
             const containerRect = container.getBoundingClientRect();
             const targetRect = target.getBoundingClientRect();
-            const topPadding = Math.min(56, Math.max(20, container.clientHeight * 0.12));
+            const topPadding = Math.min(96, Math.max(28, container.clientHeight * 0.24));
             const desiredTop = container.scrollTop + targetRect.top - containerRect.top - topPadding;
             const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
-            container.scrollTo({ top: Math.max(0, Math.min(maxTop, desiredTop)), behavior: 'smooth' });
-        }, 0);
-        return () => clearTimeout(timer);
+            container.scrollTo({ top: Math.max(0, Math.min(maxTop, desiredTop)), behavior: 'auto' });
+        };
+        // MarkdownView may window a long document around the new source line.
+        // Two frames ensure the target exists and has its final layout before
+        // taking measurements.
+        outerFrame = requestAnimationFrame(() => {
+            revealFrame = requestAnimationFrame(revealActiveLine);
+        });
+        return () => {
+            cancelAnimationFrame(outerFrame);
+            cancelAnimationFrame(revealFrame);
+        };
     }, [topPanelMode, currentIndex, embeddedKnowledgeSubtitleMatches]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
@@ -17377,6 +17447,19 @@ ${userQ}`;
         setKnowledgePreviewPopupPos(clampKnowledgePreviewPopupPos(nextPos.x, nextPos.y));
         setKnowledgePreviewTermPopup({ term, items });
     }, [clampKnowledgePreviewPopupPos, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
+    const syncOpenKnowledgePreviewToActiveTerm = useCallback((payload) => {
+        // Do not create a popup during playback.  This only keeps a preview
+        // that the learner has explicitly opened in sync with the highlighted
+        // source sentence, whether it is floating or docked on the right.
+        if (!knowledgePreviewTermPopup) return;
+        const term = cleanQuizDisplayText(String(payload?.term || ""));
+        const items = Array.isArray(payload?.items) ? payload.items : [];
+        if (!term || items.length === 0) return;
+        const currentKey = `${knowledgePreviewTermPopup.term}::${(knowledgePreviewTermPopup.items || []).map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
+        const nextKey = `${term}::${items.map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
+        if (currentKey === nextKey) return;
+        setKnowledgePreviewTermPopup({ term, items });
+    }, [knowledgePreviewTermPopup]);
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
         
@@ -19238,6 +19321,7 @@ ${userQ}`;
                                                 enableKnowledgeTermLinks={!embeddedKnowledgeIsDirectBookText}
                                                 knowledgeTermEntries={embeddedKnowledgeTermEntries}
                                                 onKnowledgeTermClick={handleKnowledgePreviewTermClick}
+                                                onActiveKnowledgeTermsChange={syncOpenKnowledgePreviewToActiveTerm}
                                                 activeKnowledgeSourceLines={embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine)}
                                                 activeKnowledgeSubtitleText={subtitles[currentIndex]?.text || ""}
                                                 treatWholeDocumentAsOriginal={embeddedKnowledgeAlignmentIndex.useWholeDocument}
