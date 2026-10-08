@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.178 · echo-reselect";
+const APP_VERSION = "v5.179 · echo-drag-markers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7890,6 +7890,9 @@ export default function GeminiPlayer() {
     const echoPhaseRef = useRef('selecting');
     const echoStartRef = useRef(0);
     const echoEndRef = useRef(0);
+    const echoHasStartRef = useRef(false);
+    const echoHasEndRef = useRef(false);
+    const echoTimelineRef = useRef(null);
     const echoOriginalRateRef = useRef(null);
     const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
@@ -8110,6 +8113,8 @@ export default function GeminiPlayer() {
         setIsEchoMode(false);
         setEchoHasStart(false);
         setEchoHasEnd(false);
+        echoHasStartRef.current = false;
+        echoHasEndRef.current = false;
         setEchoNotice("");
     };
 
@@ -8142,8 +8147,10 @@ export default function GeminiPlayer() {
         }
         isGapPausing.current = false;
         cancelWorkerTimer();
-        player.playbackRate = 0.5;
-        setPlaybackRate(0.5);
+        // Selection uses the learner's normal rate.  The draggable A/B markers
+        // provide precision without distorting the natural sound and rhythm.
+        player.playbackRate = echoOriginalRateRef.current;
+        setPlaybackRate(echoOriginalRateRef.current);
         seekThenMaybePlay(rangeStart, true);
         setIsPlaying(true);
     };
@@ -8165,20 +8172,22 @@ export default function GeminiPlayer() {
         setEchoEnd(range.end);
         setEchoHasStart(false);
         setEchoHasEnd(false);
+        echoHasStartRef.current = false;
+        echoHasEndRef.current = false;
         setEchoPhase('selecting');
-        setEchoNotice('以 0.5 倍速循環播放中；在想要的起點按 A、終點按 B。');
+        setEchoNotice('以原播放速度循環；在想要的起點按 A、終點按 B，之後可拖曳標記微調。');
         setIsEchoMode(true);
         startEchoSelectionLoop(range.start, range.end);
     };
 
-    const setEchoPoint = (point, rawTime) => {
+    const setEchoPoint = (point, rawTime, action = 'confirm') => {
         const player = playerRef.current;
         const minLength = 0.08;
         const time = clampEchoTime(rawTime);
         let nextStart = echoStartRef.current;
         let nextEnd = echoEndRef.current;
-        let hasStart = echoHasStart;
-        let hasEnd = echoHasEnd;
+        let hasStart = echoHasStartRef.current;
+        let hasEnd = echoHasEndRef.current;
         if (point === 'A') {
             nextStart = Math.min(time, Math.max(echoBounds.start, nextEnd - minLength));
             hasStart = true;
@@ -8192,12 +8201,47 @@ export default function GeminiPlayer() {
         setEchoEnd(nextEnd);
         setEchoHasStart(hasStart);
         setEchoHasEnd(hasEnd);
+        echoHasStartRef.current = hasStart;
+        echoHasEndRef.current = hasEnd;
         if (hasStart && hasEnd) {
-            playEchoRangeOnce(nextStart, nextEnd);
-        } else if (player) {
+            if (action === 'confirm') {
+                playEchoRangeOnce(nextStart, nextEnd);
+            } else if (player) {
+                player.pause();
+                const originalRate = Number.isFinite(echoOriginalRateRef.current) ? echoOriginalRateRef.current : playbackRate;
+                player.playbackRate = originalRate;
+                setPlaybackRate(originalRate);
+                setIsPlaying(false);
+                echoPhaseRef.current = 'ready';
+                setEchoPhase('ready');
+                setEchoNotice('A-B 微調完成；按「重聽一次」播放這個片段。');
+            }
+        } else if (player && action === 'confirm') {
             setEchoNotice(point === 'A' ? '已設定 A；請在終點按 B。' : '已設定 B；請在起點按 A。');
             startEchoSelectionLoop(nextStart, nextEnd);
         }
+    };
+
+    const startEchoMarkerDrag = (point, event) => {
+        if (!echoTimelineRef.current) return;
+        event.preventDefault();
+        const player = playerRef.current;
+        if (player) player.pause();
+        setIsPlaying(false);
+        const getTime = (pointerEvent) => {
+            const rect = echoTimelineRef.current?.getBoundingClientRect();
+            if (!rect || rect.width <= 0) return point === 'A' ? echoStartRef.current : echoEndRef.current;
+            const ratio = Math.max(0, Math.min(1, (pointerEvent.clientX - rect.left) / rect.width));
+            return echoBounds.start + ratio * (echoBounds.end - echoBounds.start);
+        };
+        const onMove = (pointerEvent) => setEchoPoint(point, getTime(pointerEvent), 'adjust');
+        const onEnd = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onEnd);
+        };
+        setEchoPoint(point, getTime(event), 'adjust');
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onEnd, { once: true });
     };
 
     useEffect(() => {
@@ -19672,20 +19716,48 @@ ${userQ}`;
                                     </div>
                                     <button type="button" onClick={stopEchoMode} className="px-2.5 py-1 rounded-full border border-violet-300 bg-white text-[11px] font-bold text-violet-700 hover:bg-violet-100">結束回音法</button>
                                 </div>
-                                <input
-                                    type="range"
-                                    min={echoBounds.start}
-                                    max={echoBounds.end}
-                                    step="0.01"
-                                    value={clampEchoTime(currentTime)}
-                                    onInput={(e) => {
-                                        const next = clampEchoTime(parseFloat(e.currentTarget.value));
-                                        if (playerRef.current) playerRef.current.currentTime = next;
-                                        setCurrentTime(next);
-                                    }}
-                                    className="w-full h-2 rounded-lg appearance-none cursor-pointer accent-violet-600"
-                                    aria-label="回音法片段播放位置"
-                                />
+                                <div ref={echoTimelineRef} className="relative h-9 touch-none select-none" aria-label="回音法 A-B 片段進度條">
+                                    <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-200" />
+                                    <div
+                                        className="absolute top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-600"
+                                        style={{
+                                            left: `${((echoStart - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
+                                            width: `${Math.max(0, ((echoEnd - echoStart) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100)}%`
+                                        }}
+                                    />
+                                    <input
+                                        type="range"
+                                        min={echoBounds.start}
+                                        max={echoBounds.end}
+                                        step="0.01"
+                                        value={clampEchoTime(currentTime)}
+                                        onInput={(e) => {
+                                            const next = clampEchoTime(parseFloat(e.currentTarget.value));
+                                            if (playerRef.current) playerRef.current.currentTime = next;
+                                            setCurrentTime(next);
+                                        }}
+                                        className="absolute inset-0 z-10 w-full h-full opacity-0 cursor-pointer"
+                                        aria-label="回音法片段播放位置"
+                                    />
+                                    <button
+                                        type="button"
+                                        onPointerDown={(e) => startEchoMarkerDrag('A', e)}
+                                        onClick={(e) => e.preventDefault()}
+                                        className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                        style={{ left: `${((echoStart - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                        title="拖曳微調 A 起點"
+                                        aria-label="拖曳微調 A 起點"
+                                    >A</button>
+                                    <button
+                                        type="button"
+                                        onPointerDown={(e) => startEchoMarkerDrag('B', e)}
+                                        onClick={(e) => e.preventDefault()}
+                                        className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                        style={{ left: `${((echoEnd - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                        title="拖曳微調 B 終點"
+                                        aria-label="拖曳微調 B 終點"
+                                    >B</button>
+                                </div>
                                 <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">範圍 {formatTime(echoBounds.start)} – {formatTime(echoBounds.end)}</span>
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">A {echoHasStart ? formatTime(echoStart) : '未設定'}</span>
@@ -19702,7 +19774,7 @@ ${userQ}`;
                                                 setEchoHasStart(false);
                                                 setEchoHasEnd(false);
                                                 setEchoPhase('selecting');
-                                                setEchoNotice('重新以 0.5 倍速循環；在想要的起點按 A、終點按 B。');
+                                                setEchoNotice('重新以原播放速度循環；在想要的起點按 A、終點按 B，之後可拖曳標記微調。');
                                                 // Restart from the complete subtitle range, not the
                                                 // previously selected A-B segment.
                                                 setEchoStart(echoBounds.start);
