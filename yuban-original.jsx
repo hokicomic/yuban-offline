@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.179 · echo-drag-markers";
+const APP_VERSION = "v5.180 · echo-playhead";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8258,7 +8258,8 @@ export default function GeminiPlayer() {
             }
         } else if (player && action === 'confirm') {
             setEchoNotice(point === 'A' ? '已設定 A；請在終點按 B。' : '已設定 B；請在起點按 A。');
-            startEchoSelectionLoop(nextStart, nextEnd);
+            // Keep the existing selection playback running. Restarting here
+            // interrupted the next A/B click and made B appear unselectable.
         }
     };
 
@@ -19779,6 +19780,11 @@ ${userQ}`;
                                             left: `${((echoStart - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
                                             width: `${Math.max(0, ((echoEnd - echoStart) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100)}%`
                                         }}
+                                    />
+                                    <div
+                                        className="absolute z-[15] top-1/2 -translate-x-1/2 -translate-y-1/2 h-6 w-0.5 rounded-full bg-amber-400 shadow-[0_0_5px_rgba(251,191,36,0.95)] pointer-events-none"
+                                        style={{ left: `${((clampEchoTime(currentTime) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                        aria-hidden="true"
                                     />
                                     <input
                                         type="range"
