@@ -5807,17 +5807,15 @@ const findKnowledgeSubtitleMatches = (content = "", subtitleText = "", diagnosti
                 bestObservedAlignment = alignment;
             }
             const canFuzzyMatch = Math.min(targetWords.length, candidateWords.length) >= 4;
-            const isLongCue = targetWords.length >= 12;
-            const orderThreshold = isLongCue ? 0.72 : (alignment.orderedContentTotal <= 3 ? 0.65 : 0.75);
-            const fuzzyPasses = canFuzzyMatch && alignment.targetCoverage >= (isLongCue ? 0.76 : 0.70) &&
-                alignment.orderedMatched >= (isLongCue ? 3 : 2) && alignment.orderedContentCoverage >= orderThreshold;
+            const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
+            const fuzzyPasses = canFuzzyMatch && alignment.targetCoverage >= 0.70 &&
+                alignment.orderedMatched >= 2 && alignment.orderedContentCoverage >= orderThreshold;
             // ASR occasionally mangles a name or a verb, but a consecutive
             // two-word content phrase (for example "following facts") remains
             // strong evidence of the next spoken sentence.
             const transcriptionRecoveryPasses = canFuzzyMatch && targetWords.length >= 6 &&
-                alignment.targetCoverage >= (isLongCue ? 0.66 : 0.50) &&
-                alignment.orderedContentCoverage >= (isLongCue ? 0.66 : 0.50) &&
-                alignment.orderedLongestRun >= (isLongCue ? 3 : 2);
+                alignment.targetCoverage >= 0.50 && alignment.orderedContentCoverage >= 0.50 &&
+                alignment.orderedLongestRun >= 2;
             if (exact || fuzzyPasses || transcriptionRecoveryPasses || longCueSourceSegment) {
                 bestScore = Math.max(bestScore, score);
             }
@@ -5898,15 +5896,13 @@ const isKnowledgeSentenceMatchedBySubtitlePart = (sentence = "", subtitlePart = 
         (Math.min(candidateWords.length, targetWords.length) >= 4 && (candidate.includes(target) || target.includes(candidate)))) return true;
     const alignment = getKnowledgeAlignmentDirectionalScore(target, candidate);
     const longCueSourceSegment = getKnowledgeLongCueSourceSegmentMatch(candidate, target);
-    const isLongCue = targetWords.length >= 12;
-    const orderThreshold = isLongCue ? 0.72 : (alignment.orderedContentTotal <= 3 ? 0.65 : 0.75);
+    const orderThreshold = alignment.orderedContentTotal <= 3 ? 0.65 : 0.75;
     const fuzzyPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
-        alignment.targetCoverage >= (isLongCue ? 0.76 : 0.70) && alignment.orderedMatched >= (isLongCue ? 3 : 2) &&
+        alignment.targetCoverage >= 0.70 && alignment.orderedMatched >= 2 &&
         alignment.orderedContentCoverage >= orderThreshold;
     const transcriptionRecoveryPasses = Math.min(candidateWords.length, targetWords.length) >= 4 &&
-        targetWords.length >= 6 && alignment.targetCoverage >= (isLongCue ? 0.66 : 0.50) &&
-        alignment.orderedContentCoverage >= (isLongCue ? 0.66 : 0.50) &&
-        alignment.orderedLongestRun >= (isLongCue ? 3 : 2);
+        targetWords.length >= 6 && alignment.targetCoverage >= 0.50 &&
+        alignment.orderedContentCoverage >= 0.50 && alignment.orderedLongestRun >= 2;
     const shortDialogueCuePasses = targetWords.length >= 2 && targetWords.length <= 3 &&
         candidateWords.length >= 4 && candidate.startsWith(target) &&
         alignment.targetCoverage >= 0.90;
@@ -6548,7 +6544,7 @@ const MarkdownView = ({
             let cursor = 0;
             ranges.forEach((range, index) => {
                 if (range.start > cursor) nodes.push(<React.Fragment key={`${keyPrefix}-before-${index}`}>{buildKnowledgeLinkedNodes(source.slice(cursor, range.start), `${keyPrefix}-before-${index}`)}</React.Fragment>);
-                nodes.push(<mark key={`${keyPrefix}-exact-${index}`} data-active-knowledge-highlight="true" className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{buildKnowledgeLinkedNodes(source.slice(range.start, range.end), `${keyPrefix}-exact-${index}`)}</mark>);
+                nodes.push(<mark key={`${keyPrefix}-exact-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{buildKnowledgeLinkedNodes(source.slice(range.start, range.end), `${keyPrefix}-exact-${index}`)}</mark>);
                 cursor = range.end;
             });
             if (cursor < source.length) nodes.push(<React.Fragment key={`${keyPrefix}-after`}>{buildKnowledgeLinkedNodes(source.slice(cursor), `${keyPrefix}-after`)}</React.Fragment>);
@@ -6561,7 +6557,7 @@ const MarkdownView = ({
             if (!isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText)) {
                 return <React.Fragment key={`${keyPrefix}-${index}`}>{children}</React.Fragment>;
             }
-            return <mark key={`${keyPrefix}-${index}`} data-active-knowledge-highlight="true" className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{children}</mark>;
+            return <mark key={`${keyPrefix}-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{children}</mark>;
         });
     };
 
@@ -6661,76 +6657,44 @@ const MarkdownView = ({
         if (activeLines.length === 0) return;
         const activeLineSet = new Set(activeLines);
         const activeSegments = segments.filter((segment) => activeLineSet.has(segment?.sourceLine));
-        const linkedGroups = [];
-        const seenLinkTerms = new Set();
         for (const segment of activeSegments) {
             const source = stripTargetTagsForDisplay(String(segment?.content || ""))
                 .replace(/\{\{(.*?)\}\}/g, '$1')
                 .trim();
             if (!source) continue;
-            // A source line can contain several spoken sentences.  Search only
-            // the exact yellow range(s), never an earlier link in the same
-            // paragraph.  For example, this prevents `accountability` from
-            // winning when the current highlighted cue contains `misconduct`.
-            const exactRanges = findKnowledgeExactSubtitleRanges(source, activeKnowledgeSubtitleText);
-            const highlightedFragments = exactRanges.length > 0
-                ? exactRanges.map((range) => source.slice(range.start, range.end))
-                : splitKnowledgeLineIntoSentences(source).filter((sentence) => isKnowledgeSentenceCoveredBySubtitle(sentence, activeKnowledgeSubtitleText));
-            for (const fragment of highlightedFragments) {
-                for (let pos = 0; pos < fragment.length; pos += 1) {
-                    const matches = [];
-                    for (const entry of knowledgeTermEntries) {
-                        const matchLen = getKnowledgeTermMatchLengthAt(fragment, pos, entry);
-                        if (matchLen <= 0) continue;
-                        const entryIsMultiPart = isMultiPartKnowledgeTerm(entry?.term || "");
-                        const visibleItems = (Array.isArray(entry?.items) ? entry.items : [])
-                            .filter((item) => entryIsMultiPart || String(item?.category || "").trim() !== "usage" || !matchedMultiUsageItemKeysForPreview.has(getKnowledgePopupItemKey(item)));
-                        if (visibleItems.length > 0) matches.push({ entry: { ...entry, items: visibleItems }, matchLen });
+            for (let pos = 0; pos < source.length; pos += 1) {
+                const matches = [];
+                for (const entry of knowledgeTermEntries) {
+                    const matchLen = getKnowledgeTermMatchLengthAt(source, pos, entry);
+                    if (matchLen <= 0) continue;
+                    const entryIsMultiPart = isMultiPartKnowledgeTerm(entry?.term || "");
+                    const visibleItems = (Array.isArray(entry?.items) ? entry.items : [])
+                        .filter((item) => entryIsMultiPart || String(item?.category || "").trim() !== "usage" || !matchedMultiUsageItemKeysForPreview.has(getKnowledgePopupItemKey(item)));
+                    if (visibleItems.length > 0) matches.push({ entry: { ...entry, items: visibleItems }, matchLen });
+                }
+                if (matches.length === 0) continue;
+                matches.sort((a, b) => Number(b.matchLen || 0) - Number(a.matchLen || 0) || String(b.entry?.term || "").length - String(a.entry?.term || "").length);
+                const longest = matches[0];
+                const itemSeen = new Set();
+                const items = [];
+                for (const match of matches) {
+                    for (const item of match.entry?.items || []) {
+                        const key = getKnowledgePopupItemKey(item);
+                        if (!key || itemSeen.has(key)) continue;
+                        itemSeen.add(key);
+                        items.push(item);
                     }
-                    if (matches.length === 0) continue;
-                    matches.sort((a, b) => Number(b.matchLen || 0) - Number(a.matchLen || 0) || String(b.entry?.term || "").length - String(a.entry?.term || "").length);
-                    const longest = matches[0];
-                    const term = cleanQuizDisplayText(fragment.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || "");
-                    const termKey = term.toLowerCase();
-                    if (!term || seenLinkTerms.has(termKey)) continue;
-                    const itemSeen = new Set();
-                    const items = [];
-                    for (const match of matches) {
-                        for (const item of match.entry?.items || []) {
-                            const key = getKnowledgePopupItemKey(item);
-                            if (!key || itemSeen.has(key)) continue;
-                            itemSeen.add(key);
-                            items.push(item);
-                        }
-                    }
-                    if (items.length > 0) {
-                        seenLinkTerms.add(termKey);
-                        linkedGroups.push({ term, items });
-                    }
-                    // The next character cannot begin another link inside this
-                    // one; skip it so a multi-word link is listed once only.
-                    pos += Math.max(0, Number(longest.matchLen || 1) - 1);
+                }
+                if (items.length > 0) {
+                    onActiveKnowledgeTermsChange({
+                        term: cleanQuizDisplayText(source.slice(pos, pos + Number(longest.matchLen || 0)) || longest.entry?.term || ""),
+                        items
+                    });
+                    return;
                 }
             }
         }
-        if (linkedGroups.length > 0) {
-            const itemSeen = new Set();
-            const items = [];
-            for (const group of linkedGroups) {
-                for (const item of group.items) {
-                    const key = getKnowledgePopupItemKey(item);
-                    if (!key || itemSeen.has(key)) continue;
-                    itemSeen.add(key);
-                    items.push(item);
-                }
-            }
-            onActiveKnowledgeTermsChange({
-                term: linkedGroups.length === 1 ? linkedGroups[0].term : `本句知識點：${linkedGroups.map((group) => group.term).join(" · ")}`,
-                items,
-                groups: linkedGroups
-            });
-        }
-    }, [activeKnowledgeSourceLines, activeKnowledgeSubtitleText, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
+    }, [activeKnowledgeSourceLines, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
 
     if (!sourceContent) return null;
 
@@ -7324,10 +7288,6 @@ export default function GeminiPlayer() {
     const manualKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeContentRef = useRef(null);
-    // A learner may choose a different link inside the current highlighted
-    // sentence.  Keep that explicit choice until playback advances to another
-    // LRC cue; automatic sync must never immediately overwrite it.
-    const knowledgePreviewManualOverrideRef = useRef({ documentKey: "", subtitleIndex: -1 });
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
     // Multiple reference TXT files are common for long audiobooks.  Keep the
@@ -13412,8 +13372,6 @@ ${quizTargetLanguage}
                 const text = (Array.isArray(examples) ? examples : []).join('\n');
                 const phrase = stripPointPronunciation(label);
                 if (!text || !phrase) return false;
-                // JSON normalisation may collapse a dialogue newline to a
-                // space, so accept either a line break or ordinary whitespace.
                 const hasA = /(?:^|\s)A\s*[:：]\s*\S/m.test(text);
                 const hasB = /(?:^|\s)B\s*[:：]\s*\S/m.test(text);
                 return hasA && hasB && text.toLocaleLowerCase().includes(phrase.toLocaleLowerCase());
@@ -17167,11 +17125,7 @@ ${userQ}`;
         const revealActiveLine = () => {
             const container = embeddedKnowledgeContentRef.current;
             const firstLine = embeddedKnowledgeSubtitleMatches[0]?.sourceLine;
-            const line = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
-            // The line wrapper may be a long paragraph.  Its top can already
-            // be visible while the yellow sentence is below the fold, so use
-            // the actual rendered mark for the viewport calculation.
-            const target = line?.querySelector?.('mark[data-active-knowledge-highlight="true"]') || line;
+            const target = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
             if (!container || !target) return;
             const containerRect = container.getBoundingClientRect();
             const targetRect = target.getBoundingClientRect();
@@ -17518,10 +17472,6 @@ ${userQ}`;
             if (items.length >= 12) break;
         }
         if (!term || items.length === 0) return;
-        knowledgePreviewManualOverrideRef.current = {
-            documentKey: embeddedKnowledgeDocumentKey,
-            subtitleIndex: currentIndex
-        };
         const nextPos = !knowledgePreviewTermPopup
             ? getKnowledgePreviewPopupDefaultPos()
             : {
@@ -17530,14 +17480,12 @@ ${userQ}`;
             };
         setKnowledgePreviewPopupPos(clampKnowledgePreviewPopupPos(nextPos.x, nextPos.y));
         setKnowledgePreviewTermPopup({ term, items });
-    }, [clampKnowledgePreviewPopupPos, currentIndex, embeddedKnowledgeDocumentKey, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
+    }, [clampKnowledgePreviewPopupPos, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
     const syncOpenKnowledgePreviewToActiveTerm = useCallback((payload) => {
         // Do not create a popup during playback.  This only keeps a preview
         // that the learner has explicitly opened in sync with the highlighted
         // source sentence, whether it is floating or docked on the right.
         if (!knowledgePreviewTermPopup) return;
-        const manualOverride = knowledgePreviewManualOverrideRef.current || {};
-        if (manualOverride.documentKey === embeddedKnowledgeDocumentKey && manualOverride.subtitleIndex === currentIndex) return;
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const items = Array.isArray(payload?.items) ? payload.items : [];
         if (!term || items.length === 0) return;
@@ -17545,7 +17493,7 @@ ${userQ}`;
         const nextKey = `${term}::${items.map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
         if (currentKey === nextKey) return;
         setKnowledgePreviewTermPopup({ term, items });
-    }, [currentIndex, embeddedKnowledgeDocumentKey, knowledgePreviewTermPopup]);
+    }, [knowledgePreviewTermPopup]);
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
         
@@ -19025,10 +18973,7 @@ ${userQ}`;
                         <div className="flex items-center justify-between p-3">
                             <div className="flex items-center gap-2">
                                 <div className="bg-black text-white p-1.5 rounded-lg"><span className="text-xl">🎧</span></div>
-                                <div className="flex items-baseline gap-2">
-                                    <h1 className="text-lg font-bold text-gray-900 tracking-tight">語伴</h1>
-                                    <span className="text-[10px] font-mono text-slate-400 select-all" title="目前載入的發布版本">{APP_VERSION}</span>
-                                </div>
+                                <h1 className="text-lg font-bold text-gray-900 tracking-tight">語伴</h1>
                             </div>
                             <button onClick={() => setIsHeaderExpanded(!isHeaderExpanded)} className="p-2 text-gray-500 hover:bg-gray-100 rounded-full">
                                 {isHeaderExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
