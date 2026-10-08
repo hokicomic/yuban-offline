@@ -19210,7 +19210,7 @@ ${userQ}`;
                 )}
 
                 {/* MAIN CONTENT AREA */}
-                <div className="flex-1 min-h-0 flex flex-col items-center justify-start p-4 overflow-y-auto w-full pb-48">
+                <div className="flex-1 min-h-0 flex flex-col items-center justify-start p-4 overflow-y-auto w-full">
                     {/* VIDEO AREA */}
                     <div
                         className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 transition-all duration-300 ease-in-out shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
