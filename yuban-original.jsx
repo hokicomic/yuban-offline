@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.180 · echo-playhead";
+const APP_VERSION = "v5.181 · echo-explicit-b";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19809,15 +19809,17 @@ ${userQ}`;
                                         title="拖曳微調 A 起點"
                                         aria-label="拖曳微調 A 起點"
                                     >A</button>
-                                    <button
-                                        type="button"
-                                        onPointerDown={(e) => startEchoMarkerDrag('B', e)}
-                                        onClick={(e) => e.preventDefault()}
-                                        className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
-                                        style={{ left: `${((echoEnd - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
-                                        title="拖曳微調 B 終點"
-                                        aria-label="拖曳微調 B 終點"
-                                    >B</button>
+                                    {echoHasEnd && (
+                                        <button
+                                            type="button"
+                                            onPointerDown={(e) => startEchoMarkerDrag('B', e)}
+                                            onClick={(e) => e.preventDefault()}
+                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                            style={{ left: `${((echoEnd - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                            title="拖曳微調 B 終點"
+                                            aria-label="拖曳微調 B 終點"
+                                        >B</button>
+                                    )}
                                 </div>
                                 <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">範圍 {formatTime(echoBounds.start)} – {formatTime(echoBounds.end)}</span>
@@ -19826,7 +19828,7 @@ ${userQ}`;
                                     {echoPhase === 'selecting' ? (
                                         <>
                                             <button type="button" onClick={() => setEchoPoint('A', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">A 設起點</button>
-                                            <button type="button" onClick={() => setEchoPoint('B', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">B 設終點</button>
+                                            <button type="button" onClick={() => setEchoPoint('B', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">B 取目前時點</button>
                                         </>
                                     ) : (
                                         <>
