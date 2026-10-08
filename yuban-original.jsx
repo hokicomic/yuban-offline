@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.182 · echo-default-end";
+const APP_VERSION = "v5.183 · echo-reselect-ab";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8211,11 +8211,9 @@ export default function GeminiPlayer() {
         setEchoStart(range.start);
         setEchoEnd(range.end);
         setEchoHasStart(false);
-        // B defaults to the full subtitle's end.  The learner chooses A;
-        // B remains the tail unless its marker is dragged earlier.
-        setEchoHasEnd(true);
+        setEchoHasEnd(false);
         echoHasStartRef.current = false;
-        echoHasEndRef.current = true;
+        echoHasEndRef.current = false;
         setEchoPhase('selecting');
         setEchoNotice('以原播放速度循環；在想要的起點按 A、終點按 B，之後可拖曳標記微調。');
         setIsEchoMode(true);
@@ -19829,15 +19827,15 @@ ${userQ}`;
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">B {echoHasEnd ? formatTime(echoEnd) : '未設定'}</span>
                                     {echoPhase === 'selecting' ? (
                                         <>
-                                            {!echoHasStart && <button type="button" onClick={() => setEchoPoint('A', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">A 設起點</button>}
-                                            {!echoHasStart && <span className="text-[11px] text-violet-700">B 預設為句尾，可拖曳 B 標記微調</span>}
+                                            <button type="button" onClick={() => setEchoPoint('A', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">A 設起點</button>
+                                            <button type="button" onClick={() => setEchoPoint('B', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">B 設終點</button>
                                         </>
                                     ) : (
                                         <>
                                             <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">重聽一次</button>
                                             <button type="button" onClick={() => {
                                                 setEchoHasStart(false);
-                                                setEchoHasEnd(true);
+                                                setEchoHasEnd(false);
                                                 setEchoPhase('selecting');
                                                 setEchoNotice('重新以原播放速度循環；在想要的起點按 A、終點按 B，之後可拖曳標記微調。');
                                                 // Restart from the complete subtitle range, not the
@@ -19845,7 +19843,7 @@ ${userQ}`;
                                                 setEchoStart(echoBounds.start);
                                                 setEchoEnd(echoBounds.end);
                                                 echoHasStartRef.current = false;
-                                                echoHasEndRef.current = true;
+                                                echoHasEndRef.current = false;
                                                 startEchoSelectionLoop(echoBounds.start, echoBounds.end);
                                             }} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 font-bold hover:bg-violet-100">重新選段</button>
                                         </>
