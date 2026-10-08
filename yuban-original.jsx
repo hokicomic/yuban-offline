@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.177 · echo-method";
+const APP_VERSION = "v5.178 · echo-reselect";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19758,7 +19758,11 @@ ${userQ}`;
                                                 setEchoHasEnd(false);
                                                 setEchoPhase('selecting');
                                                 setEchoNotice('重新以 0.5 倍速循環；在想要的起點按 A、終點按 B。');
-                                                startEchoSelectionLoop(echoStartRef.current, echoEndRef.current);
+                                                // Restart from the complete subtitle range, not the
+                                                // previously selected A-B segment.
+                                                setEchoStart(echoBounds.start);
+                                                setEchoEnd(echoBounds.end);
+                                                startEchoSelectionLoop(echoBounds.start, echoBounds.end);
                                             }} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 font-bold hover:bg-violet-100">重新選段</button>
                                         </>
                                     )}
