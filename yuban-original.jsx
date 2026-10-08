@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.175 · dialogue-usage-resize";
+const APP_VERSION = "v5.176 · subtitle-fill";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19265,7 +19265,7 @@ ${userQ}`;
                 )}
 
                 {/* MAIN CONTENT AREA */}
-                <div className="flex-1 min-h-0 flex flex-col items-center justify-start p-4 overflow-y-auto w-full">
+                <div className="flex-1 min-h-0 flex flex-col items-center justify-start px-4 pt-4 pb-0 overflow-hidden w-full">
                     {/* VIDEO AREA */}
                     <div
                         className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 transition-all duration-300 ease-in-out shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
@@ -19508,10 +19508,10 @@ ${userQ}`;
                         </div>
                     )}
 
-                    <div className={`w-full flex flex-1 min-h-[7.5rem] flex-col ${!mediaSrc ? 'opacity-50 pointer-events-none' : ''}`}>
+                    <div className={`w-full flex-1 min-h-0 flex flex-col ${!mediaSrc ? 'opacity-50 pointer-events-none' : ''}`}>
                         {/* LARGE SUBTITLE CARD */}
-                        <div className="relative group cursor-pointer flex-1 min-h-[7.5rem]" onClick={() => setIsSubtitleHidden(!isSubtitleHidden)}>
-                            <div ref={subtitleCardRef} className={`w-full h-full min-h-[7.5rem] rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-hidden select-none transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm' : 'bg-white border-gray-200 shadow-sm'}`}>
+                        <div className="relative group cursor-pointer flex-1 min-h-0" onClick={() => setIsSubtitleHidden(!isSubtitleHidden)}>
+                            <div ref={subtitleCardRef} className={`w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-hidden select-none transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm' : 'bg-white border-gray-200 shadow-sm'}`}>
                                 <p ref={subtitleTextRef} className="w-full font-bold text-gray-900 leading-snug" style={{ fontSize: `${fittedSubtitleFontSize}px` }}>{subtitleDisplayText}</p>
                             </div>
 
