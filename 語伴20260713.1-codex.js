@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.183 · echo-reselect-ab";
+const APP_VERSION = "v5.184 · srt-orig-pairing";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8528,7 +8528,7 @@ export default function GeminiPlayer() {
         // Subtitle distributors commonly append BCP-47 tags such as
         // `.en-US.srt`.  Remove the complete tag before matching the subtitle
         // with the media filename, otherwise the track silently has no captions.
-        const langSuffixes = ['.en-us', '.en-gb', '.en-au', '.en-ca', '.zh-tw', '.zh-hk', '.zh-cn', '.ja-jp', '.ko-kr', '.en_us', '.en_gb', '.zh_tw', '.zh_hk', '.zh_cn', '.ja_jp', '.ko_kr', '.en', '.eng', '.ja', '.jp', '.ko', '.kr', '.zh', '.cht', '.chs', '.cn', '.tw', '.hk', '.chinese', '.han', '.zht', '.zhs'];
+        const langSuffixes = ['.en-original', '.en-orig', '.en-forced', '.en-cc', '.zh-original', '.zh-orig', '.ja-original', '.ja-orig', '.en-us', '.en-gb', '.en-au', '.en-ca', '.zh-tw', '.zh-hk', '.zh-cn', '.ja-jp', '.ko-kr', '.en_us', '.en_gb', '.zh_tw', '.zh_hk', '.zh_cn', '.ja_jp', '.ko_kr', '.en', '.eng', '.ja', '.jp', '.ko', '.kr', '.zh', '.cht', '.chs', '.cn', '.tw', '.hk', '.chinese', '.han', '.zht', '.zhs'];
         let baseNoLang = base;
         for (const suf of langSuffixes) {
             if (base.endsWith(suf)) {
