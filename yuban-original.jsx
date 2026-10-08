@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.176 · subtitle-fill";
+const APP_VERSION = "v5.177 · echo-method";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7080,6 +7080,16 @@ export default function GeminiPlayer() {
     const [shadowRepeatInput, setShadowRepeatInput] = useState("3");
     const [isShadowInfinite, setIsShadowInfinite] = useState(false);
     const [isWaitingShadow, setIsWaitingShadow] = useState(false);
+    // Echo Method is deliberately separate from shadowing: hear a short source
+    // fragment, preserve silence for the inner echo, then imitate it unaided.
+    const [isEchoMode, setIsEchoMode] = useState(false);
+    const [echoBounds, setEchoBounds] = useState({ start: 0, end: 0 });
+    const [echoStart, setEchoStart] = useState(0);
+    const [echoEnd, setEchoEnd] = useState(0);
+    const [echoHasStart, setEchoHasStart] = useState(false);
+    const [echoHasEnd, setEchoHasEnd] = useState(false);
+    const [echoPhase, setEchoPhase] = useState('selecting'); // selecting | listening | ready
+    const [echoNotice, setEchoNotice] = useState("");
 
     // [FIX] REF for Logic, State for UI.
     const isWaitingShadowRef = useRef(false);
@@ -7916,6 +7926,12 @@ export default function GeminiPlayer() {
 
     const playerRef = useRef(null);
     const shadowTimerRef = useRef(null);
+    const echoModeRef = useRef(false);
+    const echoPhaseRef = useRef('selecting');
+    const echoStartRef = useRef(0);
+    const echoEndRef = useRef(0);
+    const echoOriginalRateRef = useRef(null);
+    const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
     const openedFolderHandleRef = useRef(null);
     const openedFolderNameRef = useRef("");
@@ -8108,6 +8124,150 @@ export default function GeminiPlayer() {
         timerTokenRef.current += 1;
         if (workerRef.current) workerRef.current.postMessage({ type: 'STOP_TIMER' });
     };
+
+    const clampEchoTime = (value, start = echoBounds.start, end = echoBounds.end) => {
+        const minimum = Number(start) || 0;
+        const maximum = Math.max(minimum, Number(end) || minimum);
+        return Math.max(minimum, Math.min(Number(value) || minimum, maximum));
+    };
+
+    const stopEchoMode = () => {
+        echoSessionTokenRef.current += 1;
+        echoModeRef.current = false;
+        echoPhaseRef.current = 'selecting';
+        cancelWorkerTimer();
+        isGapPausing.current = false;
+        const player = playerRef.current;
+        if (player) {
+            player.pause();
+            if (Number.isFinite(echoOriginalRateRef.current)) {
+                player.playbackRate = echoOriginalRateRef.current;
+                setPlaybackRate(echoOriginalRateRef.current);
+            }
+        }
+        echoOriginalRateRef.current = null;
+        setIsPlaying(false);
+        setIsEchoMode(false);
+        setEchoHasStart(false);
+        setEchoHasEnd(false);
+        setEchoNotice("");
+    };
+
+    const playEchoRangeOnce = (start = echoStartRef.current, end = echoEndRef.current) => {
+        const player = playerRef.current;
+        if (!player || end <= start) return;
+        echoSessionTokenRef.current += 1;
+        echoPhaseRef.current = 'listening';
+        setEchoPhase('listening');
+        setEchoNotice('播放完畢後會停止；請先聽腦中的回音，再自行覆誦。');
+        const originalRate = Number.isFinite(echoOriginalRateRef.current)
+            ? echoOriginalRateRef.current
+            : (Number(player.playbackRate) || playbackRate || 1);
+        player.playbackRate = originalRate;
+        setPlaybackRate(originalRate);
+        seekThenMaybePlay(start, true);
+        setIsPlaying(true);
+    };
+
+    const startEchoSelectionLoop = (rangeStart, rangeEnd) => {
+        const player = playerRef.current;
+        if (!player || rangeEnd <= rangeStart) return;
+        echoSessionTokenRef.current += 1;
+        echoModeRef.current = true;
+        echoPhaseRef.current = 'selecting';
+        echoStartRef.current = rangeStart;
+        echoEndRef.current = rangeEnd;
+        if (!Number.isFinite(echoOriginalRateRef.current)) {
+            echoOriginalRateRef.current = Number(player.playbackRate) || playbackRate || 1;
+        }
+        isGapPausing.current = false;
+        cancelWorkerTimer();
+        player.playbackRate = 0.5;
+        setPlaybackRate(0.5);
+        seekThenMaybePlay(rangeStart, true);
+        setIsPlaying(true);
+    };
+
+    const startEchoMode = () => {
+        const currentSub = subtitles[currentIndex];
+        const player = playerRef.current;
+        if (!player || !currentSub) {
+            setEchoNotice('請先載入影音與字幕，並選到要練習的一句。');
+            return;
+        }
+        const range = getBufferedRange(currentSub);
+        if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.end - range.start < 0.12) {
+            setEchoNotice('這一句的時間範圍太短，無法設定回音片段。');
+            return;
+        }
+        setEchoBounds(range);
+        setEchoStart(range.start);
+        setEchoEnd(range.end);
+        setEchoHasStart(false);
+        setEchoHasEnd(false);
+        setEchoPhase('selecting');
+        setEchoNotice('以 0.5 倍速循環播放中；在想要的起點按 A、終點按 B。');
+        setIsEchoMode(true);
+        startEchoSelectionLoop(range.start, range.end);
+    };
+
+    const setEchoPoint = (point, rawTime) => {
+        const player = playerRef.current;
+        const minLength = 0.08;
+        const time = clampEchoTime(rawTime);
+        let nextStart = echoStartRef.current;
+        let nextEnd = echoEndRef.current;
+        let hasStart = echoHasStart;
+        let hasEnd = echoHasEnd;
+        if (point === 'A') {
+            nextStart = Math.min(time, Math.max(echoBounds.start, nextEnd - minLength));
+            hasStart = true;
+        } else {
+            nextEnd = Math.max(time, Math.min(echoBounds.end, nextStart + minLength));
+            hasEnd = true;
+        }
+        echoStartRef.current = nextStart;
+        echoEndRef.current = nextEnd;
+        setEchoStart(nextStart);
+        setEchoEnd(nextEnd);
+        setEchoHasStart(hasStart);
+        setEchoHasEnd(hasEnd);
+        if (hasStart && hasEnd) {
+            playEchoRangeOnce(nextStart, nextEnd);
+        } else if (player) {
+            setEchoNotice(point === 'A' ? '已設定 A；請在終點按 B。' : '已設定 B；請在起點按 A。');
+            startEchoSelectionLoop(nextStart, nextEnd);
+        }
+    };
+
+    useEffect(() => {
+        const player = playerRef.current;
+        if (!isEchoMode || !player) return undefined;
+        const onEchoTimeUpdate = () => {
+            if (!echoModeRef.current) return;
+            const start = echoStartRef.current;
+            const end = echoEndRef.current;
+            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+            setCurrentTime(player.currentTime);
+            if (player.currentTime < end - 0.025) return;
+            if (echoPhaseRef.current === 'selecting') {
+                const token = ++echoSessionTokenRef.current;
+                player.currentTime = start;
+                player.play().then(() => {
+                    if (echoModeRef.current && echoPhaseRef.current === 'selecting' && token === echoSessionTokenRef.current) setIsPlaying(true);
+                }).catch(() => setIsPlaying(false));
+                return;
+            }
+            player.pause();
+            player.currentTime = end;
+            setIsPlaying(false);
+            echoPhaseRef.current = 'ready';
+            setEchoPhase('ready');
+            setEchoNotice('已播放完成。請先聽腦中的回音，再自行覆誦；需要時按「重聽」。');
+        };
+        player.addEventListener('timeupdate', onEchoTimeUpdate);
+        return () => player.removeEventListener('timeupdate', onEchoTimeUpdate);
+    }, [isEchoMode]);
 
     const seekThenMaybePlay = (targetTime, shouldPlay) => {
         const player = playerRef.current;
@@ -9233,6 +9393,7 @@ export default function GeminiPlayer() {
             subtitles,
             currentIndex,
             isShadowing,
+            isEchoMode,
             isWaitingShadowRef,
             loopMode,
             shadowGapAdjustment,
@@ -9248,7 +9409,7 @@ export default function GeminiPlayer() {
             getBufferedRange, // function
             playbackMode
         };
-    }, [isPlaying, subtitles, currentIndex, isShadowing, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, playbackMode]);
+    }, [isPlaying, subtitles, currentIndex, isShadowing, isEchoMode, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, playbackMode]);
 
     useEffect(() => {
         // Create Worker from Blob
@@ -9372,6 +9533,7 @@ export default function GeminiPlayer() {
             currentIndex,
             setCurrentIndex, // [FIX] Add setter for Flow Mode to update index without seeking
             isShadowing,
+            isEchoMode,
             isWaitingShadowRef,
             loopMode,
             shadowGapAdjustment,
@@ -9389,7 +9551,7 @@ export default function GeminiPlayer() {
             playbackMode,
             worker: workerRef.current
         };
-    }, [isPlaying, subtitles, currentIndex, isShadowing, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, isSmartMode, playbackMode]);
+    }, [isPlaying, subtitles, currentIndex, isShadowing, isEchoMode, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, isSmartMode, playbackMode]);
 
     // Re-implement the `onmessage` logic with correct Ref usage:
     useEffect(() => {
@@ -9400,10 +9562,13 @@ export default function GeminiPlayer() {
             const state = latestStateRef.current;
             if (!state || !state.player) return;
 
-            const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, playbackMode, worker } = state;
+            const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isEchoMode, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, playbackMode, worker } = state;
 
             if (type === 'TICK') {
                 if (!isPlaying || isGapPausingRef.current) return;
+                // Echo Method owns the A-B time range and must not trigger the
+                // normal subtitle-end pause/advance behavior.
+                if (isEchoMode) return;
 
                 // If conceptually waiting (shadow gap), ignore ticks
                 if (isShadowing && isWaitingShadowRef.current) return;
@@ -19553,8 +19718,56 @@ ${userQ}`;
                             <div className="flex justify-between text-[10px] font-mono text-gray-400 mt-1"><span>{formatTime(currentTime)}</span><span>{formatTime(duration)}</span></div>
                         </div>
 
+                        {isEchoMode && (
+                            <div className="mx-4 mb-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 shadow-sm">
+                                <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                                    <div>
+                                        <div className="flex items-center gap-1.5 text-xs font-bold text-violet-800"><Ear size={15} />回音法：短段聆聽</div>
+                                        <div className="text-[11px] text-violet-700 mt-0.5">{echoNotice}</div>
+                                    </div>
+                                    <button type="button" onClick={stopEchoMode} className="px-2.5 py-1 rounded-full border border-violet-300 bg-white text-[11px] font-bold text-violet-700 hover:bg-violet-100">結束回音法</button>
+                                </div>
+                                <input
+                                    type="range"
+                                    min={echoBounds.start}
+                                    max={echoBounds.end}
+                                    step="0.01"
+                                    value={clampEchoTime(currentTime)}
+                                    onInput={(e) => {
+                                        const next = clampEchoTime(parseFloat(e.currentTarget.value));
+                                        if (playerRef.current) playerRef.current.currentTime = next;
+                                        setCurrentTime(next);
+                                    }}
+                                    className="w-full h-2 rounded-lg appearance-none cursor-pointer accent-violet-600"
+                                    aria-label="回音法片段播放位置"
+                                />
+                                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">範圍 {formatTime(echoBounds.start)} – {formatTime(echoBounds.end)}</span>
+                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">A {echoHasStart ? formatTime(echoStart) : '未設定'}</span>
+                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">B {echoHasEnd ? formatTime(echoEnd) : '未設定'}</span>
+                                    {echoPhase === 'selecting' ? (
+                                        <>
+                                            <button type="button" onClick={() => setEchoPoint('A', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">A 設起點</button>
+                                            <button type="button" onClick={() => setEchoPoint('B', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">B 設終點</button>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">重聽一次</button>
+                                            <button type="button" onClick={() => {
+                                                setEchoHasStart(false);
+                                                setEchoHasEnd(false);
+                                                setEchoPhase('selecting');
+                                                setEchoNotice('重新以 0.5 倍速循環；在想要的起點按 A、終點按 B。');
+                                                startEchoSelectionLoop(echoStartRef.current, echoEndRef.current);
+                                            }} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 font-bold hover:bg-violet-100">重新選段</button>
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
                         <div className="flex flex-col gap-3 px-4 py-3 w-full md:flex-row md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
-                            <div className="flex flex-wrap items-center gap-3 pr-0 md:shrink-0 md:pr-4 md:border-r md:border-gray-100">
+                            <div className={`flex flex-wrap items-center gap-3 pr-0 md:shrink-0 md:pr-4 md:border-r md:border-gray-100 ${isEchoMode ? 'pointer-events-none opacity-40' : ''}`} aria-disabled={isEchoMode}>
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
                                 <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
@@ -19571,7 +19784,7 @@ ${userQ}`;
                             </div>
 
                             {/* SHADOWING UI */}
-                            <div className={`flex flex-wrap items-center gap-1 px-2 py-1.5 rounded-lg border transition-all ${isShadowing ? 'bg-yellow-50 border-yellow-200' : 'bg-transparent border-transparent'}`}>
+                            <div className={`flex flex-wrap items-center gap-1 px-2 py-1.5 rounded-lg border transition-all ${isEchoMode ? 'pointer-events-none opacity-40' : ''} ${isShadowing ? 'bg-yellow-50 border-yellow-200' : 'bg-transparent border-transparent'}`} aria-disabled={isEchoMode}>
                                 <button onClick={() => { setIsShadowing(!isShadowing); }} className={`flex flex-col items-center gap-0.5 font-bold ${isShadowing ? 'text-yellow-700' : 'text-gray-400'}`}><Mic size={14} /><span className="text-[9px]">跟讀</span></button>
 
                                 {isShadowing && (
@@ -19622,6 +19835,17 @@ ${userQ}`;
                                         </div>
                                     </div>
                                 )}
+                            </div>
+
+                            <div className={`flex flex-wrap items-center gap-1 px-2 py-1.5 rounded-lg border transition-all ${isEchoMode ? 'bg-violet-50 border-violet-200' : 'bg-transparent border-transparent'}`}>
+                                <button
+                                    type="button"
+                                    onClick={() => { if (isEchoMode) stopEchoMode(); else startEchoMode(); }}
+                                    title={isEchoMode ? '結束回音法，交回一般播放控制' : '回音法：0.5 倍速選 A-B，原速播放一次後停止'}
+                                    className={`flex flex-col items-center gap-0.5 font-bold ${isEchoMode ? 'text-violet-700' : 'text-gray-400'}`}
+                                >
+                                    <Ear size={14} /><span className="text-[9px]">回音法</span>
+                                </button>
                             </div>
 
                             <div className="flex flex-wrap items-center gap-2 w-full md:ml-auto md:w-auto">
