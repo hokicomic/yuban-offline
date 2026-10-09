@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.184 · srt-orig-pairing";
+const APP_VERSION = "v5.185 · mobile-compact-toolbar";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19797,7 +19797,7 @@ ${userQ}`;
                             </div>
                         )}
 
-                        <div className="flex flex-col gap-3 px-4 py-3 w-full md:flex-row md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
+                        <div className="flex flex-row flex-wrap items-center gap-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
                             <div className={`flex flex-wrap items-center gap-3 pr-0 md:shrink-0 md:pr-4 md:border-r md:border-gray-100 ${isEchoMode ? 'pointer-events-none opacity-40' : ''}`} aria-disabled={isEchoMode}>
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
@@ -19879,7 +19879,7 @@ ${userQ}`;
                                 </button>
                             </div>
 
-                            <div className="flex flex-wrap items-center gap-2 w-full md:ml-auto md:w-auto">
+                            <div className="flex flex-wrap items-center gap-2 ml-auto w-auto">
                                 <button data-ai-control onClick={() => handleAIText('correction')} className="flex items-center gap-1 px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"><CheckCircle size={16} className="text-blue-500" /><span className="text-xs font-medium text-gray-700">校正</span></button>
                                 <button data-ai-control onClick={() => handleAIText('explain')} className="flex items-center gap-1 px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"><BookOpen size={16} className="text-green-500" /><span className="text-xs font-medium text-gray-700">單字</span></button>
                                 <button data-ai-control onClick={() => handleAIText('deep')} className="flex items-center gap-1 px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"><AlertCircle size={16} className="text-purple-500" /><span className="text-xs font-medium text-gray-700">文法</span></button>
