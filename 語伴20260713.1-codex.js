@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.185 · mobile-compact-toolbar";
+const APP_VERSION = "v5.186 · collapsed-practice-controls";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19943,6 +19943,26 @@ ${userQ}`;
                                 </button>
                                 <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipForward size={16} />
+                                </button>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                                <button
+                                    type="button"
+                                    onClick={() => setIsShadowing(value => !value)}
+                                    className={`flex flex-col items-center justify-center px-2 py-1 rounded-lg ${isShadowing ? 'text-yellow-700 bg-yellow-50' : 'text-gray-500 hover:bg-gray-100'}`}
+                                    title="跟讀"
+                                    aria-label="跟讀"
+                                >
+                                    <Mic size={16} /><span className="text-[9px] leading-none mt-0.5">跟讀</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => { if (isEchoMode) stopEchoMode(); else startEchoMode(); }}
+                                    className={`flex flex-col items-center justify-center px-2 py-1 rounded-lg ${isEchoMode ? 'text-violet-700 bg-violet-50' : 'text-gray-500 hover:bg-gray-100'}`}
+                                    title="回音法"
+                                    aria-label="回音法"
+                                >
+                                    <Ear size={16} /><span className="text-[9px] leading-none mt-0.5">回音法</span>
                                 </button>
                             </div>
                             <div className="flex items-center gap-1 shrink-0">
