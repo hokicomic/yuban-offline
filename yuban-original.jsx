@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.189 · echo-only-panel";
+const APP_VERSION = "v5.190 · echo-panel-no-media-shrink";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19497,11 +19497,7 @@ ${userQ}`;
                     {/* VIDEO AREA */}
                     <div
                         className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 transition-all duration-300 ease-in-out shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
-                        style={!isVideoMasked ? {
-                            height: isEchoMode && isToolbarVisible
-                                ? `max(12rem, calc(${embeddedKnowledgePanelHeight}vh - ${echoToolbarHeight}px))`
-                                : `${embeddedKnowledgePanelHeight}vh`
-                        } : undefined}
+                        style={!isVideoMasked ? { height: `${embeddedKnowledgePanelHeight}vh` } : undefined}
                     >
                         {/* [FIX] Removed manual onTimeUpdate, relying on Worker tick */}
                         <video ref={playerRef} src={mediaSrc}
