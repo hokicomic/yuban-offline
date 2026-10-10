@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.188 · echo-layout-reserve";
+const APP_VERSION = "v5.189 · echo-only-panel";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19771,7 +19771,7 @@ ${userQ}`;
                 {/* FIXED BOTTOM TOOLBAR */}
                 {isToolbarVisible && (
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white border-t border-gray-200 z-50 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
-                        <div className="px-4 pt-3 pb-1">
+                        {!isEchoMode && <div className="px-4 pt-3 pb-1">
                             <input type="range" min="0" max={duration || 0} value={currentTime}
                                 onInput={handleProgressInput}
                                 onChange={handleProgressInput}
@@ -19783,7 +19783,7 @@ ${userQ}`;
                                 }}
                                 className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
                             <div className="flex justify-between text-[10px] font-mono text-gray-400 mt-1"><span>{formatTime(currentTime)}</span><span>{formatTime(duration)}</span></div>
-                        </div>
+                        </div>}
 
                         {isEchoMode && (
                             <div className="mx-4 mb-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 shadow-sm">
@@ -19874,7 +19874,7 @@ ${userQ}`;
                             </div>
                         )}
 
-                        <div className="flex flex-row flex-wrap items-center gap-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
+                        {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
                             <div className={`flex flex-wrap items-center gap-3 pr-0 md:shrink-0 md:pr-4 md:border-r md:border-gray-100 ${isEchoMode ? 'pointer-events-none opacity-40' : ''}`} aria-disabled={isEchoMode}>
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
@@ -20003,12 +20003,12 @@ ${userQ}`;
                                     <span className="text-[10px] font-medium text-gray-600 whitespace-nowrap">{progressStatusText}</span>
                                 </div>
                             </div>
-                        </div>
+                        </div>}
                     </div>
                 )}
 
                 {/* COLLAPSED MINI PLAYER ROW (keep playback controls visible) */}
-                {!isToolbarVisible && (
+                {!isToolbarVisible && !isEchoMode && (
                     <div className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
                         <div className="px-3 py-2 flex items-center justify-between gap-2">
                             <div className="flex items-center gap-2 min-w-0">
@@ -20068,11 +20068,11 @@ ${userQ}`;
                         {isHeaderVisible ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                     </button>
                 </div>
-                <div className={`fixed ${isToolbarVisible ? 'bottom-24' : 'bottom-16'} right-1 md:right-2 z-[80] flex flex-col gap-1.5 pointer-events-auto`}>
+                {!isEchoMode && <div className={`fixed ${isToolbarVisible ? 'bottom-24' : 'bottom-16'} right-1 md:right-2 z-[80] flex flex-col gap-1.5 pointer-events-auto`}>
                     <button onClick={() => setIsToolbarVisible(!isToolbarVisible)} className="p-1.5 bg-black/70 backdrop-blur border border-black/20 text-white rounded-full shadow-lg hover:bg-black/80 transition-colors" title="下方控制列">
                         {isToolbarVisible ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
                     </button>
-                </div>
+                </div>}
 
                 {/* FABs */}
                 <div className="fixed bottom-36 right-6 z-[60] flex flex-col gap-3 items-end pointer-events-auto">
