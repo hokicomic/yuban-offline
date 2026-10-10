@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.186 · collapsed-practice-controls";
+const APP_VERSION = "v5.187 · remove-swipe-tutor";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7907,7 +7907,6 @@ export default function GeminiPlayer() {
         showModal
     ]);
 
-    const touchStartRef = useRef(null);
     const lastUserSeekValueRef = useRef(0);
 
     const addToAudioCache = useCallback((text, url) => {
@@ -16617,13 +16616,6 @@ ${userQ}`;
         } catch (e) { isGeneratingRef.current = false; startLiveRecording(streamRef.current); }
     };
 
-    const onTouchStart = (e) => { touchStartRef.current = e.targetTouches[0].clientX; };
-    const onTouchEnd = (e) => {
-        if (!touchStartRef.current) return;
-        if (touchStartRef.current - e.changedTouches[0].clientX > 50 && !showModal) handleVoiceTutor();
-        touchStartRef.current = null;
-    };
-
     const targetKey = `${currentTrackIndex}-${currentIndex}`;
     const targetFixText = targetFixCache[targetKey] || "";
     const targetSentenceHtml = renderTargetSentenceHtml(smartTargetDisplay, targetFixText);
@@ -19228,7 +19220,7 @@ ${userQ}`;
 
     return (
         <AudioCacheContext.Provider value={{ cache: audioCache, addToCache: addToAudioCache, currentKey: currentApiKey, trackLanguage: trackLanguage, preferredVoice: preferredVoice, globalAudioRef }}>
-            <div className="bg-gray-50 text-gray-800 flex flex-col font-sans h-screen overflow-hidden" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+            <div className="bg-gray-50 text-gray-800 flex flex-col font-sans h-screen overflow-hidden">
                 {/* [HEADER] */}
                 {isHeaderVisible && (
                     <header className="bg-white border-b border-gray-200 shadow-sm z-30 transition-all duration-300">

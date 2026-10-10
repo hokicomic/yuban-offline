@@ -35,6 +35,20 @@ test('source punctuation does not make an unfinished trailing fragment into a se
     }
 });
 
+test('preserves punctuation from the Bourne LRC cue format', () => {
+    const result = split([
+        cue(0, 8, 'The Born Identity by Robert Ludlam, read by Scott Brick.'),
+        cue(8, 11, 'Preface.'),
+        cue(11, 17, 'The New York Times, Friday, July 11, 1975. Front page.')
+    ]);
+    assert.equal(JSON.stringify(result.map(({ text }) => text)), JSON.stringify([
+        'The Born Identity by Robert Ludlam, read by Scott Brick.',
+        'Preface.',
+        'The New York Times, Friday, July 11, 1975.',
+        'Front page.'
+    ]));
+});
+
 test('an observed cue boundary survives nonuniform speaking rates', () => {
     const result = split([cue(0, 10, 'He spoke very slowly'),
         cue(10, 12, 'and stopped. Next thought.')]);
