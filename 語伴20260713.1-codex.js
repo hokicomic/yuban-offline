@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.187 · remove-swipe-tutor";
+const APP_VERSION = "v5.188 · echo-layout-reserve";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7034,6 +7034,7 @@ export default function GeminiPlayer() {
     const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
     const [isHeaderVisible, setIsHeaderVisible] = useState(true);
     const [isToolbarVisible, setIsToolbarVisible] = useState(true);
+    const [echoToolbarHeight, setEchoToolbarHeight] = useState(0);
     const [mockMode, setMockMode] = useState(false);
     const [learnerLevel, setLearnerLevel] = useState(5);
 
@@ -7054,6 +7055,7 @@ export default function GeminiPlayer() {
     const [echoHasEnd, setEchoHasEnd] = useState(false);
     const [echoPhase, setEchoPhase] = useState('selecting'); // selecting | listening | ready
     const [echoNotice, setEchoNotice] = useState("");
+    const fixedToolbarRef = useRef(null);
 
     // [FIX] REF for Logic, State for UI.
     const isWaitingShadowRef = useRef(false);
@@ -19158,6 +19160,27 @@ ${userQ}`;
     }, [topPanelMode]);
 
     useEffect(() => {
+        const toolbar = fixedToolbarRef.current;
+        if (!toolbar || !isEchoMode || !isToolbarVisible) {
+            setEchoToolbarHeight(0);
+            return undefined;
+        }
+        const updateToolbarHeight = () => {
+            setEchoToolbarHeight(Math.ceil(toolbar.getBoundingClientRect().height));
+        };
+        updateToolbarHeight();
+        const observer = typeof ResizeObserver !== 'undefined'
+            ? new ResizeObserver(updateToolbarHeight)
+            : null;
+        observer?.observe(toolbar);
+        window.addEventListener('resize', updateToolbarHeight);
+        return () => {
+            observer?.disconnect();
+            window.removeEventListener('resize', updateToolbarHeight);
+        };
+    }, [isEchoMode, isToolbarVisible]);
+
+    useEffect(() => {
         setIsVideoMasked(true);
         setTopPanelMode(isAudioOnlyTrack ? 'document' : 'media');
         setEmbeddedKnowledgeText("");
@@ -19412,11 +19435,18 @@ ${userQ}`;
                 )}
 
                 {/* MAIN CONTENT AREA */}
-                <div className="flex-1 min-h-0 flex flex-col items-center justify-start px-4 pt-4 pb-0 overflow-hidden w-full">
+                <div
+                    className="flex-1 min-h-0 flex flex-col items-center justify-start px-4 pt-4 overflow-hidden w-full"
+                    style={isEchoMode && isToolbarVisible ? { paddingBottom: `${echoToolbarHeight}px` } : undefined}
+                >
                     {/* VIDEO AREA */}
                     <div
                         className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 transition-all duration-300 ease-in-out shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
-                        style={!isVideoMasked ? { height: `${embeddedKnowledgePanelHeight}vh` } : undefined}
+                        style={!isVideoMasked ? {
+                            height: isEchoMode && isToolbarVisible
+                                ? `max(12rem, calc(${embeddedKnowledgePanelHeight}vh - ${echoToolbarHeight}px))`
+                                : `${embeddedKnowledgePanelHeight}vh`
+                        } : undefined}
                     >
                         {/* [FIX] Removed manual onTimeUpdate, relying on Worker tick */}
                         <video ref={playerRef} src={mediaSrc}
@@ -19685,7 +19715,7 @@ ${userQ}`;
 
                 {/* FIXED BOTTOM TOOLBAR */}
                 {isToolbarVisible && (
-                    <div className="fixed bottom-0 left-0 w-full bg-white border-t border-gray-200 z-50 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
+                    <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white border-t border-gray-200 z-50 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
                         <div className="px-4 pt-3 pb-1">
                             <input type="range" min="0" max={duration || 0} value={currentTime}
                                 onInput={handleProgressInput}
