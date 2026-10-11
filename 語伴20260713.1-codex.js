@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.192 · echo-extended-drag-range";
+const APP_VERSION = "v5.193 · echo-original-boundary-markers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19724,8 +19724,20 @@ ${userQ}`;
                                     </div>
                                     <button type="button" onClick={stopEchoMode} className="px-2.5 py-1 rounded-full border border-violet-300 bg-white text-[11px] font-bold text-violet-700 hover:bg-violet-100">結束回音法</button>
                                 </div>
-                                <div ref={echoTimelineRef} className="relative h-9 touch-none select-none" aria-label="回音法 A-B 片段進度條">
+                                <div ref={echoTimelineRef} className="relative h-16 touch-none select-none" aria-label="回音法 A-B 片段進度條">
                                     <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-200" />
+                                    {['start', 'end'].map((edge) => (
+                                        <div
+                                            key={edge}
+                                            className="absolute inset-y-0 z-[15] pointer-events-none"
+                                            style={{ left: `${((echoOriginalBoundsRef.current[edge] - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                        >
+                                            <span className={`absolute top-0 whitespace-nowrap rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-bold text-white ${edge === 'end' ? '-translate-x-full' : ''}`}>
+                                                {edge === 'start' ? '原起點' : '原終點'}
+                                            </span>
+                                            <span className="absolute top-6 bottom-1 -translate-x-1/2 border-l-2 border-dashed border-slate-800" />
+                                        </div>
+                                    ))}
                                     <div
                                         className="absolute top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-600"
                                         style={{
@@ -19775,6 +19787,8 @@ ${userQ}`;
                                 </div>
                                 <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">範圍 {formatTime(echoBounds.start)} – {formatTime(echoBounds.end)}</span>
+                                    <span className="rounded bg-slate-100 px-2 py-1 border border-slate-300 text-slate-800">原段 {formatTime(echoOriginalBoundsRef.current.start)} – {formatTime(echoOriginalBoundsRef.current.end)}</span>
+                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">前延伸 {Math.max(0, echoOriginalBoundsRef.current.start - echoStart).toFixed(2)}s · 後延伸 {Math.max(0, echoEnd - echoOriginalBoundsRef.current.end).toFixed(2)}s</span>
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">A {echoHasStart ? formatTime(echoStart) : '未設定'}</span>
                                     <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">B {echoHasEnd ? formatTime(echoEnd) : '未設定'}</span>
                                     {echoPhase === 'selecting' ? (
