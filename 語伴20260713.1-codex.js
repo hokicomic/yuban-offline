@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.191 · echo-respect-playback-speed";
+const APP_VERSION = "v5.192 · echo-extended-drag-range";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7894,6 +7894,7 @@ export default function GeminiPlayer() {
     const echoHasStartRef = useRef(false);
     const echoHasEndRef = useRef(false);
     const echoTimelineRef = useRef(null);
+    const echoOriginalBoundsRef = useRef({ start: 0, end: 0 });
     const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
     const openedFolderHandleRef = useRef(null);
@@ -8151,7 +8152,14 @@ export default function GeminiPlayer() {
             setEchoNotice('這一句的時間範圍太短，無法設定回音片段。');
             return;
         }
-        setEchoBounds(range);
+        echoOriginalBoundsRef.current = { start: range.start, end: range.end };
+        const mediaDuration = Number(player.duration) || Number(duration);
+        setEchoBounds({
+            start: Math.max(0, range.start - 3),
+            end: Number.isFinite(mediaDuration) && mediaDuration > 0
+                ? Math.min(mediaDuration, range.end + 3)
+                : range.end + 3
+        });
         setEchoStart(range.start);
         setEchoEnd(range.end);
         setEchoHasStart(false);
@@ -8167,7 +8175,8 @@ export default function GeminiPlayer() {
     const setEchoPoint = (point, rawTime, action = 'confirm') => {
         const player = playerRef.current;
         const minLength = 0.08;
-        const time = clampEchoTime(rawTime);
+        const pointBounds = action === 'adjust' ? echoBounds : echoOriginalBoundsRef.current;
+        const time = clampEchoTime(rawTime, pointBounds.start, pointBounds.end);
         let nextStart = echoStartRef.current;
         let nextEnd = echoEndRef.current;
         let hasStart = echoHasStartRef.current;
@@ -19783,11 +19792,11 @@ ${userQ}`;
                                                 setEchoNotice('依上方設定的語速循環；在起點按 A、終點按 B，之後可拖曳標記微調。');
                                                 // Restart from the complete subtitle range, not the
                                                 // previously selected A-B segment.
-                                                setEchoStart(echoBounds.start);
-                                                setEchoEnd(echoBounds.end);
+                                                setEchoStart(echoOriginalBoundsRef.current.start);
+                                                setEchoEnd(echoOriginalBoundsRef.current.end);
                                                 echoHasStartRef.current = false;
                                                 echoHasEndRef.current = false;
-                                                startEchoSelectionLoop(echoBounds.start, echoBounds.end);
+                                                startEchoSelectionLoop(echoOriginalBoundsRef.current.start, echoOriginalBoundsRef.current.end);
                                             }} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 font-bold hover:bg-violet-100">重新選段</button>
                                         </>
                                     )}
