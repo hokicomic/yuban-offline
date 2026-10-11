@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.190 · echo-panel-no-media-shrink";
+const APP_VERSION = "v5.191 · echo-respect-playback-speed";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7934,7 +7934,6 @@ export default function GeminiPlayer() {
     const echoHasStartRef = useRef(false);
     const echoHasEndRef = useRef(false);
     const echoTimelineRef = useRef(null);
-    const echoOriginalRateRef = useRef(null);
     const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
     const openedFolderHandleRef = useRef(null);
@@ -8144,12 +8143,7 @@ export default function GeminiPlayer() {
         const player = playerRef.current;
         if (player) {
             player.pause();
-            if (Number.isFinite(echoOriginalRateRef.current)) {
-                player.playbackRate = echoOriginalRateRef.current;
-                setPlaybackRate(echoOriginalRateRef.current);
-            }
         }
-        echoOriginalRateRef.current = null;
         setIsPlaying(false);
         setIsEchoMode(false);
         setEchoHasStart(false);
@@ -8166,11 +8160,6 @@ export default function GeminiPlayer() {
         echoPhaseRef.current = 'listening';
         setEchoPhase('listening');
         setEchoNotice('播放完畢後會停止；請先聽腦中的回音，再自行覆誦。');
-        const originalRate = Number.isFinite(echoOriginalRateRef.current)
-            ? echoOriginalRateRef.current
-            : (Number(player.playbackRate) || playbackRate || 1);
-        player.playbackRate = originalRate;
-        setPlaybackRate(originalRate);
         seekThenMaybePlay(start, true);
         setIsPlaying(true);
     };
@@ -8183,15 +8172,9 @@ export default function GeminiPlayer() {
         echoPhaseRef.current = 'selecting';
         echoStartRef.current = rangeStart;
         echoEndRef.current = rangeEnd;
-        if (!Number.isFinite(echoOriginalRateRef.current)) {
-            echoOriginalRateRef.current = Number(player.playbackRate) || playbackRate || 1;
-        }
         isGapPausing.current = false;
         cancelWorkerTimer();
-        // Selection uses the learner's normal rate.  The draggable A/B markers
-        // provide precision without distorting the natural sound and rhythm.
-        player.playbackRate = echoOriginalRateRef.current;
-        setPlaybackRate(echoOriginalRateRef.current);
+        // Preserve the speed selected in the header throughout echo practice.
         seekThenMaybePlay(rangeStart, true);
         setIsPlaying(true);
     };
@@ -8216,7 +8199,7 @@ export default function GeminiPlayer() {
         echoHasStartRef.current = false;
         echoHasEndRef.current = false;
         setEchoPhase('selecting');
-        setEchoNotice('以原播放速度循環；在想要的起點按 A、終點按 B，之後可拖曳標記微調。');
+        setEchoNotice('依上方設定的語速循環；在起點按 A、終點按 B，之後可拖曳標記微調。');
         setIsEchoMode(true);
         startEchoSelectionLoop(range.start, range.end);
     };
@@ -8249,9 +8232,6 @@ export default function GeminiPlayer() {
                 playEchoRangeOnce(nextStart, nextEnd);
             } else if (player) {
                 player.pause();
-                const originalRate = Number.isFinite(echoOriginalRateRef.current) ? echoOriginalRateRef.current : playbackRate;
-                player.playbackRate = originalRate;
-                setPlaybackRate(originalRate);
                 setIsPlaying(false);
                 echoPhaseRef.current = 'ready';
                 setEchoPhase('ready');
@@ -19855,7 +19835,7 @@ ${userQ}`;
                                                 setEchoHasStart(false);
                                                 setEchoHasEnd(false);
                                                 setEchoPhase('selecting');
-                                                setEchoNotice('重新以原播放速度循環；在想要的起點按 A、終點按 B，之後可拖曳標記微調。');
+                                                setEchoNotice('依上方設定的語速循環；在起點按 A、終點按 B，之後可拖曳標記微調。');
                                                 // Restart from the complete subtitle range, not the
                                                 // previously selected A-B segment.
                                                 setEchoStart(echoBounds.start);
@@ -19945,7 +19925,7 @@ ${userQ}`;
                                 <button
                                     type="button"
                                     onClick={() => { if (isEchoMode) stopEchoMode(); else startEchoMode(); }}
-                                    title={isEchoMode ? '結束回音法，交回一般播放控制' : '回音法：0.5 倍速選 A-B，原速播放一次後停止'}
+                                    title={isEchoMode ? '結束回音法，交回一般播放控制' : '回音法：依設定語速選 A-B，播放一次後停止'}
                                     className={`flex flex-col items-center gap-0.5 font-bold ${isEchoMode ? 'text-violet-700' : 'text-gray-400'}`}
                                 >
                                     <Ear size={14} /><span className="text-[9px]">回音法</span>
