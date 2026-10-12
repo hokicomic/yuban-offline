@@ -36,9 +36,23 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         context.currentIndex = 1;
         const next = { id: 2, start: 20, end: 25, text: 'Next.' };
         context.subtitles.push(next);
+        // Seeking the next cue happens before React updates currentIndex.
+        assert.equal(api.getBufferedRange(next).start, 23);
         effects[0]();
         assert.equal(api.sentenceRangeRef.current.sub, next);
-        assert.equal(api.getBufferedRange(next).start, 20);
+        assert.equal(api.getBufferedRange(next).start, 23);
         assert.equal(api.getBufferedRange(next).end, 25);
+        // An earlier B carries the same negative offset into the next A.
+        api.sentenceRangeRef.current.end = 24.5;
+        const third = { id: 3, start: 25, end: 30, text: 'Third.' };
+        context.subtitles.push(third);
+        assert.equal(api.getBufferedRange(third).start, 24.5);
+        context.currentIndex = 2;
+        effects[0]();
+        assert.equal(api.getBufferedRange(third).start, 24.5);
+        // Do not transfer another track's timing correction.
+        context.currentTrackIndex = 1;
+        effects[0]();
+        assert.equal(api.getBufferedRange(third).start, 25);
     });
 }

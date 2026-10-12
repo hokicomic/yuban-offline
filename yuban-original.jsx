@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.195 · collapsed-sentence-timeline";
+const APP_VERSION = "v5.196 · carry-sentence-boundary-offset";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7956,10 +7956,26 @@ export default function GeminiPlayer() {
     const sentenceDragRef = useRef(null);
     const [, refreshSentenceRange] = useState(0);
 
+    const resolveSentenceRange = (sub) => {
+        const previous = sentenceRangeRef.current;
+        if (previous?.sub === sub && previous.track === currentTrackIndex) return previous;
+        const index = subtitles.indexOf(sub);
+        const carriesPreviousEnd = previous?.track === currentTrackIndex
+            && index > 0 && subtitles[index - 1] === previous.sub;
+        const offset = carriesPreviousEnd ? previous.end - Number(previous.sub.end) : 0;
+        const originalStart = Math.max(0, Number(sub.start) || 0);
+        const end = Number(sub.end) || originalStart;
+        return {
+            sub, track: currentTrackIndex,
+            start: Math.max(0, originalStart - 3, Math.min(originalStart + offset, originalStart + 3, end - 0.08)),
+            end
+        };
+    };
+
     useEffect(() => {
         const sub = subtitles[currentIndex];
         sentenceRangeRef.current = playbackMode === 'sentence' && sub
-            ? { sub, start: Math.max(0, Number(sub.start) || 0), end: Number(sub.end) || 0 }
+            ? resolveSentenceRange(sub)
             : null;
         refreshSentenceRange(value => value + 1);
     }, [currentTrackIndex, currentIndex, subtitles, playbackMode]);
@@ -7979,7 +7995,7 @@ export default function GeminiPlayer() {
         if (!sentenceSub || !rect?.width) return;
         const time = sentenceTimelineStart + Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * (sentenceTimelineEnd - sentenceTimelineStart);
         const previous = sentenceRangeRef.current?.sub === sentenceSub ? sentenceRangeRef.current : sentenceSelectedRange;
-        const range = { sub: sentenceSub, start: previous.start, end: previous.end };
+        const range = { ...previous, sub: sentenceSub, track: currentTrackIndex, start: previous.start, end: previous.end };
         if (point === 'A') range.start = Math.max(sentenceTimelineStart, Math.min(time, range.end - 0.08));
         else range.end = Math.min(sentenceTimelineEnd, Math.max(time, range.start + 0.08));
         sentenceRangeRef.current = range;
@@ -7988,8 +8004,9 @@ export default function GeminiPlayer() {
 
     const getBufferedRange = (sub) => {
         if (!sub) return { start: 0, end: 0 };
-        if (playbackMode === 'sentence' && !echoModeRef.current && sentenceRangeRef.current?.sub === sub) {
-            return { start: sentenceRangeRef.current.start, end: sentenceRangeRef.current.end };
+        if (playbackMode === 'sentence' && !echoModeRef.current) {
+            const range = resolveSentenceRange(sub);
+            return { start: range.start, end: range.end };
         }
         const pad = Math.max(0, Number(timePadding) || 0);
         const baseEnd = Number(sub.end || 0);
