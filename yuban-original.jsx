@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.194 · sentence-ab-timeline";
+const APP_VERSION = "v5.195 · collapsed-sentence-timeline";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19240,7 +19240,7 @@ ${userQ}`;
 
     useEffect(() => {
         const toolbar = fixedToolbarRef.current;
-        if (!toolbar || (!isEchoMode && playbackMode !== 'sentence') || !isToolbarVisible) {
+        if (!toolbar || (!isEchoMode && playbackMode !== 'sentence')) {
             setEchoToolbarHeight(0);
             return undefined;
         }
@@ -19267,6 +19267,58 @@ ${userQ}`;
         setEmbeddedKnowledgeError("");
         setEmbeddedKnowledgeLoading(false);
     }, [currentTrackIndex, isAudioOnlyTrack]);
+
+    const renderSentenceTimeline = () => (
+        <>
+                        {playbackMode === 'sentence' && !isEchoMode && sentenceSub && (
+                            <div className="mx-4 mt-2" aria-label="單句 A-B 播放範圍">
+                                <div ref={sentenceTimelineRef} className="relative h-14 touch-none select-none">
+                                    <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-200" />
+                                    <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-600" style={{ left: sentencePosition(sentenceSelectedRange.start), width: `${Math.max(0, (sentenceSelectedRange.end - sentenceSelectedRange.start) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100)}%` }} />
+                                    {['start', 'end'].map(edge => (
+                                        <div key={edge} className="absolute inset-y-0 z-[15] pointer-events-none" style={{ left: sentencePosition(edge === 'start' ? sentenceOriginalStart : sentenceOriginalEnd) }}>
+                                            <span className={`absolute top-0 whitespace-nowrap rounded bg-slate-800 px-1 text-[10px] font-bold text-white ${edge === 'end' ? '-translate-x-full' : ''}`}>{edge === 'start' ? '原起點' : '原終點'}</span>
+                                            <span className="absolute top-5 bottom-0 -translate-x-1/2 border-l-2 border-dashed border-slate-800" />
+                                        </div>
+                                    ))}
+                                    <div className="absolute z-[15] top-1/2 h-6 w-0.5 -translate-x-1/2 -translate-y-1/2 bg-amber-400 pointer-events-none" style={{ left: sentencePosition(currentTime) }} />
+                                    {['A', 'B'].map(point => (
+                                        <button key={point} type="button" aria-label={point === 'A' ? '拖曳單句播放起點 A' : '拖曳單句播放終點 B'}
+                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                            style={{ left: sentencePosition(point === 'A' ? sentenceSelectedRange.start : sentenceSelectedRange.end) }}
+                                            onPointerDown={event => {
+                                                event.preventDefault();
+                                                event.currentTarget.setPointerCapture(event.pointerId);
+                                                sentenceDragRef.current = { point, playing: Boolean(playerRef.current && !playerRef.current.paused) };
+                                                playerRef.current?.pause();
+                                                cancelWorkerTimer();
+                                                resetShadowStateForSeek();
+                                                setIsPlaying(false);
+                                                adjustSentenceMarker(point, event);
+                                            }}
+                                            onPointerMove={event => {
+                                                if (event.currentTarget.hasPointerCapture(event.pointerId)) adjustSentenceMarker(point, event);
+                                            }}
+                                            onPointerUp={event => {
+                                                if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+                                                event.currentTarget.releasePointerCapture(event.pointerId);
+                                                const resume = sentenceDragRef.current?.playing;
+                                                sentenceDragRef.current = null;
+                                                const range = sentenceRangeRef.current;
+                                                if (range && playerRef.current) {
+                                                    seekThenMaybePlay(range.start, Boolean(resume));
+                                                    setCurrentTime(range.start);
+                                                    setIsPlaying(Boolean(resume));
+                                                }
+                                            }}
+                                            onPointerCancel={() => { sentenceDragRef.current = null; }}
+                                        >{point}</button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+        </>
+    );
 
     return (
         <AudioCacheContext.Provider value={{ cache: audioCache, addToCache: addToAudioCache, currentKey: currentApiKey, trackLanguage: trackLanguage, preferredVoice: preferredVoice, globalAudioRef }}>
@@ -19519,7 +19571,7 @@ ${userQ}`;
                 {/* MAIN CONTENT AREA */}
                 <div
                     className="flex-1 min-h-0 flex flex-col items-center justify-start px-4 pt-4 overflow-hidden w-full"
-                    style={(isEchoMode || playbackMode === 'sentence') && isToolbarVisible ? { paddingBottom: `${echoToolbarHeight}px` } : undefined}
+                    style={isEchoMode || playbackMode === 'sentence' ? { paddingBottom: `${echoToolbarHeight}px` } : undefined}
                 >
                     {/* VIDEO AREA */}
                     <div
@@ -19794,53 +19846,7 @@ ${userQ}`;
                 {/* FIXED BOTTOM TOOLBAR */}
                 {isToolbarVisible && (
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white border-t border-gray-200 z-50 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
-                        {playbackMode === 'sentence' && !isEchoMode && sentenceSub && (
-                            <div className="mx-4 mt-2" aria-label="單句 A-B 播放範圍">
-                                <div ref={sentenceTimelineRef} className="relative h-14 touch-none select-none">
-                                    <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-200" />
-                                    <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-600" style={{ left: sentencePosition(sentenceSelectedRange.start), width: `${Math.max(0, (sentenceSelectedRange.end - sentenceSelectedRange.start) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100)}%` }} />
-                                    {['start', 'end'].map(edge => (
-                                        <div key={edge} className="absolute inset-y-0 z-[15] pointer-events-none" style={{ left: sentencePosition(edge === 'start' ? sentenceOriginalStart : sentenceOriginalEnd) }}>
-                                            <span className={`absolute top-0 whitespace-nowrap rounded bg-slate-800 px-1 text-[10px] font-bold text-white ${edge === 'end' ? '-translate-x-full' : ''}`}>{edge === 'start' ? '原起點' : '原終點'}</span>
-                                            <span className="absolute top-5 bottom-0 -translate-x-1/2 border-l-2 border-dashed border-slate-800" />
-                                        </div>
-                                    ))}
-                                    <div className="absolute z-[15] top-1/2 h-6 w-0.5 -translate-x-1/2 -translate-y-1/2 bg-amber-400 pointer-events-none" style={{ left: sentencePosition(currentTime) }} />
-                                    {['A', 'B'].map(point => (
-                                        <button key={point} type="button" aria-label={point === 'A' ? '拖曳單句播放起點 A' : '拖曳單句播放終點 B'}
-                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
-                                            style={{ left: sentencePosition(point === 'A' ? sentenceSelectedRange.start : sentenceSelectedRange.end) }}
-                                            onPointerDown={event => {
-                                                event.preventDefault();
-                                                event.currentTarget.setPointerCapture(event.pointerId);
-                                                sentenceDragRef.current = { point, playing: Boolean(playerRef.current && !playerRef.current.paused) };
-                                                playerRef.current?.pause();
-                                                cancelWorkerTimer();
-                                                resetShadowStateForSeek();
-                                                setIsPlaying(false);
-                                                adjustSentenceMarker(point, event);
-                                            }}
-                                            onPointerMove={event => {
-                                                if (event.currentTarget.hasPointerCapture(event.pointerId)) adjustSentenceMarker(point, event);
-                                            }}
-                                            onPointerUp={event => {
-                                                if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
-                                                event.currentTarget.releasePointerCapture(event.pointerId);
-                                                const resume = sentenceDragRef.current?.playing;
-                                                sentenceDragRef.current = null;
-                                                const range = sentenceRangeRef.current;
-                                                if (range && playerRef.current) {
-                                                    seekThenMaybePlay(range.start, Boolean(resume));
-                                                    setCurrentTime(range.start);
-                                                    setIsPlaying(Boolean(resume));
-                                                }
-                                            }}
-                                            onPointerCancel={() => { sentenceDragRef.current = null; }}
-                                        >{point}</button>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
+                        {renderSentenceTimeline()}
                         {!isEchoMode && <div className="px-4 pt-3 pb-1">
                             <input type="range" min="0" max={duration || 0} value={currentTime}
                                 onInput={handleProgressInput}
@@ -20093,7 +20099,8 @@ ${userQ}`;
 
                 {/* COLLAPSED MINI PLAYER ROW (keep playback controls visible) */}
                 {!isToolbarVisible && !isEchoMode && (
-                    <div className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
+                    <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
+                        {renderSentenceTimeline()}
                         <div className="px-3 py-2 flex items-center justify-between gap-2">
                             <div className="flex items-center gap-2 min-w-0">
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
