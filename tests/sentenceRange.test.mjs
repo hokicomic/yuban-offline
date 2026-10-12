@@ -41,18 +41,21 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         effects[0]();
         assert.equal(api.sentenceRangeRef.current.sub, next);
         assert.equal(api.getBufferedRange(next).start, 23);
-        assert.equal(api.getBufferedRange(next).end, 25);
+        assert.equal(api.getBufferedRange(next).end, 28);
         // An earlier B carries the same negative offset into the next A.
         api.sentenceRangeRef.current.end = 24.5;
         const third = { id: 3, start: 25, end: 30, text: 'Third.' };
         context.subtitles.push(third);
         assert.equal(api.getBufferedRange(third).start, 24.5);
+        assert.equal(api.getBufferedRange(third).end, 29.5);
         context.currentIndex = 2;
         effects[0]();
         assert.equal(api.getBufferedRange(third).start, 24.5);
+        assert.equal(api.getBufferedRange(third).end, 29.5);
         // Do not transfer another track's timing correction.
         context.currentTrackIndex = 1;
         effects[0]();
         assert.equal(api.getBufferedRange(third).start, 25);
+        assert.equal(api.getBufferedRange(third).end, 30);
     });
 }

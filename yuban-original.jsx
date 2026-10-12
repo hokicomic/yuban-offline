@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.196 · carry-sentence-boundary-offset";
+const APP_VERSION = "v5.197 · shift-sentence-ab-together";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7965,10 +7965,12 @@ export default function GeminiPlayer() {
         const offset = carriesPreviousEnd ? previous.end - Number(previous.sub.end) : 0;
         const originalStart = Math.max(0, Number(sub.start) || 0);
         const end = Number(sub.end) || originalStart;
+        const mediaEnd = Number(duration) > 0 ? Number(duration) : Infinity;
+        const shift = Math.max(-3, -originalStart, Math.min(offset, 3, mediaEnd - end));
         return {
             sub, track: currentTrackIndex,
-            start: Math.max(0, originalStart - 3, Math.min(originalStart + offset, originalStart + 3, end - 0.08)),
-            end
+            start: originalStart + shift,
+            end: end + shift
         };
     };
 
