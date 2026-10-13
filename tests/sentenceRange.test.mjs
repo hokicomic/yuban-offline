@@ -52,6 +52,19 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         effects[0]();
         assert.equal(api.getBufferedRange(third).start, 24.5);
         assert.equal(api.getBufferedRange(third).end, 29.5);
+        // Going backward inherits the current cue's A offset immediately.
+        assert.equal(api.getBufferedRange(next).start, 19.5);
+        assert.equal(api.getBufferedRange(next).end, 24.5);
+        context.currentIndex = 1;
+        effects[0]();
+        assert.equal(api.getBufferedRange(next).start, 19.5);
+        assert.equal(api.getBufferedRange(next).end, 24.5);
+        // A positive adjustment propagates backward to both boundaries too.
+        api.sentenceRangeRef.current.start = 20.75;
+        assert.equal(api.getBufferedRange(sub).start, 10.75);
+        assert.equal(api.getBufferedRange(sub).end, 15.75);
+        context.currentIndex = 2;
+        effects[0]();
         // Do not transfer another track's timing correction.
         context.currentTrackIndex = 1;
         effects[0]();

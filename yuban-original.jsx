@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.198 · editable-revealed-subtitles";
+const APP_VERSION = "v5.199 · bidirectional-sentence-offset";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7963,7 +7963,10 @@ export default function GeminiPlayer() {
         const index = subtitles.indexOf(sub);
         const carriesPreviousEnd = previous?.track === currentTrackIndex
             && index > 0 && subtitles[index - 1] === previous.sub;
-        const offset = carriesPreviousEnd ? previous.end - Number(previous.sub.end) : 0;
+        const carriesNextStart = previous?.track === currentTrackIndex
+            && index >= 0 && subtitles[index + 1] === previous.sub;
+        const offset = carriesPreviousEnd ? previous.end - Number(previous.sub.end)
+            : carriesNextStart ? previous.start - Number(previous.sub.start) : 0;
         const originalStart = Math.max(0, Number(sub.start) || 0);
         const end = Number(sub.end) || originalStart;
         const mediaEnd = Number(duration) > 0 ? Number(duration) : Infinity;
