@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.197 · shift-sentence-ab-together";
+const APP_VERSION = "v5.198 · editable-revealed-subtitles";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7258,6 +7258,7 @@ export default function GeminiPlayer() {
     useEffect(() => { subtitlesRef.current = subtitles; }, [subtitles]);
     const subtitleCardRef = useRef(null);
     const subtitleTextRef = useRef(null);
+    const subtitleTextEditsRef = useRef(new WeakMap());
     const panelSplitDragCleanupRef = useRef(null);
 
     const aiCacheRef = useRef(aiCache);
@@ -18812,6 +18813,13 @@ ${userQ}`;
     const isTopPanelMediaMode = topPanelMode === 'media';
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
     const subtitleDisplayText = subtitles[currentIndex]?.text || "Load File...";
+    useEffect(() => {
+        const element = subtitleTextRef.current;
+        const sub = subtitles[currentIndex];
+        if (element) element.textContent = sub && subtitleTextEditsRef.current.has(sub)
+            ? subtitleTextEditsRef.current.get(sub)
+            : subtitleDisplayText;
+    }, [subtitleDisplayText, currentIndex, currentTrackIndex, subtitles]);
 
     // The divider keeps the top reference/media panel and the subtitle panel as
     // one adjustable reading surface.  The subtitle card itself flexes into all
@@ -19781,9 +19789,22 @@ ${userQ}`;
 
                     <div className={`w-full flex-1 min-h-0 flex flex-col ${!mediaSrc ? 'opacity-50 pointer-events-none' : ''}`}>
                         {/* LARGE SUBTITLE CARD */}
-                        <div className="relative group cursor-pointer flex-1 min-h-0" onClick={() => setIsSubtitleHidden(!isSubtitleHidden)}>
-                            <div ref={subtitleCardRef} className={`w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-hidden select-none transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm' : 'bg-white border-gray-200 shadow-sm'}`}>
-                                <p ref={subtitleTextRef} className="w-full font-bold text-gray-900 leading-snug" style={{ fontSize: `${fittedSubtitleFontSize}px` }}>{subtitleDisplayText}</p>
+                        <div className="relative group cursor-pointer flex-1 min-h-0" onClick={() => { if (!isSubtitleHidden) { window.getSelection()?.removeAllRanges(); subtitleTextRef.current?.blur(); } setIsSubtitleHidden(!isSubtitleHidden); }}>
+                            <div ref={subtitleCardRef} className={`w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-hidden transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm select-none' : 'bg-white border-gray-200 shadow-sm'}`}>
+                                <p ref={subtitleTextRef}
+                                    contentEditable={isSubtitleHidden ? false : 'plaintext-only'}
+                                    suppressContentEditableWarning
+                                    role={isSubtitleHidden ? undefined : 'textbox'}
+                                    aria-label="字幕文字" aria-multiline="true"
+                                    tabIndex={isSubtitleHidden ? -1 : 0}
+                                    onClick={event => { if (!isSubtitleHidden) event.stopPropagation(); }}
+                                    onInput={event => {
+                                        const sub = subtitles[currentIndex];
+                                        if (sub && !isSubtitleHidden) subtitleTextEditsRef.current.set(sub, event.currentTarget.textContent || '');
+                                    }}
+                                    className={`w-fit max-w-full self-center font-bold text-gray-900 leading-snug whitespace-pre-wrap outline-none ${isSubtitleHidden ? 'select-none' : 'select-text cursor-text'}`}
+                                    style={{ fontSize: `${fittedSubtitleFontSize}px` }}
+                                />
                             </div>
 
                             {/* SHADOWING PROGRESS BAR */}
