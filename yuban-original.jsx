@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.200 · standalone-canvas-fix";
+const APP_VERSION = "v5.201 · separated-playback-controls";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -20007,11 +20007,13 @@ ${userQ}`;
                             </div>
                         )}
 
-                        {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
-                            <div className={`flex flex-wrap items-center gap-3 pr-0 md:shrink-0 md:pr-4 md:border-r md:border-gray-100 ${isEchoMode ? 'pointer-events-none opacity-40' : ''}`} aria-disabled={isEchoMode}>
+                        {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-x-6 gap-y-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
+                            <div className="flex items-center gap-3 shrink-0" aria-label="播放控制">
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
                                 <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
+                            </div>
+                            <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習">
                                 <button onClick={() => { const modes = ['single', 'all', 'none']; setLoopMode(modes[(modes.indexOf(loopMode) + 1) % modes.length]); }} className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${loopMode !== 'none' ? 'text-blue-600 bg-blue-50' : 'text-gray-400'}`}>
                                     {loopMode === 'single' && <><Repeat1 size={16} /><span className="text-[9px]">單句</span></>}
                                     {loopMode === 'all' && <><Repeat size={16} /><span className="text-[9px]">全部</span></>}
@@ -20022,8 +20024,7 @@ ${userQ}`;
                                     {playlistLoopMode === 'all' && <><Repeat size={16} /><span className="text-[9px]">清單全部</span></>}
                                     {playlistLoopMode === 'none' && <><MoveRight size={16} /><span className="text-[9px]">清單不循</span></>}
                                 </button>
-                            </div>
-
+                            <div className="flex flex-wrap items-center justify-end gap-1">
                             {/* SHADOWING UI */}
                             <div className={`flex flex-wrap items-center gap-1 px-2 py-1.5 rounded-lg border transition-all ${isEchoMode ? 'pointer-events-none opacity-40' : ''} ${isShadowing ? 'bg-yellow-50 border-yellow-200' : 'bg-transparent border-transparent'}`} aria-disabled={isEchoMode}>
                                 <button onClick={() => { setIsShadowing(!isShadowing); }} className={`flex flex-col items-center gap-0.5 font-bold ${isShadowing ? 'text-yellow-700' : 'text-gray-400'}`}><Mic size={14} /><span className="text-[9px]">跟讀</span></button>
@@ -20089,7 +20090,9 @@ ${userQ}`;
                                 </button>
                             </div>
 
-                            <div className="flex flex-wrap items-center gap-2 ml-auto w-auto">
+                            </div>
+                            </div>
+                            <div className="flex flex-wrap items-center justify-end gap-2 ml-auto w-auto">
                                 <button data-ai-control onClick={() => handleAIText('correction')} className="flex items-center gap-1 px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"><CheckCircle size={16} className="text-blue-500" /><span className="text-xs font-medium text-gray-700">校正</span></button>
                                 <button data-ai-control onClick={() => handleAIText('explain')} className="flex items-center gap-1 px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"><BookOpen size={16} className="text-green-500" /><span className="text-xs font-medium text-gray-700">單字</span></button>
                                 <button data-ai-control onClick={() => handleAIText('deep')} className="flex items-center gap-1 px-3 py-1.5 rounded-full border border-gray-200 bg-white hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"><AlertCircle size={16} className="text-purple-500" /><span className="text-xs font-medium text-gray-700">文法</span></button>
@@ -20144,8 +20147,8 @@ ${userQ}`;
                 {!isToolbarVisible && !isEchoMode && (
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
                         {renderSentenceTimeline()}
-                        <div className="px-3 py-2 flex items-center justify-between gap-2">
-                            <div className="flex items-center gap-2 min-w-0">
+                        <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
+                            <div className="flex items-center gap-2 shrink-0" aria-label="播放控制">
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipBack size={16} />
                                 </button>
@@ -20156,6 +20159,7 @@ ${userQ}`;
                                     <SkipForward size={16} />
                                 </button>
                             </div>
+                            <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習">
                             <div className="flex items-center gap-1 shrink-0">
                                 <button
                                     type="button"
@@ -20191,6 +20195,7 @@ ${userQ}`;
                                 >
                                     {playlistLoopMode === 'single' ? '單曲' : playlistLoopMode === 'all' ? '清單' : '不循'}
                                 </button>
+                            </div>
                             </div>
                         </div>
                     </div>
