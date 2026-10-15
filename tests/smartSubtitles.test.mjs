@@ -16,6 +16,31 @@ const cue = (start, end, text) => ({ start, end, text });
 const split = (cues, mode = 'covered', overlap = 0, cap = 8) =>
     generate(cues, overlap, 3, cap, 'en-US', mode);
 
+test('duration limit waits for a nearby short sentence ending', () => {
+    const result = split([cue(0, 12, 'And when that milestone appears, for reasons unknown,'),
+        cue(12, 15, 'your atoms will close you down.')]);
+    assert.equal(result.length, 1);
+    assert.ok(result[0].text.endsWith('your atoms will close you down.'));
+    assert.equal(result[0].end, 15);
+});
+
+test('Reader merge cap permits a short trailing sentence ending', () => {
+    const result = split([cue(0, 2, 'we wait for'),
+        cue(2, 4, 'the last few'), cue(4, 6, 'words to finish.')], 'cue-merged', 0, 2);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].text, 'we wait for the last few words to finish.');
+});
+
+test('lookahead respects gaps and bounded extension', () => {
+    const gap = split([cue(0, 12, 'we wait for'), cue(13, 15, 'the last words.')]);
+    assert.equal(gap.length, 2);
+    const longTail = split([cue(0, 12, 'we wait for'), cue(12, 20, 'a much later ending.')]);
+    assert.equal(longTail.length, 2);
+    const noEnd = split([cue(0, 12, 'we wait for'),
+        cue(12, 14, 'more words'), cue(14, 16, 'still continuing')]);
+    assert.equal(noEnd[0].text, 'we wait for');
+});
+
 test('neither mode adds punctuation to grammatical fragments', () => {
     for (const mode of ['covered', 'cue-merged']) {
         const result = split([cue(0, 2, 'I went to'), cue(2, 4, 'New York')], mode);

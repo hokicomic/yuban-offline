@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.201 · separated-playback-controls";
+const APP_VERSION = "v5.202 · sentence-end-lookahead";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3674,16 +3674,36 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     const useCueMergedTiming = timingMode === "cue-merged";
     const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
 
+    // Bounded lookahead avoids leaving a short clause behind at a safety cap.
+    const findNearbySentenceEnd = (fromIndex) => {
+        const origin = rawSubtitles[fromIndex];
+        let extraUnits = 0;
+        for (let nextIndex = fromIndex + 1; nextIndex < Math.min(rawSubtitles.length, fromIndex + 4); nextIndex += 1) {
+            const next = rawSubtitles[nextIndex];
+            const text = String(next?.text || "").trim();
+            if (!text || isStandaloneHeadingCue(text)
+                || Number(next.start) - Number(rawSubtitles[nextIndex - 1].end) > 0.8
+                || Number(next.end) - Number(origin.end) > 6) break;
+            extraUnits += countTimelineUnits(text);
+            if (extraUnits > 24) break;
+            if (endsCompleteSentence(text)) return nextIndex;
+        }
+        return -1;
+    };
+
     const logicalSubtitles = [];
-    for (const rawSub of rawSubtitles) {
+    for (const [rawIndex, rawSub] of rawSubtitles.entries()) {
         const text = String(rawSub?.text || "").trim();
         if (!text) continue;
         const previous = logicalSubtitles[logicalSubtitles.length - 1];
+        if (previous && previous.sourceLineCount === maxMergedLines && previous.extensionEndIndex == null) {
+            previous.extensionEndIndex = findNearbySentenceEnd(rawIndex - 1);
+        }
         const continuesPrevious = previous
             && !isStandaloneHeadingCue(text)
             && !isStandaloneHeadingCue(previous.text)
             && !endsCompleteSentence(previous.text)
-            && previous.sourceLineCount < maxMergedLines
+            && (previous.sourceLineCount < maxMergedLines || rawIndex <= previous.extensionEndIndex)
             && Number(rawSub.start) - Number(previous.end) <= 0.8
             && (isAbbreviationEnding(previous.text)
                 || previousDemandsContinuation(previous.text, text)
@@ -3718,6 +3738,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     // conservative safety limit only for preventing one enormous subtitle forever.
     const maxUnpunctuatedDuration = Math.max(12, Number(minDuration || 0) * 4);
     const maxUnpunctuatedUnits = 58;
+    let extensionEndIndex = -1;
 
     const sentences = [];
     // Internal punctuation has no observed timestamp. Only an explicitly
@@ -3872,11 +3893,15 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         // far less aggressive than the old 3-second/3-cue rule, which split continuations
         // such as "and then he lost ..." away from their grammatical sentence.
         const currentDuration = currentSentence.start === null ? 0 : (currentSentence.end - currentSentence.start);
+        const hasGapAfter = Number(rawSubtitles[index + 1]?.start) - Number(sub.end) > 0.8;
+        const reachesLimit = currentDuration >= maxUnpunctuatedDuration
+            || countTimelineUnits(currentSentence.text) >= maxUnpunctuatedUnits;
+        if (currentSentence.text && reachesLimit && !hasGapAfter && extensionEndIndex < index) {
+            extensionEndIndex = findNearbySentenceEnd(index);
+        }
         if (currentSentence.text
             && !sentenceEndRegex.test(currentSentence.text)
-            && (Number(rawSubtitles[index + 1]?.start) - Number(sub.end) > 0.8
-                || currentDuration >= maxUnpunctuatedDuration
-                || countTimelineUnits(currentSentence.text) >= maxUnpunctuatedUnits)) {
+            && (hasGapAfter || (reachesLimit && extensionEndIndex <= index))) {
             pushCoveredSentence(currentSentence, {
                 sourceStart: currentSentence.sourceStart,
                 sourceEnd: currentSentence.sourceEnd,
