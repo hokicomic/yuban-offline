@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.202 · sentence-end-lookahead";
+const APP_VERSION = "v5.203 · original-marker-alignment-fix";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -4240,7 +4240,7 @@ const cleanQuizDisplayText = (text) => {
 
 const KNOWLEDGE_META_LINE_RE = /^(LRC\s*知識點整理|檔名[:：]|語言[:：]|生成時間[:：]|總知識點[:：]|===)/i;
 const KNOWLEDGE_SECTION_LINE_RE = /^(單字|詞彙|字彙|用語|片語|搭配|文法|語法|句型|閱讀|聽力|vocab(?:ulary)?|usage|grammar|pattern|reading|listening)\s*(?:\(\s*\d+\s*\))?$/i;
-const KNOWLEDGE_ORIGINAL_MARKER_RE = /^(\[\s*原文\s*\]|\[\s*original\s*\]|原文\s*[:：]?|original\s*[:：]?)/i;
+const KNOWLEDGE_ORIGINAL_MARKER_RE = /^(?:\[\s*(?:原文|original)\s*\]|(?:原文|original)(?:\s*[:：]|[ \t]*$))/i;
 
 const isKnowledgeMetaLine = (line) => {
     const t = String(line || "").trim();
