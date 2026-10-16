@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.203 · original-marker-alignment-fix";
+const APP_VERSION = "v5.204 · linked-ab-echo-once";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7959,6 +7959,7 @@ export default function App() {
     const sentenceTimelineRef = useRef(null);
     const sentenceRangeRef = useRef(null);
     const sentenceDragRef = useRef(null);
+    const [sentenceAbLinked, setSentenceAbLinked] = useState(true);
     const [, refreshSentenceRange] = useState(0);
 
     const resolveSentenceRange = (sub) => {
@@ -8006,7 +8007,12 @@ export default function App() {
         const time = sentenceTimelineStart + Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * (sentenceTimelineEnd - sentenceTimelineStart);
         const previous = sentenceRangeRef.current?.sub === sentenceSub ? sentenceRangeRef.current : sentenceSelectedRange;
         const range = { ...previous, sub: sentenceSub, track: currentTrackIndex, start: previous.start, end: previous.end };
-        if (point === 'A') range.start = Math.max(sentenceTimelineStart, Math.min(time, range.end - 0.08));
+        if (sentenceAbLinked) {
+            const delta = Math.max(sentenceTimelineStart - range.start,
+                Math.min(time - (point === 'A' ? range.start : range.end), sentenceTimelineEnd - range.end));
+            range.start += delta;
+            range.end += delta;
+        } else if (point === 'A') range.start = Math.max(sentenceTimelineStart, Math.min(time, range.end - 0.08));
         else range.end = Math.min(sentenceTimelineEnd, Math.max(time, range.start + 0.08));
         sentenceRangeRef.current = range;
         refreshSentenceRange(value => value + 1);
@@ -8230,20 +8236,6 @@ export default function App() {
         setIsPlaying(true);
     };
 
-    const startEchoSelectionLoop = (rangeStart, rangeEnd) => {
-        const player = playerRef.current;
-        if (!player || rangeEnd <= rangeStart) return;
-        echoSessionTokenRef.current += 1;
-        echoModeRef.current = true;
-        echoPhaseRef.current = 'selecting';
-        echoStartRef.current = rangeStart;
-        echoEndRef.current = rangeEnd;
-        isGapPausing.current = false;
-        cancelWorkerTimer();
-        // Preserve the speed selected in the header throughout echo practice.
-        seekThenMaybePlay(rangeStart, true);
-        setIsPlaying(true);
-    };
 
     const startEchoMode = () => {
         const currentSub = subtitles[currentIndex];
@@ -8267,14 +8259,18 @@ export default function App() {
         });
         setEchoStart(range.start);
         setEchoEnd(range.end);
-        setEchoHasStart(false);
-        setEchoHasEnd(false);
-        echoHasStartRef.current = false;
-        echoHasEndRef.current = false;
-        setEchoPhase('selecting');
-        setEchoNotice('依上方設定的語速循環；在起點按 A、終點按 B，之後可拖曳標記微調。');
+        setEchoHasStart(true);
+        setEchoHasEnd(true);
+        echoHasStartRef.current = true;
+        echoHasEndRef.current = true;
+        echoStartRef.current = range.start;
+        echoEndRef.current = range.end;
+        echoModeRef.current = true;
+        cancelWorkerTimer();
+        isGapPausing.current = false;
         setIsEchoMode(true);
-        startEchoSelectionLoop(range.start, range.end);
+        setIsToolbarVisible(true);
+        playEchoRangeOnce(range.start, range.end);
     };
 
     const setEchoPoint = (point, rawTime, action = 'confirm') => {
@@ -8334,10 +8330,28 @@ export default function App() {
         const onEnd = () => {
             window.removeEventListener('pointermove', onMove);
             window.removeEventListener('pointerup', onEnd);
+            window.removeEventListener('pointercancel', onCancel);
+            playEchoRangeOnce();
+        };
+        const onCancel = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onEnd);
+            window.removeEventListener('pointercancel', onCancel);
         };
         setEchoPoint(point, getTime(event), 'adjust');
         window.addEventListener('pointermove', onMove);
         window.addEventListener('pointerup', onEnd, { once: true });
+        window.addEventListener('pointercancel', onCancel, { once: true });
+    };
+
+    const shiftEchoRange = (seconds) => {
+        const delta = Math.max(echoBounds.start - echoStartRef.current,
+            Math.min(seconds, echoBounds.end - echoEndRef.current));
+        echoStartRef.current += delta;
+        echoEndRef.current += delta;
+        setEchoStart(echoStartRef.current);
+        setEchoEnd(echoEndRef.current);
+        playEchoRangeOnce();
     };
 
     useEffect(() => {
@@ -19295,6 +19309,10 @@ ${userQ}`;
                         {playbackMode === 'sentence' && !isEchoMode && sentenceSub && (
                             <div className="mx-4 mt-2" aria-label="單句 A-B 播放範圍">
                                 <div ref={sentenceTimelineRef} className="relative h-14 touch-none select-none">
+                                    <label className="absolute bottom-0 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 bg-white px-1 text-[10px] leading-3 text-violet-800 cursor-pointer">
+                                        <input type="checkbox" checked={sentenceAbLinked} onChange={event => setSentenceAbLinked(event.target.checked)} className="h-3 w-3 accent-violet-600" />
+                                        AB 連動
+                                    </label>
                                     <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-200" />
                                     <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-600" style={{ left: sentencePosition(sentenceSelectedRange.start), width: `${Math.max(0, (sentenceSelectedRange.end - sentenceSelectedRange.start) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100)}%` }} />
                                     {['start', 'end'].map(edge => (
@@ -19963,35 +19981,10 @@ ${userQ}`;
                                         >B</button>
                                     )}
                                 </div>
-                                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
-                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">範圍 {formatTime(echoBounds.start)} – {formatTime(echoBounds.end)}</span>
-                                    <span className="rounded bg-slate-100 px-2 py-1 border border-slate-300 text-slate-800">原段 {formatTime(echoOriginalBoundsRef.current.start)} – {formatTime(echoOriginalBoundsRef.current.end)}</span>
-                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">前延伸 {Math.max(0, echoOriginalBoundsRef.current.start - echoStart).toFixed(2)}s · 後延伸 {Math.max(0, echoEnd - echoOriginalBoundsRef.current.end).toFixed(2)}s</span>
-                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">A {echoHasStart ? formatTime(echoStart) : '未設定'}</span>
-                                    <span className="rounded bg-white px-2 py-1 border border-violet-200 text-violet-800">B {echoHasEnd ? formatTime(echoEnd) : '未設定'}</span>
-                                    {echoPhase === 'selecting' ? (
-                                        <>
-                                            <button type="button" onClick={() => setEchoPoint('A', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">A 設起點</button>
-                                            <button type="button" onClick={() => setEchoPoint('B', playerRef.current?.currentTime ?? currentTime)} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">B 設終點</button>
-                                        </>
-                                    ) : (
-                                        <>
-                                            <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white font-bold hover:bg-violet-700">重聽一次</button>
-                                            <button type="button" onClick={() => {
-                                                setEchoHasStart(false);
-                                                setEchoHasEnd(false);
-                                                setEchoPhase('selecting');
-                                                setEchoNotice('依上方設定的語速循環；在起點按 A、終點按 B，之後可拖曳標記微調。');
-                                                // Restart from the complete subtitle range, not the
-                                                // previously selected A-B segment.
-                                                setEchoStart(echoOriginalBoundsRef.current.start);
-                                                setEchoEnd(echoOriginalBoundsRef.current.end);
-                                                echoHasStartRef.current = false;
-                                                echoHasEndRef.current = false;
-                                                startEchoSelectionLoop(echoOriginalBoundsRef.current.start, echoOriginalBoundsRef.current.end);
-                                            }} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 font-bold hover:bg-violet-100">重新選段</button>
-                                        </>
-                                    )}
+                                <div className="mt-2 flex items-center justify-center gap-2">
+                                    <button type="button" onClick={() => shiftEchoRange(-0.5)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold" title="A、B 同時提前 0.5 秒">向後 0.5s</button>
+                                    <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
+                                    <button type="button" onClick={() => shiftEchoRange(0.5)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold" title="A、B 同時延後 0.5 秒">向前 0.5s</button>
                                 </div>
                             </div>
                         )}

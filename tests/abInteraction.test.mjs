@@ -1,0 +1,84 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+
+for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
+    const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
+    const noop = () => {};
+    test('sentence linking defaults on and preserves duration at bounds: ' + file, () => {
+        const effects = [];
+        const sub = { start: 10, end: 15 };
+        const c = { useRef: current => ({ current }), useState: initial => [initial, noop],
+            useEffect: effect => effects.push(effect), subtitles: [sub], currentIndex: 0,
+            currentTrackIndex: 0, playbackMode: 'sentence', duration: 100 };
+        const code = source.slice(source.indexOf('    const sentenceTimelineRef ='), source.indexOf('    const getBufferedRange ='));
+        const api = vm.runInNewContext(code + '\n({sentenceAbLinked, sentenceTimelineRef, sentenceRangeRef, adjustSentenceMarker})', c);
+        assert.equal(api.sentenceAbLinked, true);
+        effects[0]();
+        api.sentenceTimelineRef.current = { getBoundingClientRect: () => ({ left: 0, width: 110 }) };
+        api.adjustSentenceMarker('A', { clientX: 0 });
+        assert.equal(api.sentenceRangeRef.current.start, 7);
+        assert.equal(api.sentenceRangeRef.current.end, 12);
+        api.adjustSentenceMarker('B', { clientX: 110 });
+        assert.equal(api.sentenceRangeRef.current.start, 13);
+        assert.equal(api.sentenceRangeRef.current.end, 18);
+        api.adjustSentenceMarker('A', { clientX: 110 });
+        assert.equal(api.sentenceRangeRef.current.end - api.sentenceRangeRef.current.start, 5);
+    });
+
+    test('echo enters once, shifts once, and replays only on drag release: ' + file, () => {
+        const handlers = {};
+        const seeks = [];
+        const c = { subtitles: [{ start: 10, end: 15 }], currentIndex: 0, duration: 100,
+            echoBounds: { start: 7, end: 18 }, playbackRate: 0.75,
+            getBufferedRange: () => ({ start: 10, end: 15 }),
+            playerRef: { current: { duration: 100, playbackRate: 0.75, pause: noop } },
+            cancelWorkerTimer: noop, seekThenMaybePlay: (start, play) => seeks.push({ start, play }),
+            echoTimelineRef: { current: { getBoundingClientRect: () => ({ left: 0, width: 110 }) } },
+            window: { addEventListener: (name, fn) => { handlers[name] = fn; },
+                removeEventListener: name => { delete handlers[name]; } }
+        };
+        for (const name of ['echoSessionTokenRef', 'echoModeRef', 'echoPhaseRef', 'echoStartRef',
+            'echoEndRef', 'echoHasStartRef', 'echoHasEndRef', 'echoOriginalBoundsRef', 'isGapPausing']) c[name] = { current: 0 };
+        for (const name of ['setEchoPhase', 'setEchoNotice', 'setEchoBounds', 'setEchoStart',
+            'setEchoEnd', 'setEchoHasStart', 'setEchoHasEnd', 'setIsEchoMode', 'setIsPlaying', 'setIsToolbarVisible']) c[name] = noop;
+        const code = source.slice(source.indexOf('    const clampEchoTime ='), source.indexOf('    useEffect(() => {\n        const player = playerRef.current;\n        if (!isEchoMode', source.indexOf('    const clampEchoTime =')));
+        const api = vm.runInNewContext(code + '\n({startEchoMode, shiftEchoRange, startEchoMarkerDrag})', c);
+        api.startEchoMode();
+        assert.equal(c.echoHasStartRef.current, true);
+        assert.equal(c.echoHasEndRef.current, true);
+        assert.equal(c.echoPhaseRef.current, 'listening');
+        assert.equal(seeks.length, 1);
+        api.shiftEchoRange(0.5);
+        assert.equal(c.echoStartRef.current, 10.5);
+        assert.equal(c.echoEndRef.current, 15.5);
+        assert.equal(seeks.length, 2);
+        api.shiftEchoRange(-0.5);
+        assert.equal(c.echoStartRef.current, 10);
+        api.startEchoMarkerDrag('A', { clientX: 20, preventDefault: noop });
+        handlers.pointermove({ clientX: 10 });
+        assert.equal(seeks.length, 3);
+        handlers.pointerup();
+        assert.equal(seeks.length, 4);
+        assert.equal(c.echoPhaseRef.current, 'listening');
+        assert.equal(c.playerRef.current.playbackRate, 0.75);
+        assert.equal(c.echoEndRef.current, 15);
+        // Reaching B must pause and become ready rather than loop back to A.
+        let tick;
+        let pauses = 0;
+        c.isEchoMode = true;
+        c.setCurrentTime = noop;
+        c.useEffect = fn => fn();
+        c.playerRef.current.pause = () => { pauses += 1; };
+        c.playerRef.current.addEventListener = (_name, fn) => { tick = fn; };
+        c.playerRef.current.removeEventListener = noop;
+        c.playerRef.current.currentTime = 15;
+        const effectStart = source.indexOf('    useEffect(() => {\n        const player = playerRef.current;\n        if (!isEchoMode', source.indexOf('    const clampEchoTime ='));
+        vm.runInNewContext(source.slice(effectStart, source.indexOf('    const seekThenMaybePlay =', effectStart)), c);
+        tick();
+        assert.equal(pauses, 1);
+        assert.equal(c.echoPhaseRef.current, 'ready');
+        assert.equal(seeks.length, 4);
+    });
+}
