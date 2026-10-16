@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.206 · fixed-echo-window";
+const APP_VERSION = "v5.207 · opt-in-echo-buffers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7940,6 +7940,9 @@ export default function App() {
     const echoHasEndRef = useRef(false);
     const echoTimelineRef = useRef(null);
     const echoOriginalBoundsRef = useRef({ start: 0, end: 0 });
+    const echoWindowRef = useRef({ start: 0, end: 0 });
+    const echoBufferRef = useRef({ before: false, after: false });
+    const [echoBuffers, setEchoBuffers] = useState({ before: false, after: false });
     const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
     const openedFolderHandleRef = useRef(null);
@@ -8225,22 +8228,29 @@ export default function App() {
         setEchoNotice("");
     };
 
-    const playEchoRangeOnce = (start = echoStartRef.current, end = echoEndRef.current, bounds = echoBounds) => {
+    const getEchoPlaybackRange = (start = echoStartRef.current, end = echoEndRef.current) => ({
+        start: Math.max(start, echoBufferRef.current.before ? echoWindowRef.current.start : echoOriginalBoundsRef.current.start),
+        end: Math.min(end, echoBufferRef.current.after ? echoWindowRef.current.end : echoOriginalBoundsRef.current.end)
+    });
+
+    const playEchoRangeOnce = (start = echoStartRef.current, end = echoEndRef.current) => {
         const player = playerRef.current;
         if (!player || end <= start) return;
-        if (start < bounds.start - 0.000001 || end > bounds.end + 0.000001) {
+        const range = getEchoPlaybackRange(start, end);
+        cancelWorkerTimer();
+        if (range.end <= range.start) {
             player.pause();
             setIsPlaying(false);
             echoPhaseRef.current = 'ready';
             setEchoPhase('ready');
-            setEchoNotice('A–B 已超出固定時間範圍；請反向移回範圍內再播放。');
+            setEchoNotice('A–B 與可播放範圍沒有交集；請移回，或點選灰色 buffer 區啟用。');
             return;
         }
         echoSessionTokenRef.current += 1;
         echoPhaseRef.current = 'listening';
         setEchoPhase('listening');
         setEchoNotice('播放完畢後會停止；請先聽腦中的回音，再自行覆誦。');
-        seekThenMaybePlay(start, true);
+        seekThenMaybePlay(range.start, true);
         setIsPlaying(true);
     };
 
@@ -8259,12 +8269,16 @@ export default function App() {
         }
         echoOriginalBoundsRef.current = { start: range.start, end: range.end };
         const mediaDuration = Number(player.duration) || Number(duration);
-        setEchoBounds({
+        const windowBounds = {
             start: Math.max(0, range.start - 3),
             end: Number.isFinite(mediaDuration) && mediaDuration > 0
                 ? Math.min(mediaDuration, range.end + 3)
                 : range.end + 3
-        });
+        };
+        echoWindowRef.current = windowBounds;
+        setEchoBounds(windowBounds);
+        echoBufferRef.current = { before: false, after: false };
+        setEchoBuffers(echoBufferRef.current);
         setEchoStart(range.start);
         setEchoEnd(range.end);
         setEchoHasStart(true);
@@ -8278,7 +8292,7 @@ export default function App() {
         isGapPausing.current = false;
         setIsEchoMode(true);
         setIsToolbarVisible(true);
-        playEchoRangeOnce(range.start, range.end, range);
+        playEchoRangeOnce(range.start, range.end);
     };
 
     const setEchoPoint = (point, rawTime, action = 'confirm') => {
@@ -8364,14 +8378,27 @@ export default function App() {
         playEchoRangeOnce();
     };
 
+    const toggleEchoBuffer = (side) => {
+        echoBufferRef.current = { ...echoBufferRef.current, [side]: !echoBufferRef.current[side] };
+        setEchoBuffers(echoBufferRef.current);
+        playEchoRangeOnce();
+    };
+
     useEffect(() => {
         const player = playerRef.current;
         if (!isEchoMode || !player) return undefined;
         const onEchoTimeUpdate = () => {
             if (!echoModeRef.current) return;
-            const start = echoStartRef.current;
-            const end = echoEndRef.current;
-            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+            const { start, end } = getEchoPlaybackRange();
+            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+                player.pause();
+                setIsPlaying(false);
+                return;
+            }
+            if (!player.paused && player.currentTime < start - 0.025) {
+                player.currentTime = start;
+                return;
+            }
             setCurrentTime(player.currentTime);
             if (player.currentTime < end - 0.025) return;
             if (echoPhaseRef.current === 'selecting') {
@@ -19963,13 +19990,34 @@ ${userQ}`;
                                         step="0.01"
                                         value={clampEchoTime(currentTime)}
                                         onInput={(e) => {
-                                            const next = clampEchoTime(parseFloat(e.currentTarget.value));
+                                            const range = getEchoPlaybackRange();
+                                            if (range.end <= range.start) return;
+                                            const next = Math.max(range.start, Math.min(range.end, parseFloat(e.currentTarget.value)));
                                             if (playerRef.current) playerRef.current.currentTime = next;
                                             setCurrentTime(next);
                                         }}
                                         className="absolute inset-0 z-10 w-full h-full opacity-0 cursor-pointer"
                                         aria-label="回音法片段播放位置"
                                     />
+                                    {['before', 'after'].map(side => {
+                                        const from = side === 'before' ? echoBounds.start : echoOriginalBoundsRef.current.end;
+                                        const to = side === 'before' ? echoOriginalBoundsRef.current.start : echoBounds.end;
+                                        if (to <= from) return null;
+                                        return (
+                                            <button key={side} type="button"
+                                                aria-label={side === 'before' ? '切換起點前 buffer 播放' : '切換終點後 buffer 播放'}
+                                                aria-pressed={echoBuffers[side]}
+                                                title={echoBuffers[side] ? 'buffer 已啟用，點選關閉' : '灰色 buffer 不播放，點選啟用'}
+                                                onClick={() => toggleEchoBuffer(side)}
+                                                className="absolute inset-y-0 z-[11] cursor-pointer"
+                                                style={{
+                                                    left: `${((from - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
+                                                    width: `${((to - from) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`
+                                                }}>
+                                                <span className={`absolute inset-x-0 top-1/2 -translate-y-1/2 h-2 rounded ${echoBuffers[side] ? 'bg-violet-400/40 ring-1 ring-violet-500' : 'bg-gray-400'}`} />
+                                            </button>
+                                        );
+                                    })}
                                     <button
                                         type="button"
                                         onPointerDown={(e) => startEchoMarkerDrag('A', e)}

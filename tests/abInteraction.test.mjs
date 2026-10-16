@@ -40,11 +40,11 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
                 removeEventListener: name => { delete handlers[name]; } }
         };
         for (const name of ['echoSessionTokenRef', 'echoModeRef', 'echoPhaseRef', 'echoStartRef',
-            'echoEndRef', 'echoHasStartRef', 'echoHasEndRef', 'echoOriginalBoundsRef', 'isGapPausing']) c[name] = { current: 0 };
+            'echoEndRef', 'echoHasStartRef', 'echoHasEndRef', 'echoOriginalBoundsRef', 'echoWindowRef', 'echoBufferRef', 'isGapPausing']) c[name] = { current: 0 };
         for (const name of ['setEchoPhase', 'setEchoNotice', 'setEchoBounds', 'setEchoStart',
-            'setEchoEnd', 'setEchoHasStart', 'setEchoHasEnd', 'setIsEchoMode', 'setIsPlaying', 'setIsToolbarVisible']) c[name] = noop;
+            'setEchoEnd', 'setEchoHasStart', 'setEchoHasEnd', 'setIsEchoMode', 'setIsPlaying', 'setIsToolbarVisible', 'setEchoBuffers']) c[name] = noop;
         const code = source.slice(source.indexOf('    const clampEchoTime ='), source.indexOf('    useEffect(() => {\n        const player = playerRef.current;\n        if (!isEchoMode', source.indexOf('    const clampEchoTime =')));
-        const api = vm.runInNewContext(code + '\n({startEchoMode, shiftEchoRange, startEchoMarkerDrag})', c);
+        const api = vm.runInNewContext(code + '\n({startEchoMode, shiftEchoRange, startEchoMarkerDrag, getEchoPlaybackRange, toggleEchoBuffer, playEchoRangeOnce})', c);
         api.startEchoMode();
         assert.equal(c.echoHasStartRef.current, true);
         assert.equal(c.echoHasEndRef.current, true);
@@ -63,6 +63,19 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(seeks.length, 2);
         handlers.pointerup();
         assert.equal(seeks.length, 3);
+        assert.equal(seeks[2].start, 10);
+        assert.equal(api.getEchoPlaybackRange(8, 12).start, 10);
+        assert.equal(api.getEchoPlaybackRange(13, 17).end, 15);
+        api.toggleEchoBuffer('before');
+        assert.equal(api.getEchoPlaybackRange(8, 12).start, 8);
+        assert.equal(api.getEchoPlaybackRange(13, 17).end, 15);
+        api.toggleEchoBuffer('after');
+        assert.equal(api.getEchoPlaybackRange(13, 17).end, 17);
+        assert.equal(api.getEchoPlaybackRange(-5, 105).start, 7);
+        assert.equal(api.getEchoPlaybackRange(-5, 105).end, 18);
+        api.toggleEchoBuffer('before');
+        api.toggleEchoBuffer('after');
+        const validSeeks = seeks.length;
         // Outside the fixed window, keep virtual A/B and allow moving back.
         c.echoStartRef.current = 0;
         c.echoEndRef.current = 5;
@@ -77,7 +90,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         api.shiftEchoRange(1);
         assert.equal(c.echoStartRef.current, 100);
         assert.equal(c.echoEndRef.current, 105);
-        assert.equal(seeks.length, 3);
+        assert.equal(seeks.length, validSeeks);
         c.echoStartRef.current = 8;
         c.echoEndRef.current = 15;
         assert.equal(c.playerRef.current.playbackRate, 0.75);
@@ -97,6 +110,6 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         tick();
         assert.equal(pauses, 1);
         assert.equal(c.echoPhaseRef.current, 'ready');
-        assert.equal(seeks.length, 3);
+        assert.equal(seeks.length, validSeeks);
     });
 }
