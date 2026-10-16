@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.205 · echo-full-range-step";
+const APP_VERSION = "v5.206 · fixed-echo-window";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8246,9 +8246,17 @@ export default function GeminiPlayer() {
         setEchoNotice("");
     };
 
-    const playEchoRangeOnce = (start = echoStartRef.current, end = echoEndRef.current) => {
+    const playEchoRangeOnce = (start = echoStartRef.current, end = echoEndRef.current, bounds = echoBounds) => {
         const player = playerRef.current;
         if (!player || end <= start) return;
+        if (start < bounds.start - 0.000001 || end > bounds.end + 0.000001) {
+            player.pause();
+            setIsPlaying(false);
+            echoPhaseRef.current = 'ready';
+            setEchoPhase('ready');
+            setEchoNotice('A–B 已超出固定時間範圍；請反向移回範圍內再播放。');
+            return;
+        }
         echoSessionTokenRef.current += 1;
         echoPhaseRef.current = 'listening';
         setEchoPhase('listening');
@@ -8291,7 +8299,7 @@ export default function GeminiPlayer() {
         isGapPausing.current = false;
         setIsEchoMode(true);
         setIsToolbarVisible(true);
-        playEchoRangeOnce(range.start, range.end);
+        playEchoRangeOnce(range.start, range.end, range);
     };
 
     const setEchoPoint = (point, rawTime, action = 'confirm') => {
@@ -8370,14 +8378,8 @@ export default function GeminiPlayer() {
         if (length <= 0) return;
         const start = direction > 0 ? echoEndRef.current : echoStartRef.current - length;
         const end = start + length;
-        const mediaEnd = Number(playerRef.current?.duration) || Number(duration) || Infinity;
-        if (start < 0 || end > mediaEnd) return;
         echoStartRef.current = start;
         echoEndRef.current = end;
-        setEchoBounds({
-            start: Math.max(0, Math.min(echoBounds.start, start - 3)),
-            end: Math.min(mediaEnd, Math.max(echoBounds.end, end + 3))
-        });
         setEchoStart(echoStartRef.current);
         setEchoEnd(echoEndRef.current);
         playEchoRangeOnce();
@@ -19981,8 +19983,8 @@ ${userQ}`;
                                     <div
                                         className="absolute top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-600"
                                         style={{
-                                            left: `${((echoStart - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
-                                            width: `${Math.max(0, ((echoEnd - echoStart) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100)}%`
+                                            left: `${((clampEchoTime(echoStart) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
+                                            width: `${Math.max(0, ((clampEchoTime(echoEnd) - clampEchoTime(echoStart)) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100)}%`
                                         }}
                                     />
                                     <div
@@ -20009,7 +20011,7 @@ ${userQ}`;
                                         onPointerDown={(e) => startEchoMarkerDrag('A', e)}
                                         onClick={(e) => e.preventDefault()}
                                         className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
-                                        style={{ left: `${((echoStart - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                        style={{ left: `${((clampEchoTime(echoStart) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
                                         title="拖曳微調 A 起點"
                                         aria-label="拖曳微調 A 起點"
                                     >A</button>
@@ -20019,16 +20021,16 @@ ${userQ}`;
                                             onPointerDown={(e) => startEchoMarkerDrag('B', e)}
                                             onClick={(e) => e.preventDefault()}
                                             className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
-                                            style={{ left: `${((echoEnd - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
+                                            style={{ left: `${((clampEchoTime(echoEnd) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
                                             title="拖曳微調 B 終點"
                                             aria-label="拖曳微調 B 終點"
                                         >B</button>
                                     )}
                                 </div>
                                 <div className="mt-2 flex items-center justify-center gap-2">
-                                    <button type="button" onClick={() => shiftEchoRange(-1)} disabled={echoStart - (echoEnd - echoStart) < 0} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
+                                    <button type="button" onClick={() => shiftEchoRange(-1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
                                     <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
-                                    <button type="button" onClick={() => shiftEchoRange(1)} disabled={duration > 0 && echoEnd + (echoEnd - echoStart) > duration} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
+                                    <button type="button" onClick={() => shiftEchoRange(1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
                                 </div>
                             </div>
                         )}

@@ -53,30 +53,33 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         api.shiftEchoRange(1);
         assert.equal(c.echoStartRef.current, 15);
         assert.equal(c.echoEndRef.current, 20);
-        assert.equal(seeks.length, 2);
+        assert.equal(seeks.length, 1);
+        assert.equal(c.echoPhaseRef.current, 'ready');
         api.shiftEchoRange(-1);
         assert.equal(c.echoStartRef.current, 10);
         assert.equal(c.echoEndRef.current, 15);
         api.startEchoMarkerDrag('A', { clientX: 20, preventDefault: noop });
         handlers.pointermove({ clientX: 10 });
-        assert.equal(seeks.length, 3);
+        assert.equal(seeks.length, 2);
         handlers.pointerup();
-        assert.equal(seeks.length, 4);
-        // At media edges, reject a full step rather than shortening it.
+        assert.equal(seeks.length, 3);
+        // Outside the fixed window, keep virtual A/B and allow moving back.
         c.echoStartRef.current = 0;
         c.echoEndRef.current = 5;
         api.shiftEchoRange(-1);
+        assert.equal(c.echoStartRef.current, -5);
+        assert.equal(c.echoEndRef.current, 0);
+        api.shiftEchoRange(1);
         assert.equal(c.echoStartRef.current, 0);
         assert.equal(c.echoEndRef.current, 5);
         c.echoStartRef.current = 95;
         c.echoEndRef.current = 100;
         api.shiftEchoRange(1);
-        assert.equal(c.echoStartRef.current, 95);
-        assert.equal(c.echoEndRef.current, 100);
-        assert.equal(seeks.length, 4);
+        assert.equal(c.echoStartRef.current, 100);
+        assert.equal(c.echoEndRef.current, 105);
+        assert.equal(seeks.length, 3);
         c.echoStartRef.current = 8;
         c.echoEndRef.current = 15;
-        assert.equal(c.echoPhaseRef.current, 'listening');
         assert.equal(c.playerRef.current.playbackRate, 0.75);
         assert.equal(c.echoEndRef.current, 15);
         // Reaching B must pause and become ready rather than loop back to A.
@@ -94,6 +97,6 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         tick();
         assert.equal(pauses, 1);
         assert.equal(c.echoPhaseRef.current, 'ready');
-        assert.equal(seeks.length, 4);
+        assert.equal(seeks.length, 3);
     });
 }
