@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.204 · linked-ab-echo-once";
+const APP_VERSION = "v5.205 · echo-full-range-step";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8344,11 +8344,19 @@ export default function App() {
         window.addEventListener('pointercancel', onCancel, { once: true });
     };
 
-    const shiftEchoRange = (seconds) => {
-        const delta = Math.max(echoBounds.start - echoStartRef.current,
-            Math.min(seconds, echoBounds.end - echoEndRef.current));
-        echoStartRef.current += delta;
-        echoEndRef.current += delta;
+    const shiftEchoRange = (direction) => {
+        const length = echoEndRef.current - echoStartRef.current;
+        if (length <= 0) return;
+        const start = direction > 0 ? echoEndRef.current : echoStartRef.current - length;
+        const end = start + length;
+        const mediaEnd = Number(playerRef.current?.duration) || Number(duration) || Infinity;
+        if (start < 0 || end > mediaEnd) return;
+        echoStartRef.current = start;
+        echoEndRef.current = end;
+        setEchoBounds({
+            start: Math.max(0, Math.min(echoBounds.start, start - 3)),
+            end: Math.min(mediaEnd, Math.max(echoBounds.end, end + 3))
+        });
         setEchoStart(echoStartRef.current);
         setEchoEnd(echoEndRef.current);
         playEchoRangeOnce();
@@ -19982,9 +19990,9 @@ ${userQ}`;
                                     )}
                                 </div>
                                 <div className="mt-2 flex items-center justify-center gap-2">
-                                    <button type="button" onClick={() => shiftEchoRange(-0.5)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold" title="A、B 同時提前 0.5 秒">向後 0.5s</button>
+                                    <button type="button" onClick={() => shiftEchoRange(-1)} disabled={echoStart - (echoEnd - echoStart) < 0} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
                                     <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
-                                    <button type="button" onClick={() => shiftEchoRange(0.5)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold" title="A、B 同時延後 0.5 秒">向前 0.5s</button>
+                                    <button type="button" onClick={() => shiftEchoRange(1)} disabled={duration > 0 && echoEnd + (echoEnd - echoStart) > duration} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
                                 </div>
                             </div>
                         )}
