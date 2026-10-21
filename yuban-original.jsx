@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.207 · opt-in-echo-buffers";
+const APP_VERSION = "v5.208 · reliable-long-track-seeking";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7936,6 +7936,12 @@ export default function GeminiPlayer() {
     ]);
 
     const lastUserSeekValueRef = useRef(0);
+    const progressSeekRef = useRef({ dragging: false, pendingIndex: null });
+    const [progressPreview, setProgressPreview] = useState(null);
+    useEffect(() => {
+        progressSeekRef.current = { dragging: false, pendingIndex: null };
+        setProgressPreview(null);
+    }, [currentTrackIndex]);
 
     const addToAudioCache = useCallback((text, url) => {
         setAudioCache(prev => ({ ...prev, [text]: url }));
@@ -8607,55 +8613,66 @@ export default function GeminiPlayer() {
         return findSubtitleIndexByTimeInList(time, subtitles);
     };
 
-    const seekToSubtitleByTime = (timeSec) => {
-        if (!playerRef.current) return;
-        const safeTime = Math.max(0, Math.min(timeSec, duration || timeSec));
-
-        if (!subtitles || subtitles.length === 0) {
-            playerRef.current.currentTime = safeTime;
-            setCurrentTime(safeTime);
-            return;
-        }
-
-        const targetIndex = findSubtitleIndexByTime(safeTime);
-        if (targetIndex === -1) {
-            playerRef.current.currentTime = safeTime;
-            setCurrentTime(safeTime);
-            return;
-        }
-
-        const targetSub = subtitles[targetIndex];
-        const inRange = safeTime >= targetSub.start && safeTime < targetSub.end;
-        const seekTime = inRange ? safeTime : targetSub.start;
-        const shouldPlay = isPlaying;
-
+    const seekToSubtitleByTime = (timeSec, resume = null) => {
+        const player = playerRef.current;
+        if (!player || !Number.isFinite(Number(timeSec))) return;
+        const ceiling = Number(player.duration) || Number(duration) || Infinity;
+        const safeTime = Math.max(0, Math.min(Number(timeSec), ceiling));
+        // In a caption gap use the next cue, but never change the chosen time.
+        let targetIndex = subtitles.findIndex(sub => safeTime >= sub.start && safeTime < sub.end);
+        if (targetIndex < 0) targetIndex = subtitles.findIndex(sub => sub.start > safeTime);
+        const shouldPlay = resume == null ? (isPlaying || !player.paused) : resume;
         cancelWorkerTimer();
         resetShadowStateForSeek();
-        setCurrentTime(seekTime);
-
-        if (targetIndex !== currentIndex) {
-            setCurrentIndex(targetIndex);
-        }
-
-        if (shouldPlay) {
-            seekThenMaybePlay(seekTime, true);
-        } else {
-            // Still seek, but do not auto-play
-            seekThenMaybePlay(seekTime, false);
-            setIsPlaying(false);
-        }
+        progressSeekRef.current.pendingIndex = targetIndex;
+        setCurrentIndex(targetIndex);
+        setCurrentTime(safeTime);
+        seekThenMaybePlay(safeTime, shouldPlay);
+        if (!shouldPlay) setIsPlaying(false);
     };
 
-    const handleProgressInput = (e) => {
-        const val = parseFloat(e.target.value);
-        if (Number.isNaN(val)) return;
-        lastUserSeekValueRef.current = val;
-        setCurrentTime(val);
+    const beginProgressSeek = (event) => {
+        if (progressSeekRef.current.dragging || !playerRef.current) return;
+        const player = playerRef.current;
+        progressSeekRef.current = {
+            dragging: true, resume: isPlaying || !player.paused,
+            originalTime: player.currentTime, track: currentTrackIndex,
+            pendingIndex: null
+        };
+        lastUserSeekValueRef.current = player.currentTime;
+        setProgressPreview(player.currentTime);
+        cancelWorkerTimer();
+        resetShadowStateForSeek();
+        player.pause();
+        setIsPlaying(false);
+        if (event?.pointerId != null) event.currentTarget.setPointerCapture(event.pointerId);
+    };
+
+    const handleProgressInput = (event) => {
+        const value = Number(event.currentTarget.value);
+        if (!Number.isFinite(value)) return;
+        beginProgressSeek();
+        lastUserSeekValueRef.current = value;
+        setProgressPreview(value);
     };
 
     const commitProgressSeek = (value) => {
-        if (value == null || Number.isNaN(value)) return;
-        seekToSubtitleByTime(value);
+        const interaction = progressSeekRef.current;
+        if (!interaction.dragging) return;
+        interaction.dragging = false;
+        setProgressPreview(null);
+        if (interaction.track !== currentTrackIndex) return;
+        seekToSubtitleByTime(value, interaction.resume);
+    };
+
+    const cancelProgressSeek = () => {
+        const interaction = progressSeekRef.current;
+        if (!interaction.dragging) return;
+        interaction.dragging = false;
+        setProgressPreview(null);
+        if (interaction.track === currentTrackIndex) {
+            seekToSubtitleByTime(interaction.originalTime, interaction.resume);
+        }
     };
 
     const seekByContinuousOffset = (offsetSeconds) => {
@@ -9735,6 +9752,11 @@ export default function GeminiPlayer() {
             if (!state || !state.player) return;
 
             const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isEchoMode, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, playbackMode, worker } = state;
+            if (progressSeekRef.current.dragging || player.seeking) return;
+            if (progressSeekRef.current.pendingIndex != null) {
+                if (currentIndex !== progressSeekRef.current.pendingIndex) return;
+                progressSeekRef.current.pendingIndex = null;
+            }
 
             if (type === 'TICK') {
                 if (!isPlaying || isGapPausingRef.current) return;
@@ -15496,18 +15518,11 @@ ${userQ}`;
 
     const togglePlaybackMode = () => {
         const nextMode = playbackMode === 'continuous' ? 'sentence' : 'continuous';
+        cancelWorkerTimer();
+        resetShadowStateForSeek();
+        if (progressSeekRef.current.dragging) commitProgressSeek(lastUserSeekValueRef.current);
+        if (latestStateRef.current) latestStateRef.current.playbackMode = nextMode;
         setPlaybackMode(nextMode);
-        if (nextMode === 'continuous') {
-            // A user may switch while the sentence timer is between segments.
-            // Clear that timer/lock so the next ordinary Play click never waits
-            // for an old drill action or rewinds to the previous segment.
-            cancelWorkerTimer();
-            currentRepeatRef.current = 0;
-            isGapPausing.current = false;
-            isWaitingShadowRef.current = false;
-            setIsWaitingShadow(false);
-            setShadowCountdown(0);
-        }
     };
 
     // [NEW] Survival Mode Logic
@@ -19971,14 +19986,18 @@ ${userQ}`;
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white border-t border-gray-200 z-50 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
                         {renderSentenceTimeline()}
                         {!isEchoMode && <div className="px-4 pt-3 pb-1">
-                            <input type="range" min="0" max={duration || 0} value={currentTime}
+                            <input type="range" min="0" max={duration || 0} step="0.1" value={progressPreview ?? currentTime}
+                                aria-label="整檔播放位置"
+                                onPointerDown={beginProgressSeek}
                                 onInput={handleProgressInput}
                                 onChange={handleProgressInput}
-                                onMouseUp={() => commitProgressSeek(lastUserSeekValueRef.current)}
-                                onTouchEnd={() => commitProgressSeek(lastUserSeekValueRef.current)}
+                                onPointerUp={(event) => commitProgressSeek(Number(event.currentTarget.value))}
+                                onPointerCancel={cancelProgressSeek}
+                                onLostPointerCapture={cancelProgressSeek}
+                                onBlur={() => commitProgressSeek(lastUserSeekValueRef.current)}
                                 onKeyUp={(e) => {
                                     const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'];
-                                    if (keys.includes(e.key)) commitProgressSeek(parseFloat(e.currentTarget.value));
+                                    if (keys.includes(e.key)) commitProgressSeek(Number(e.currentTarget.value));
                                 }}
                                 className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
                             <div className="flex justify-between text-[10px] font-mono text-gray-400 mt-1"><span>{formatTime(currentTime)}</span><span>{formatTime(duration)}</span></div>
