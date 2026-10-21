@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.208 · reliable-long-track-seeking";
+const APP_VERSION = "v5.209 · punctuation-first-segmentation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3520,7 +3520,7 @@ const parseLRC = (data) => {
 };
 
 const isAbbreviation = (text) => {
-    if (/(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Vs|etc|e\.g|i\.e|No|Fig|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.$/i.test(text)) return true;
+    if (/\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Vs|etc|e\.g|i\.e|No|Fig|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.$/i.test(text)) return true;
     if (/(?:^|\s)[a-zA-Z]\.$/.test(text)) return true;
     if (/(?:[a-zA-Z]\.){2,}$/.test(text)) return true;
     return false;
@@ -3640,39 +3640,14 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
             || isCJKLine(b.charAt(0));
         return a + (noSpace ? "" : " ") + b;
     };
-    // Caption files often put invisible Unicode controls, WebVTT/SRT style
-    // tags, or an opening quotation mark before a continuation.  Test the
-    // spoken first character instead of character zero; otherwise
-    // "technology's" + "<i>adoption..." is incorrectly treated as two
-    // sentences and the later punctuation pass invents a full stop.
-    const cueLeadForContinuation = (line) => String(line || "")
-        .replace(/^\s*[\u200B-\u200D\uFEFF]+/u, "")
-        .replace(/^\s*(?:(?:<[^>]*>)|(?:\{\\[^}]*\})|[“‘"'([\{]+)\s*/u, "")
-        .trim();
-    const startsClearlyAsContinuation = (line) => /^[a-zà-öø-ÿ]/.test(cueLeadForContinuation(line))
-        || /^[,.;:!?…，。！？；：、】【、】【）\)\]\}”’]/.test(cueLeadForContinuation(line));
-    // A cue may split immediately before a value which is grammatically the
-    // complement of the preceding words, e.g. "generating" + "$370bn in net
-    // income".  A currency amount cannot sensibly open an English sentence,
-    // so do not turn the preceding cue into a synthetic full stop merely
-    // because the amount starts with a symbol rather than lower-case text.
-    const startsWithCurrencyAmount = (line) => /^\s*[$€£¥]\s*\d/.test(String(line || ""));
-    const endsWithValueIntroducingWord = (line) => /\b(?:generating|reaching|hitting|earning|making|bringing\s+in|raising|cutting|losing|saving|costing|worth|valued|valuing|amounting\s+to|totalling|totaling|numbering)\s*$/i.test(String(line || "").trim());
-    const previousDemandsContinuation = (line, nextLine = "") => {
-        const previous = String(line || "").trim();
-        return /(?:[,;:—–-]|[“‘(\[{])$/.test(previous)
-            || (startsWithCurrencyAmount(nextLine) && endsWithValueIntroducingWord(previous))
-            // A possessive ending is not a sentence ending.  This protects
-            // common LRC splits such as "the technology's" + "adoption".
-            // Restrict it to a lower-case continuation so a real next
-            // sentence beginning with a proper noun is not swallowed.
-            || (/[\p{L}\p{N}]['’]s$/u.test(previous) && /^[a-zà-öø-ÿ]/.test(cueLeadForContinuation(nextLine)));
-    };
-    // An LRC line start is an actual timing observation. Punctuation inside a
-    // line is not. Keep a bounded number of original cues together only when
-    // they are clearly a continuation; the limit is exposed as Max Merge Lines.
+    // Cue starts are timing observations, not sentence boundaries.
+    // Capitalization never proves completion; punctuated sources use wider
+    // safety bounds while unpunctuated sources retain a configurable cue cap.
     const useCueMergedTiming = timingMode === "cue-merged";
     const maxMergedLines = Math.max(1, Math.round(Number(maxMergeCount) || 1));
+    const hasPunctuationEvidence = rawSubtitles.reduce((count, sub) =>
+        count + (String(sub?.text || "").match(/[.!?。！？](?=\s|$)/g) || []).length, 0) >= 2;
+    const isExplicitHeading = (text) => /^(?:Chapter|Episode|Season|Part|Section|Lesson|Unit|Vol|Volume)\s+\d+/i.test(String(text || "").trim());
 
     // Bounded lookahead avoids leaving a short clause behind at a safety cap.
     const findNearbySentenceEnd = (fromIndex) => {
@@ -3681,7 +3656,7 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         for (let nextIndex = fromIndex + 1; nextIndex < Math.min(rawSubtitles.length, fromIndex + 4); nextIndex += 1) {
             const next = rawSubtitles[nextIndex];
             const text = String(next?.text || "").trim();
-            if (!text || isStandaloneHeadingCue(text)
+            if (!text || isExplicitHeading(text)
                 || Number(next.start) - Number(rawSubtitles[nextIndex - 1].end) > 0.8
                 || Number(next.end) - Number(origin.end) > 6) break;
             extraUnits += countTimelineUnits(text);
@@ -3696,24 +3671,26 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         const text = String(rawSub?.text || "").trim();
         if (!text) continue;
         const previous = logicalSubtitles[logicalSubtitles.length - 1];
+        const gapBefore = previous ? Number(rawSub.start) - Number(previous.end) : Infinity;
+        const headingBoundary = isStandaloneHeadingCue(text) &&
+            (!previous || endsCompleteSentence(previous.text) || gapBefore > 0.8 || isExplicitHeading(text));
         if (previous && previous.sourceLineCount === maxMergedLines && previous.extensionEndIndex == null) {
             previous.extensionEndIndex = findNearbySentenceEnd(rawIndex - 1);
         }
         const continuesPrevious = previous
-            && !isStandaloneHeadingCue(text)
-            && !isStandaloneHeadingCue(previous.text)
+            && !headingBoundary
+            && !previous.isHeading
             && !endsCompleteSentence(previous.text)
-            && (previous.sourceLineCount < maxMergedLines || rawIndex <= previous.extensionEndIndex)
-            && Number(rawSub.start) - Number(previous.end) <= 0.8
-            && (isAbbreviationEnding(previous.text)
-                || previousDemandsContinuation(previous.text, text)
-                || startsClearlyAsContinuation(text));
+            && (hasPunctuationEvidence
+                ? previous.sourceLineCount < 128 && Number(rawSub.end) - Number(previous.start) <= 120 && countTimelineUnits(previous.text) < 480
+                : previous.sourceLineCount < maxMergedLines || rawIndex <= previous.extensionEndIndex)
+            && gapBefore <= 0.8;
         if (continuesPrevious) {
             previous.text = joinWithNaturalSpacing(previous.text, text);
             previous.end = rawSub.end;
             previous.sourceLineCount += 1;
         } else {
-            logicalSubtitles.push({ ...rawSub, text, sourceLineCount: 1 });
+            logicalSubtitles.push({ ...rawSub, text, sourceLineCount: 1, isHeading: headingBoundary });
         }
     }
 
@@ -3736,8 +3713,8 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
     // An LRC timestamp/line break is a timing cue, not proof of a sentence boundary.
     // Some subtitle sources contain no punctuation at all, so retain a deliberately
     // conservative safety limit only for preventing one enormous subtitle forever.
-    const maxUnpunctuatedDuration = Math.max(12, Number(minDuration || 0) * 4);
-    const maxUnpunctuatedUnits = 58;
+    const maxUnpunctuatedDuration = hasPunctuationEvidence ? 120 : Math.max(30, Number(minDuration || 0) * 4);
+    const maxUnpunctuatedUnits = hasPunctuationEvidence ? 480 : 120;
     let extensionEndIndex = -1;
 
     const sentences = [];
@@ -3777,7 +3754,8 @@ const generateSmartSubtitles = (rawSubtitles, bufferTime = 0.2, minDuration = 3.
         if (!text) return;
         const punctCheckText = stripLeadingListMarker(text) || text;
 
-        if (isTitleLike(text)) {
+        if (isTitleLike(text) && (!currentSentence.text || isExplicitHeading(text)
+            || Number(sub.start) - Number(rawSubtitles[index - 1]?.end) > 0.8)) {
             if (currentSentence.text) {
                 pushCoveredSentence(currentSentence, {
                     sourceStart: currentSentence.sourceStart,
@@ -7058,7 +7036,7 @@ export default function GeminiPlayer() {
     const [timeBuffer, setTimeBuffer] = useState(0);
     const [minDuration, setMinDuration] = useState(3.0);
     // Reader groups stop at this cap without inventing terminal punctuation.
-    const [maxMergeCount, setMaxMergeCount] = useState(8);
+    const [maxMergeCount, setMaxMergeCount] = useState(16);
     // "covered" estimates inside each original cue, with optional overlap;
     // "cue-merged" only uses original timestamp boundaries.
     const [smartTimingMode, setSmartTimingMode] = useState("covered");
@@ -19601,7 +19579,7 @@ ${userQ}`;
                                 <div className="mb-3">
                                     <div className="flex justify-between text-xs text-gray-600 mb-1">
                                         <span>無標點片段分組上限（不補句點）</span>
-                                        <span>{Math.max(12, minDuration * 4).toFixed(1)}s</span>
+                                        <span>{Math.max(30, minDuration * 4).toFixed(1)}s</span>
                                     </div>
                                     <input type="range" min="0.5" max="10.0" step="0.5" value={minDuration} onChange={(e) => setMinDuration(parseFloat(e.target.value))} className="w-full h-1 bg-gray-300 rounded-lg accent-blue-600" />
                                 </div>
@@ -19609,13 +19587,13 @@ ${userQ}`;
                         )}
                         <div className="mb-3">
                             <div className="flex justify-between text-xs text-gray-600 mb-1">
-                                <span>Reader-style 最多合併行數</span>
+                                <span>Reader-style 無標點合併行數</span>
                                 <span>{maxMergeCount}</span>
                             </div>
                             <input
                                 type="range"
                                 min="1"
-                                max="8"
+                                max="32"
                                 step="1"
                                 value={maxMergeCount}
                                 onChange={(e) => setMaxMergeCount(Math.max(1, parseInt(e.target.value, 10) || 1))}

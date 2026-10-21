@@ -16,6 +16,50 @@ const cue = (start, end, text) => ({ start, end, text });
 const split = (cues, mode = 'covered', overlap = 0, cap = 8) =>
     generate(cues, overlap, 3, cap, 'en-US', mode);
 
+test('punctuated long sentences continue across capitalized months in both releases', () => {
+    const prefix = "I don't know if you know that sort of feeling you get on these days, round about the end of";
+    const tail = "April and the beginning of May, when the skies are light blue with cotton-willed clouds and there's a bit of breeze blowing from the west.";
+    const cues = [cue(0, 13, prefix), cue(13, 23, tail),
+        cue(23, 25, 'Kind of uplifted feeling.'), cue(25, 28, 'Romantic, if you know what I mean.')];
+    for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
+        const text = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
+        const fn = vm.runInNewContext(text.slice(text.indexOf('const isAbbreviation ='), text.indexOf('const extractJsonObjectFromText =')) + '\n generateSmartSubtitles');
+        for (const mode of ['covered', 'cue-merged']) {
+            const result = fn(cues, 0, 3, 1, 'en-US', mode);
+            assert.equal(result[0].text, prefix + ' ' + tail);
+            assert.equal(result[0].start, 0);
+            assert.equal(result[0].end, 23);
+            assert.equal(result[1].text, 'Kind of uplifted feeling.');
+        }
+    }
+});
+
+test('capitalization alone never proves a sentence ending or a heading', () => {
+    for (const mode of ['covered', 'cue-merged']) {
+        const result = split([cue(0, 2, 'we met'),
+            cue(2, 4, 'Alex near the'), cue(4, 6, 'USA'),
+            cue(6, 8, 'office.'), cue(8, 10, 'Then we left.')], mode);
+        assert.equal(result[0].text, 'we met Alex near the USA office.');
+        assert.equal(result[1].text, 'Then we left.');
+    }
+});
+
+test('punctuation-first grouping still respects explicit headings and hard safety bounds', () => {
+    for (const mode of ['covered', 'cue-merged']) {
+        const heading = split([cue(0, 2, 'an unfinished fragment'),
+            cue(2, 4, 'Chapter 2'), cue(4, 6, 'The story continues.'),
+            cue(6, 8, 'Another sentence.')], mode);
+        assert.equal(heading[0].text, 'an unfinished fragment');
+        assert.equal(heading[1].text, 'Chapter 2');
+        const veryLong = Array.from({ length: 100 }, (_, i) => cue(i * 2, i * 2 + 2,
+            i === 99 ? 'finally ends.' : 'and the story keeps continuing'));
+        veryLong.push(cue(200, 202, 'Another sentence.'));
+        const result = split(veryLong, mode);
+        assert.ok(result.length > 2);
+        assert.equal(result.map(sub => sub.text).join(' '), veryLong.map(sub => sub.text).join(' '));
+    }
+});
+
 test('duration limit waits for a nearby short sentence ending', () => {
     const result = split([cue(0, 12, 'And when that milestone appears, for reasons unknown,'),
         cue(12, 15, 'your atoms will close you down.')]);
@@ -34,10 +78,10 @@ test('Reader merge cap permits a short trailing sentence ending', () => {
 test('lookahead respects gaps and bounded extension', () => {
     const gap = split([cue(0, 12, 'we wait for'), cue(13, 15, 'the last words.')]);
     assert.equal(gap.length, 2);
-    const longTail = split([cue(0, 12, 'we wait for'), cue(12, 20, 'a much later ending.')]);
+    const longTail = split([cue(0, 30, 'we wait for'), cue(30, 38, 'a much later ending.')]);
     assert.equal(longTail.length, 2);
-    const noEnd = split([cue(0, 12, 'we wait for'),
-        cue(12, 14, 'more words'), cue(14, 16, 'still continuing')]);
+    const noEnd = split([cue(0, 30, 'we wait for'),
+        cue(30, 32, 'more words'), cue(32, 34, 'still continuing')]);
     assert.equal(noEnd[0].text, 'we wait for');
 });
 
