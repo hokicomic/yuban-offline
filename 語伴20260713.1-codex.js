@@ -1,4 +1,4 @@
-// VERSION: v5.200
+// VERSION: v5.210
 // Single-file React/JSX for Gemini Canvas: paste as App.jsx, not index.html.
 // FSRS and ts-fsrs are embedded; only React and lucide-react imports remain.
 
@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.209 · punctuation-first-segmentation";
+const APP_VERSION = "v5.210 · verified-seek-and-time-input";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3475,6 +3475,73 @@ const clampSubtitles = (subs) => {
         }
     }
     return subs;
+};
+
+const parsePlaybackTimeInput = (input) => {
+    const value = String(input || "").trim();
+    if (!/^\d+(?::\d{1,2}){0,2}(?:\.\d+)?$/.test(value)) return null;
+    const parts = value.split(":").map(Number);
+    if (parts.length > 1 && parts[parts.length - 1] >= 60) return null;
+    if (parts.length === 3 && parts[1] >= 60) return null;
+    const seconds = parts.reduce((total, part) => total * 60 + part, 0);
+    return Number.isFinite(seconds) ? seconds : null;
+};
+
+// A seek request is not proof that audio decoding has reached the target.
+const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, timeoutMs = 15000 }) => {
+    let timer = null;
+    let finished = false;
+    let attempts = 0;
+    let observedCompletion = Math.abs(Number(player.currentTime) - target) <= 0.15;
+    const started = Date.now();
+    const source = player.src;
+    const events = ['seeked', 'timeupdate', 'canplay', 'loadeddata', 'loadedmetadata', 'progress'];
+    const cleanup = () => {
+        finished = true;
+        if (timer != null) clearTimeout(timer);
+        events.forEach(name => player.removeEventListener(name, check));
+        player.removeEventListener('error', fail);
+        player.removeEventListener('emptied', fail);
+    };
+    const cancel = () => { cleanup(); };
+    const fail = () => {
+        if (finished) return;
+        const current = isCurrent() && player.src === source;
+        cleanup();
+        if (current) {
+            player.pause();
+            onFailure(Number(player.currentTime) || 0);
+        }
+    };
+    const assignTarget = () => {
+        if (player.readyState < 1 || player.seeking || attempts >= 3) return;
+        attempts += 1;
+        try { player.currentTime = target; } catch (_) { /* Retry after metadata is available. */ }
+    };
+    const check = (event) => {
+        if (finished) return;
+        if (!isCurrent() || player.src !== source) { cleanup(); return; }
+        if (event && ['seeked', 'timeupdate', 'canplay', 'loadeddata'].includes(event.type)) observedCompletion = true;
+        const actual = Number(player.currentTime);
+        if (observedCompletion && !player.seeking && player.readyState >= 2 && Math.abs(actual - target) <= 0.15) {
+            cleanup();
+            onLocated(actual);
+            return;
+        }
+        if (Date.now() - started >= timeoutMs) { fail(); return; }
+        if (!player.seeking && Math.abs(actual - target) > 0.15) assignTarget();
+    };
+    const poll = () => {
+        check();
+        if (!finished) timer = setTimeout(poll, 250);
+    };
+    events.forEach(name => player.addEventListener(name, check));
+    player.addEventListener('error', fail);
+    player.addEventListener('emptied', fail);
+    player.pause();
+    assignTarget();
+    poll();
+    return cancel;
 };
 
 const parseSRT = (data) => {
@@ -7893,6 +7960,18 @@ export default function App() {
     ]);
 
     const lastUserSeekValueRef = useRef(0);
+    const mediaSeekRef = useRef({ active: false, cancel: null });
+    const [seekNotice, setSeekNotice] = useState("");
+    const [seekTimeInput, setSeekTimeInput] = useState("");
+    useEffect(() => {
+        mediaSeekRef.current.cancel?.();
+        mediaSeekRef.current.active = false;
+        setSeekNotice("");
+        return () => {
+            mediaSeekRef.current.cancel?.();
+            mediaSeekRef.current.active = false;
+        };
+    }, [currentTrackIndex]);
     const progressSeekRef = useRef({ dragging: false, pendingIndex: null });
     const [progressPreview, setProgressPreview] = useState(null);
     useEffect(() => {
@@ -8183,6 +8262,8 @@ export default function App() {
     }, [currentIndex]);
 
     const cancelWorkerTimer = () => {
+        mediaSeekRef.current.cancel?.();
+        mediaSeekRef.current.active = false;
         timerTokenRef.current += 1;
         if (workerRef.current) workerRef.current.postMessage({ type: 'STOP_TIMER' });
     };
@@ -8404,73 +8485,42 @@ export default function App() {
         return () => player.removeEventListener('timeupdate', onEchoTimeUpdate);
     }, [isEchoMode]);
 
-    const seekThenMaybePlay = (targetTime, shouldPlay) => {
+    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null) => {
         const player = playerRef.current;
         if (!player) return;
-
-        const t = Math.max(0, Math.min(Number(targetTime) || 0, duration || Number(targetTime) || 0));
-
-        // Avoid stacking multiple listeners across rapid Next/Prev taps
-        const token = (timerTokenRef.current = (timerTokenRef.current + 1));
-
-        let resolved = false;
-        const cleanup = (onSeeked, onErr, onTu) => {
-            try { player.removeEventListener('seeked', onSeeked); } catch (_) { }
-            try { player.removeEventListener('error', onErr); } catch (_) { }
-            try { player.removeEventListener('timeupdate', onTu); } catch (_) { }
+        const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
+        mediaSeekRef.current.cancel?.();
+        const token = ++timerTokenRef.current;
+        const session = { active: true, cancel: null, target: t, resume: shouldPlay };
+        mediaSeekRef.current = session;
+        setSeekNotice('正在定位…');
+        setIsPlaying(false);
+        const syncActual = (actual) => {
+            setCurrentTime(actual);
+            if (onLocated) onLocated(actual);
         };
-
-        const tryPlay = () => {
-            if (!shouldPlay) return;
-            // If another seek started after us, don't force play
-            if (token !== timerTokenRef.current) return;
-            player.play().then(() => {
-                setIsPlaying(true);
-            }).catch(e => {
-                console.log("Play after seek blocked:", e);
+        session.cancel = performVerifiedMediaSeek(player, t, {
+            isCurrent: () => token === timerTokenRef.current && playerRef.current === player,
+            onLocated: (actual) => {
+                session.active = false;
+                syncActual(actual);
+                setSeekNotice('');
+                if (!shouldPlay) return;
+                player.play().then(() => {
+                    if (token === timerTokenRef.current) setIsPlaying(true);
+                }).catch(() => {
+                    if (token !== timerTokenRef.current) return;
+                    setIsPlaying(false);
+                    setSeekNotice('已定位，請按播放。');
+                });
+            },
+            onFailure: (actual) => {
+                session.active = false;
+                syncActual(actual);
                 setIsPlaying(false);
-            });
-        };
-
-        const onSeeked = () => {
-            if (resolved) return;
-            resolved = true;
-            cleanup(onSeeked, onErr, onTu);
-            tryPlay();
-        };
-
-        const onErr = () => {
-            if (resolved) return;
-            resolved = true;
-            cleanup(onSeeked, onErr, onTu);
-            // Fallback: attempt play anyway
-            tryPlay();
-        };
-
-        // iOS sometimes delays/never fires seeked for tiny seeks; timeupdate fallback
-        const onTu = () => {
-            if (resolved) return;
-            // When we're close enough to the intended time, treat as complete
-            if (Math.abs(player.currentTime - t) <= 0.12) {
-                resolved = true;
-                cleanup(onSeeked, onErr, onTu);
-                tryPlay();
+                setSeekNotice('定位未完成，已停止播放。請重試，或改用下載後的本機媒體檔。');
             }
-        };
-
-        player.addEventListener('seeked', onSeeked);
-        player.addEventListener('error', onErr);
-        player.addEventListener('timeupdate', onTu);
-
-        // Hard timeout fallback
-        setTimeout(() => {
-            if (resolved) return;
-            resolved = true;
-            cleanup(onSeeked, onErr, onTu);
-            tryPlay();
-        }, 650);
-
-        player.currentTime = t;
+        });
     };
 
     const jumpTrackByOffset = (offset = 1) => {
@@ -8575,17 +8625,31 @@ export default function App() {
         if (!player || !Number.isFinite(Number(timeSec))) return;
         const ceiling = Number(player.duration) || Number(duration) || Infinity;
         const safeTime = Math.max(0, Math.min(Number(timeSec), ceiling));
-        // In a caption gap use the next cue, but never change the chosen time.
-        let targetIndex = subtitles.findIndex(sub => safeTime >= sub.start && safeTime < sub.end);
-        if (targetIndex < 0) targetIndex = subtitles.findIndex(sub => sub.start > safeTime);
         const shouldPlay = resume == null ? (isPlaying || !player.paused) : resume;
         cancelWorkerTimer();
         resetShadowStateForSeek();
-        progressSeekRef.current.pendingIndex = targetIndex;
-        setCurrentIndex(targetIndex);
-        setCurrentTime(safeTime);
-        seekThenMaybePlay(safeTime, shouldPlay);
+        setProgressPreview(safeTime);
+        seekThenMaybePlay(safeTime, shouldPlay, (actual) => {
+            const list = subtitlesRef.current;
+            let index = list.findIndex(sub => actual >= sub.start && actual < sub.end);
+            progressSeekRef.current.pendingIndex = index;
+            setCurrentIndex(index);
+            setCurrentTime(actual);
+            setProgressPreview(null);
+        });
         if (!shouldPlay) setIsPlaying(false);
+    };
+
+    const submitSeekTime = (event) => {
+        event.preventDefault();
+        const seconds = parsePlaybackTimeInput(seekTimeInput);
+        const maximum = Number(playerRef.current?.duration) || Number(duration) || Infinity;
+        if (seconds == null || seconds > maximum) {
+            setSeekNotice('請輸入有效的起播時間：時:分:秒、分:秒或秒數，且不可超過總時長。');
+            return;
+        }
+        progressSeekRef.current.dragging = false;
+        seekToSubtitleByTime(seconds, true);
     };
 
     const beginProgressSeek = (event) => {
@@ -9486,6 +9550,10 @@ export default function App() {
 
     // [FIX] Updated togglePlay to handle Shadow Wait cancellation using REF
     const togglePlay = () => {
+        if (mediaSeekRef.current.active) {
+            setSeekNotice('正在定位，完成後才會播放。');
+            return;
+        }
         if (playerRef.current) {
             // Check REF for truth
             if (isWaitingShadowRef.current) {
@@ -9709,7 +9777,7 @@ export default function App() {
             if (!state || !state.player) return;
 
             const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isEchoMode, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, playbackMode, worker } = state;
-            if (progressSeekRef.current.dragging || player.seeking) return;
+            if (progressSeekRef.current.dragging || mediaSeekRef.current.active || player.seeking) return;
             if (progressSeekRef.current.pendingIndex != null) {
                 if (currentIndex !== progressSeekRef.current.pendingIndex) return;
                 progressSeekRef.current.pendingIndex = null;
@@ -9727,6 +9795,13 @@ export default function App() {
                 const now = player.currentTime;
                 // Update UI time (using state setter from component scope)
                 setCurrentTime(now);
+                if (playbackMode === 'continuous' || currentIndex === -1) {
+                    const actualIndex = subtitles.findIndex(sub => now >= sub.start && now < sub.end);
+                    if (actualIndex !== currentIndex) {
+                        setCurrentIndex(actualIndex);
+                        return;
+                    }
+                }
 
                 if (subtitles && subtitles.length > 0 && currentIndex !== -1) {
                     const currentSub = subtitles[currentIndex];
@@ -15473,9 +15548,11 @@ ${userQ}`;
 
     const togglePlaybackMode = () => {
         const nextMode = playbackMode === 'continuous' ? 'sentence' : 'continuous';
+        const pendingSeek = mediaSeekRef.current.active ? { ...mediaSeekRef.current } : null;
         cancelWorkerTimer();
         resetShadowStateForSeek();
         if (progressSeekRef.current.dragging) commitProgressSeek(lastUserSeekValueRef.current);
+        else if (pendingSeek) seekToSubtitleByTime(pendingSeek.target, pendingSeek.resume);
         if (latestStateRef.current) latestStateRef.current.playbackMode = nextMode;
         setPlaybackMode(nextMode);
     };
@@ -19334,6 +19411,21 @@ ${userQ}`;
         setEmbeddedKnowledgeLoading(false);
     }, [currentTrackIndex, isAudioOnlyTrack]);
 
+    const renderSeekTimeControls = () => !isEchoMode && (
+        <form onSubmit={submitSeekTime} className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1 px-3 py-1">
+            <label className="flex items-center gap-1 text-[11px] text-gray-600">
+                起播時間
+                <input type="text" inputMode="text" value={seekTimeInput}
+                    onChange={event => setSeekTimeInput(event.target.value)}
+                    placeholder="1:23:45" aria-label="起播時間，時分秒"
+                    autoComplete="off" spellCheck={false}
+                    className="w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-mono text-gray-800" />
+            </label>
+            <button type="submit" disabled={!mediaSrc} className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
+            {seekNotice && <span role="status" className="text-[11px] text-amber-800">{seekNotice}</span>}
+        </form>
+    );
+
     const renderSentenceTimeline = () => (
         <>
                         {playbackMode === 'sentence' && !isEchoMode && sentenceSub && (
@@ -19646,7 +19738,7 @@ ${userQ}`;
                         style={!isVideoMasked ? { height: `${embeddedKnowledgePanelHeight}vh` } : undefined}
                     >
                         {/* [FIX] Removed manual onTimeUpdate, relying on Worker tick */}
-                        <video ref={playerRef} src={mediaSrc}
+                        <video ref={playerRef} src={mediaSrc} preload="auto"
                             className={`w-full h-full object-contain ${!isVideoMasked && isTopPanelMediaMode ? 'block' : 'hidden'}`} controls={false} playsInline onLoadedMetadata={(e) => {
                                 setMediaError("");
                                 setDuration(e.target.duration);
@@ -19934,15 +20026,16 @@ ${userQ}`;
                                 onInput={handleProgressInput}
                                 onChange={handleProgressInput}
                                 onPointerUp={(event) => commitProgressSeek(Number(event.currentTarget.value))}
-                                onPointerCancel={cancelProgressSeek}
-                                onLostPointerCapture={cancelProgressSeek}
+                                onPointerCancel={() => commitProgressSeek(lastUserSeekValueRef.current)}
+                                onLostPointerCapture={() => commitProgressSeek(lastUserSeekValueRef.current)}
                                 onBlur={() => commitProgressSeek(lastUserSeekValueRef.current)}
                                 onKeyUp={(e) => {
                                     const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'];
                                     if (keys.includes(e.key)) commitProgressSeek(Number(e.currentTarget.value));
                                 }}
                                 className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
-                            <div className="flex justify-between text-[10px] font-mono text-gray-400 mt-1"><span>{formatTime(currentTime)}</span><span>{formatTime(duration)}</span></div>
+                            <div className="flex justify-between text-[10px] font-mono text-gray-400 mt-1"><span>{formatTime(progressPreview ?? currentTime)}</span><span>{formatTime(duration)}</span></div>
+                            {renderSeekTimeControls()}
                         </div>}
 
                         {isEchoMode && (
@@ -20184,6 +20277,7 @@ ${userQ}`;
                 {!isToolbarVisible && !isEchoMode && (
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
                         {renderSentenceTimeline()}
+                        {renderSeekTimeControls()}
                         <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
                             <div className="flex items-center gap-2 shrink-0" aria-label="播放控制">
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
