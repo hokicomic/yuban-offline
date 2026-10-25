@@ -27,7 +27,7 @@ test('track changes preserve the selected media/document panel state', () => {
 
 test('source and standalone release carry the same continuity fix and version', () => {
   for (const candidate of [source, standalone]) {
-    assert.match(candidate, /const APP_VERSION = "v5\.213 · playlist-continuity";/);
+    assert.equal(candidate.match(/const APP_VERSION = "([^"]+)";/)?.[1], source.match(/const APP_VERSION = "([^"]+)";/)?.[1]);
     assert.match(candidate, /handlePlaylistEnd\(\);/);
     assert.match(candidate, /\/\/ Track changes must not reset/);
   }

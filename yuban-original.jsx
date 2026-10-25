@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.213 · playlist-continuity";
+const APP_VERSION = "v5.214 · text-encoding-fix";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -1297,7 +1297,7 @@ const AudioCacheContext = React.createContext({
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const KNOWN_KNOWLEDGE_TEXT_RE = /LRC\s*知識點整理|===\s*(?:單字|用語|文法|句型|閱讀|聽力)|@K_HEADER@|\[原文\]|中譯[:：]/i;
-const SUSPICIOUS_BOOKMARK_TEXT_RE = /NSURLBookmark|NSURLError|bookmark(?:data)?|Macintosh\s*HD|file:\/\/\//i;
+const SUSPICIOUS_BOOKMARK_TEXT_RE = /NSURLBookmark|NSURLError|\bbookmark(?:data)?\b|Macintosh\s*HD|file:\/\/\//i;
 
 const scoreDecodedKnowledgeCandidate = (text = "") => {
     const s = String(text || "");
@@ -1331,13 +1331,39 @@ const decodeArrayBufferBestEffort = (buffer) => {
     const hasUtf16LeBom = bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE;
     const hasUtf16BeBom = bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF;
 
-    if (hasUtf8Bom) tryDecode("utf-8");
-    if (hasUtf16LeBom) tryDecode("utf-16le");
-    if (hasUtf16BeBom) tryDecode("utf-16be");
+    // A BOM is explicit encoding metadata; content heuristics must not override it.
+    if (hasUtf8Bom) return new TextDecoder("utf-8").decode(bytes);
+    if (hasUtf16LeBom) return new TextDecoder("utf-16le").decode(bytes);
+    if (hasUtf16BeBom) return new TextDecoder("utf-16be").decode(bytes);
+
+    // Prefer valid UTF-8 before knowledge-file scoring. NUL-containing data may
+    // be BOM-less UTF-16, so leave that case to the fallback candidates below.
+    if (!bytes.includes(0)) {
+        try {
+            return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch (_) { }
+    }
+
+    // Alternating NUL bytes identify ASCII-heavy UTF-16 without a BOM.
+    let evenZeros = 0;
+    let oddZeros = 0;
+    for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === 0) {
+            if (i % 2 === 0) evenZeros++;
+            else oddZeros++;
+        }
+    }
+    const pairs = Math.floor(bytes.length / 2);
+    if (bytes.length % 2 === 0 && pairs > 0) {
+        if (oddZeros / pairs > 0.2 && evenZeros < oddZeros / 4) {
+            return new TextDecoder("utf-16le").decode(bytes);
+        }
+        if (evenZeros / pairs > 0.2 && oddZeros < evenZeros / 4) {
+            return new TextDecoder("utf-16be").decode(bytes);
+        }
+    }
 
     tryDecode("utf-8");
-    tryDecode("utf-16le");
-    tryDecode("utf-16be");
     tryDecode("big5");
 
     if (!candidates.length) return "";
