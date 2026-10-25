@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.210 · verified-seek-and-time-input";
+const APP_VERSION = "v5.211 · lazy-knowledge-reference-follow";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6134,6 +6134,148 @@ const findLrcStartForKnowledgeText = (content = "", subtitles = []) => {
     return -1;
 };
 
+// Reference tabs are file descriptors, not fourteen rendered documents. Keep
+// only the active document plus one candidate; serialize reads during rapid seeks.
+const getKnowledgeReferenceFileKey = (file) =>
+    `${String(file?.name || "")}:${Number(file?.size || 0)}:${Number(file?.lastModified || 0)}`;
+
+const createKnowledgeReferenceCache = (limit = 2) => {
+    const entries = new Map();
+    let queue = Promise.resolve();
+    let generation = 0;
+    const get = (key) => {
+        const value = entries.get(key);
+        if (value) { entries.delete(key); entries.set(key, value); }
+        return value;
+    };
+    return {
+        get size() { return entries.size; },
+        get,
+        clear() { generation += 1; entries.clear(); },
+        load(file, reader, isCurrent = () => true, keepKey = "") {
+            const key = getKnowledgeReferenceFileKey(file);
+            const epoch = generation;
+            const task = queue.catch(() => {}).then(async () => {
+                if (epoch !== generation || !isCurrent()) return null;
+                const hit = get(key);
+                if (hit) return hit;
+                const value = await reader(file);
+                if (epoch !== generation || !isCurrent()) return null;
+                entries.set(key, value);
+                while (entries.size > limit) {
+                    const victim = [...entries.keys()].find(candidate => candidate !== keepKey && candidate !== key);
+                    entries.delete(victim || entries.keys().next().value);
+                }
+                return value;
+            });
+            queue = task.then(() => {}, () => {});
+            return task;
+        }
+    };
+};
+
+// A compact inverted LRC/SRT index is built once per subtitle track. It maps
+// distinctive source sentences to real cue times, without retaining other TXTs.
+const buildKnowledgeReferenceCueLookup = (subtitles = []) => {
+    const normalized = subtitles.map(cue => normalizeKnowledgeAlignmentText(cue?.text));
+    const postings = new Map();
+    normalized.forEach((text, index) => {
+        for (const word of new Set(text.split(" ").filter(word => word.length >= 3))) {
+            if (!postings.has(word)) postings.set(word, []);
+            postings.get(word).push(index);
+        }
+    });
+    return { normalized, postings, subtitles };
+};
+
+const getKnowledgeReferenceRange = (data, lookup) => {
+    const entries = data?.index?.entries || [];
+    const sampled = [...entries.slice(0, 5), ...entries.slice(-5)];
+    const hits = [];
+    for (const entry of sampled) {
+        for (const sentence of entry.sentences.slice(0, 3)) {
+            const text = normalizeKnowledgeAlignmentText(sentence);
+            const words = text.split(" ").filter(Boolean);
+            if (words.length < 5 && !(/[\u3400-\u9fff]/u.test(text) && text.length >= 12)) continue;
+            const lists = [...new Set(words)].map(word => lookup.postings.get(word))
+                .filter(Boolean).sort((a, b) => a.length - b.length);
+            const candidates = lists[0] || [];
+            // Common refrains are not timing anchors. A range only ranks the
+            // search; the current subtitle must still be checked before loading.
+            if (candidates.length > 160) continue;
+            const matching = candidates.filter(index => {
+                const cue = lookup.normalized[index];
+                return cue && (cue.includes(text) || text.includes(cue)) && cue.length >= 20;
+            });
+            if (matching.length === 1) hits.push(matching[0]);
+        }
+    }
+    if (hits.length < 2) return null;
+    const start = Math.min(...hits);
+    const end = Math.max(...hits);
+    if (start === end) return null;
+    return { start, end, startTime: Number(lookup.subtitles[start]?.start || 0), endTime: Number(lookup.subtitles[end]?.end || lookup.subtitles[end]?.start || 0) };
+};
+
+const rankKnowledgeReferenceFiles = (entries, currentIndex, subtitles, activeName, ranges) => {
+    const firstTime = Number(subtitles[0]?.start || 0);
+    const lastCue = subtitles[subtitles.length - 1];
+    const lastTime = Number(lastCue?.end || lastCue?.start || 0);
+    const time = Number(subtitles[currentIndex]?.start || 0);
+    const total = Math.max(...entries.map(entry => Number(entry.total || entries.length)), 1);
+    const estimatedPart = 1 + Math.max(0, Math.min(0.9999, (time - firstTime) / Math.max(1, lastTime - firstTime))) * total;
+    const score = entry => {
+        const range = ranges.get(getKnowledgeReferenceFileKey(entry.file));
+        if (range && currentIndex >= range.start && currentIndex <= range.end) return -100;
+        if (entry.name === activeName) return -50;
+        // Equal time is a search hint ONLY, never evidence for a switch.
+        return Math.abs(Number(entry.order || 1) - estimatedPart);
+    };
+    return [...entries].sort((a, b) => score(a) - score(b) || Number(a.order) - Number(b.order));
+};
+
+// Require dialogue/context evidence, not error keywords or a repeated "Exactly".
+// At boundaries nearby cues may belong to the other file: do not require both sides.
+const getKnowledgeReferenceEvidence = (data, subtitles, currentIndex) => {
+    if (!data?.index?.entries?.length || !subtitles[currentIndex]) return null;
+    const hits = [];
+    for (let index = Math.max(0, currentIndex - 2); index <= Math.min(subtitles.length - 1, currentIndex + 2); index += 1) {
+        const text = String(subtitles[index]?.text || "");
+        const normalized = normalizeKnowledgeAlignmentText(text);
+        const words = normalized.split(" ").filter(Boolean).length;
+        const informative = words >= 4 || (/[\u3400-\u9fff]/u.test(normalized) && normalized.length >= 10);
+        const matches = findKnowledgeSubtitleMatches(data.rawTxt, text, null, { index: data.index })
+            .filter(match => Number(match.score) >= 0.90);
+        if (!informative && normalized && !matches.length) {
+            // One-word reactions require TWO distinct contextual anchors below.
+            for (const entry of data.index.entries) {
+                if (entry.sentences.some(sentence => normalizeKnowledgeAlignmentText(sentence) === normalized)) {
+                    matches.push({ sourceLine: entry.sourceLine, score: 1 });
+                }
+            }
+        }
+        // Repeated lines inside a file need a local context anchor too.
+        if (matches.length) hits.push({ index, normalized, informative, matches });
+    }
+    const current = hits.find(hit => hit.index === currentIndex);
+    if (!current) return null;
+    for (const match of current.matches) {
+        const context = hits.filter(hit => hit.index !== currentIndex && hit.informative &&
+            hit.normalized !== current.normalized && hit.matches.some(other =>
+                Math.abs(other.sourceLine - match.sourceLine) <= 60 &&
+                (hit.index < currentIndex ? other.sourceLine <= match.sourceLine : other.sourceLine >= match.sourceLine)));
+        const distinct = new Set(context.map(hit => hit.normalized)).size;
+        if (distinct >= (current.informative ? 1 : 2)) {
+            return { sourceLine: match.sourceLine, score: match.score, subtitleIndex: currentIndex };
+        }
+    }
+    // A single-cue source has no neighbours to confirm; only a long exact cue is safe.
+    if (subtitles.length === 1 && current.normalized.split(" ").length >= 10 && current.matches.length === 1 && current.matches[0].score >= 0.99) {
+        return { ...current.matches[0], subtitleIndex: currentIndex };
+    }
+    return null;
+};
+
 const MarkdownView = ({
     content,
     fontSize = 16,
@@ -7121,6 +7263,9 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
+    const [embeddedKnowledgeAutoFollow, setEmbeddedKnowledgeAutoFollow] = useState(true);
+    const [embeddedKnowledgeFollowStatus, setEmbeddedKnowledgeFollowStatus] = useState("");
+    const [embeddedKnowledgeLocatedCue, setEmbeddedKnowledgeLocatedCue] = useState(null);
     const [showPCloudBrowser, setShowPCloudBrowser] = useState(false);
     const [pCloudConnection, setPCloudConnection] = useState(() => getPCloudSavedConnection());
     const [pCloudClientId, setPCloudClientId] = useState(() => String(getPCloudSavedConnection()?.clientId || ""));
@@ -7413,12 +7558,10 @@ export default function GeminiPlayer() {
     const knowledgePreviewManualOverrideRef = useRef({ documentKey: "", subtitleIndex: -1 });
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
-    // Multiple reference TXT files are common for long audiobooks.  Keep the
-    // parsed original-text index for each File so changing LRC cues does not
-    // repeatedly re-read and re-split large EPUB conversions on the UI thread.
-    const embeddedKnowledgeTabIndexCacheRef = useRef(new Map());
-    // Tab selection is a reading sequence, not a global document search:
-    // 1/n should advance to 2/n only after the current source is exhausted.
+    const embeddedKnowledgeTabIndexCacheRef = useRef(createKnowledgeReferenceCache(2));
+    const embeddedKnowledgeReferenceRangesRef = useRef(new Map());
+    const embeddedKnowledgeCueLookupRef = useRef(null);
+    const embeddedKnowledgeLoadRequestRef = useRef(0);
     const embeddedKnowledgeTabSequenceRef = useRef({ subtitleIndex: -1, tabName: "", sourceLine: -1, misses: 0 });
     const embeddedKnowledgePreferSeriesStartRef = useRef(true);
     // Do not lock the document cursor until the audiobook is reliably aligned
@@ -7906,6 +8049,12 @@ export default function GeminiPlayer() {
         embeddedKnowledgePreferSeriesStartRef.current = true;
         embeddedKnowledgeTabSearchRef.current = "";
         embeddedKnowledgeTabIndexCacheRef.current.clear();
+        embeddedKnowledgeReferenceRangesRef.current.clear();
+        embeddedKnowledgeCueLookupRef.current = null;
+        embeddedKnowledgeLoadRequestRef.current += 1;
+        setEmbeddedKnowledgeAutoFollow(true);
+        setEmbeddedKnowledgeFollowStatus("");
+        setEmbeddedKnowledgeLocatedCue(null);
         embeddedKnowledgeTabSequenceRef.current = { subtitleIndex: -1, tabName: "", sourceLine: -1, misses: 0 };
         setEmbeddedKnowledgeText("");
         setEmbeddedKnowledgeFileInfo(null);
@@ -8804,7 +8953,10 @@ export default function GeminiPlayer() {
         return out;
     };
 
-    const mergeFilesIntoSelectedFolderMap = (files) => {
+    // Uses only the current file-map ref and stable React setters. Keeping this
+    // callback stable prevents status/progress renders from cancelling an
+    // in-flight reference search through loadEmbeddedKnowledgeTxtFile's deps.
+    const mergeFilesIntoSelectedFolderMap = useCallback((files) => {
         if (!Array.isArray(files) || files.length === 0) return selectedFolderFilesRef.current || {};
         const currentMap = selectedFolderFilesRef.current || {};
         const nextMap = { ...currentMap };
@@ -8824,7 +8976,7 @@ export default function GeminiPlayer() {
             syncKnowledgeTxtOptionsFromMap(nextMap);
         }
         return nextMap;
-    };
+    }, []);
 
     const stripTrailingSubtitleLanguageSuffix = (rawBaseName) => {
         let out = String(rawBaseName || "").trim();
@@ -12948,11 +13100,11 @@ ${quizTargetLanguage}
         return map[selectedName.toLowerCase()] || null;
     }, [selectedKnowledgeTxtName]);
 
-    const loadKnowledgeBankFromTxtFile = useCallback(async (file, { baseName = "", quizTargetLanguage = "", trackKey = "" } = {}) => {
+    const loadKnowledgeBankFromTxtFile = useCallback(async (file, { baseName = "", quizTargetLanguage = "", trackKey = "", sourceText = null } = {}) => {
         if (!file || (typeof file.text !== 'function' && typeof file.arrayBuffer !== 'function')) {
             throw new Error("指定知識點檔不存在或無法讀取。");
         }
-        const rawTxt = String(await readTextFileRobust(file, { purpose: "knowledge" }) || "").trim();
+        const rawTxt = String(sourceText ?? await readTextFileRobust(file, { purpose: "knowledge" }) ?? "").trim();
         const txt = rawTxt;
         if (!txt) {
             throw new Error(`知識點檔為空：${String(file?.name || "unknown")}`);
@@ -17326,8 +17478,11 @@ ${userQ}`;
         return buildKnowledgeTermEntriesFromTxt(embeddedKnowledgeText);
     }, [buildKnowledgeTermEntriesFromTxt, embeddedKnowledgeIsDirectBookText, embeddedKnowledgeText]);
     const embeddedKnowledgeAlignmentIndex = useMemo(() => {
-        return buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText, { allowWholeDocumentFallback: embeddedKnowledgeIsDirectBookText });
-    }, [embeddedKnowledgeText, embeddedKnowledgeIsDirectBookText]);
+        const file = selectedFolderFilesRef.current?.[String(embeddedKnowledgeFileInfo?.filename || "").toLowerCase()];
+        const cached = file && embeddedKnowledgeTabIndexCacheRef.current.get(getKnowledgeReferenceFileKey(file));
+        return cached?.rawTxt === embeddedKnowledgeText ? cached.index
+            : buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText, { allowWholeDocumentFallback: embeddedKnowledgeIsDirectBookText });
+    }, [embeddedKnowledgeText, embeddedKnowledgeIsDirectBookText, embeddedKnowledgeFileInfo?.filename]);
     const embeddedKnowledgeDocumentKey = useMemo(() => {
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
@@ -17348,6 +17503,17 @@ ${userQ}`;
             embeddedKnowledgeAlignmentLogRef.current = [];
             embeddedKnowledgeAlignmentLogSignatureRef.current = "";
             documentReset = true;
+        }
+        const locatedCue = embeddedKnowledgeLocatedCue?.filename === embeddedKnowledgeFileInfo?.filename &&
+            embeddedKnowledgeLocatedCue?.subtitleIndex === currentIndex ? embeddedKnowledgeLocatedCue : null;
+        // A verified cross-file/content search supersedes the old sequential
+        // cursor, including large backwards seeks within the same TXT.
+        if (locatedCue) {
+            progress.anchorState = "anchored";
+            progress.maxSourceLine = locatedCue.sourceLine;
+            progress.anchorCandidate = null;
+            progress.trustedSourceLines = [locatedCue.sourceLine];
+            progress.forwardMisses = 0;
         }
         // 正常往後播放時，不能因為模糊匹配回頭標記已讀原文。
         // 只有兩個有效 LRC 索引真的倒退時，才視為使用者回播。播放時短暫的 -1
@@ -17392,6 +17558,7 @@ ${userQ}`;
                 : (isAnchored ? Infinity : INITIAL_ANCHOR_MAX_LINES));
         const allRawMatches = Number.isInteger(manualSourceLine) && manualSourceLine >= 0
             ? [{ sourceLine: manualSourceLine, score: 1, manual: true }]
+            : locatedCue ? [{ sourceLine: locatedCue.sourceLine, score: locatedCue.score }]
             : findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics, {
                 index: embeddedKnowledgeAlignmentIndex,
                 startLine: windowStart,
@@ -17530,7 +17697,7 @@ ${userQ}`;
             }
         }
         return visibleMatches;
-    }, [embeddedKnowledgeText, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, currentIndex]);
+    }, [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeLocatedCue, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, currentIndex]);
     useEffect(() => {
         setEmbeddedKnowledgeMatchCandidates(embeddedKnowledgeMatchCandidatesRef.current || []);
     }, [embeddedKnowledgeDocumentKey, currentIndex, embeddedKnowledgeSubtitleMatches]);
@@ -19085,23 +19252,38 @@ ${userQ}`;
         };
     }, [subtitleDisplayText, effectiveSubtitleFontSize, fittedSubtitleFontSize]);
 
-    const loadEmbeddedKnowledgeTxtFile = useCallback(async (file, { markSelected = true, preferSeriesStart = false } = {}) => {
+    const getEmbeddedKnowledgeTabSearchData = useCallback((file, { isCurrent = () => true, keepFile = null } = {}) =>
+        embeddedKnowledgeTabIndexCacheRef.current.load(file, async candidate => {
+            const rawTxt = String(await readManualDocumentText(candidate) || "").trim();
+            const allowWholeDocumentFallback = !/(?:知識點|knowledge\s*point|\.lrc(?:\s|$))/i.test(String(candidate?.name || ""));
+            return { rawTxt, index: buildKnowledgeOriginalSearchIndex(rawTxt, { allowWholeDocumentFallback }) };
+        }, isCurrent, keepFile ? getKnowledgeReferenceFileKey(keepFile) : ""), []);
+
+    const loadEmbeddedKnowledgeTxtFile = useCallback(async (file, { markSelected = true, preferSeriesStart = false, isCurrent = () => true } = {}) => {
         if (!file) throw new Error("找不到指定的文字檔。");
         const seriesStartFile = preferSeriesStart ? getKnowledgeSeriesTabEntries(String(file?.name || ""))?.[0]?.file : null;
         const fileToLoad = seriesStartFile || file;
+        const requestId = ++embeddedKnowledgeLoadRequestRef.current;
+        const canCommit = () => requestId === embeddedKnowledgeLoadRequestRef.current && isCurrent();
         setEmbeddedKnowledgeLoading(true);
         setEmbeddedKnowledgeError("");
         try {
-            mergeFilesIntoSelectedFolderMap([fileToLoad]);
-            const rawTxt = String(await readManualDocumentText(fileToLoad) || "").trim();
+            if (selectedFolderFilesRef.current?.[String(fileToLoad?.name || "").toLowerCase()] !== fileToLoad) {
+                mergeFilesIntoSelectedFolderMap([fileToLoad]);
+            }
+            const data = await getEmbeddedKnowledgeTabSearchData(fileToLoad, { isCurrent: canCommit });
+            if (!data || !canCommit()) return { ok: false };
+            const rawTxt = data.rawTxt;
             if (!rawTxt) throw new Error("文字檔為空。");
             let knowledgeBank = null;
             try {
                 knowledgeBank = await loadKnowledgeBankFromTxtFile(fileToLoad, {
                     quizTargetLanguage: trackLanguage,
+                    sourceText: rawTxt,
                     trackKey: `${currentTrackIndex >= 0 ? currentTrackIndex : "manual"}:embedded:${String(fileToLoad?.name || "").toLowerCase()}`
                 });
             } catch (_) {}
+            if (!canCommit()) return { ok: false };
             setEmbeddedKnowledgeText(rawTxt);
             setEmbeddedKnowledgeFileInfo({
                 filename: String(knowledgeBank?.filename || fileToLoad?.name || "知識點.txt"),
@@ -19116,7 +19298,12 @@ ${userQ}`;
                 setActiveTrackKnowledgeTabName(String(fileToLoad?.name || "知識點.txt"));
             }
             if (knowledgeBank) {
-                setQuizKnowledgeBankMap(prev => ({ ...prev, [knowledgeBank.trackKey]: knowledgeBank }));
+                // Reference navigation must not retain every previously opened
+                // parsed quiz bank. Explicit quiz/flashcard banks are untouched.
+                setQuizKnowledgeBankMap(prev => ({
+                    ...Object.fromEntries(Object.entries(prev).filter(([key]) => !key.includes(":embedded:"))),
+                    [knowledgeBank.trackKey]: knowledgeBank
+                }));
                 setQuizKnowledgePointsPool(knowledgeBank.points || []);
                 setQuizKnowledgeFileInfo({
                     filename: knowledgeBank.filename,
@@ -19135,12 +19322,15 @@ ${userQ}`;
             if (preferSeriesStart) embeddedKnowledgePreferSeriesStartRef.current = false;
             return { ok: true, rawTxt, filename: String(fileToLoad?.name || "知識點.txt") };
         } finally {
-            setEmbeddedKnowledgeLoading(false);
+            if (requestId === embeddedKnowledgeLoadRequestRef.current) setEmbeddedKnowledgeLoading(false);
         }
-    }, [currentTrackIndex, loadKnowledgeBankFromTxtFile, mergeFilesIntoSelectedFolderMap, trackLanguage]);
+    }, [currentTrackIndex, getEmbeddedKnowledgeTabSearchData, loadKnowledgeBankFromTxtFile, mergeFilesIntoSelectedFolderMap, trackLanguage]);
 
     const handleManualKnowledgeTxtFileForEmbedded = useCallback(async (file) => {
         if (!file) return;
+        setEmbeddedKnowledgeAutoFollow(false);
+        setEmbeddedKnowledgeLocatedCue(null);
+        setEmbeddedKnowledgeFollowStatus("手動選檔；可勾選「跟隨播放」恢復自動定位");
         try {
             const result = await loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
             setIsVideoMasked(false);
@@ -19249,19 +19439,6 @@ ${userQ}`;
         if (!file) throw new Error(`找不到指定的知識點 txt：${targetName}`);
         return loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
     }, [getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile]);
-    const getEmbeddedKnowledgeTabSearchData = useCallback(async (file) => {
-        const cacheKey = `${String(file?.name || '')}:${Number(file?.size || 0)}:${Number(file?.lastModified || 0)}`;
-        const cached = embeddedKnowledgeTabIndexCacheRef.current.get(cacheKey);
-        if (cached) return cached;
-        const rawTxt = String(await readManualDocumentText(file) || "").trim();
-        const allowWholeDocumentFallback = !/(?:知識點|knowledge\s*point|\.lrc(?:\s|$))/i.test(String(file?.name || ""));
-        const data = {
-            rawTxt,
-            index: buildKnowledgeOriginalSearchIndex(rawTxt, { allowWholeDocumentFallback })
-        };
-        embeddedKnowledgeTabIndexCacheRef.current.set(cacheKey, data);
-        return data;
-    }, []);
 
     const handleSelectTrackKnowledgeTab = useCallback(async (name, { target = "modal" } = {}) => {
         const nextName = String(name || "").trim();
@@ -19269,6 +19446,9 @@ ${userQ}`;
         setActiveTrackKnowledgeTabName(nextName);
         setSelectedKnowledgeTxtName(nextName);
         if (target === "embedded") {
+            setEmbeddedKnowledgeAutoFollow(false);
+            setEmbeddedKnowledgeLocatedCue(null);
+            setEmbeddedKnowledgeFollowStatus("手動選檔；開啟「跟隨播放」即可恢復自動定位");
             try {
                 await openEmbeddedKnowledgeTxtByName(nextName);
             } catch (err) {
@@ -19283,78 +19463,91 @@ ${userQ}`;
         }
     }, [openEmbeddedKnowledgeTxtByName, openKnowledgeTxtInModal]);
     useEffect(() => {
-        const subtitleText = subtitles[currentIndex]?.text || "";
-        const searchKey = `${currentIndex}:${subtitleText}`;
-        if (topPanelMode !== 'document' || embeddedKnowledgeLoading || trackKnowledgeTabEntries.length < 2 || embeddedKnowledgeTabSearchRef.current === searchKey) return;
-        embeddedKnowledgeTabSearchRef.current = searchKey;
+        if (!embeddedKnowledgeAutoFollow || topPanelMode !== 'document' || isVideoMasked ||
+            currentIndex < 0 || trackKnowledgeTabEntries.length < 2 || !embeddedKnowledgeFileInfo?.filename) return;
+        const searchKey = `${currentTrackIndex}:${currentIndex}:${subtitles[currentIndex]?.text || ""}`;
+        if (embeddedKnowledgeTabSearchRef.current === searchKey) return;
         let cancelled = false;
+        const isCurrent = () => !cancelled;
+        const lookupRef = embeddedKnowledgeCueLookupRef.current;
+        if (!lookupRef || lookupRef.subtitles !== subtitles) {
+            embeddedKnowledgeCueLookupRef.current = buildKnowledgeReferenceCueLookup(subtitles);
+            embeddedKnowledgeReferenceRangesRef.current.clear();
+        }
+        const lookup = embeddedKnowledgeCueLookupRef.current;
         (async () => {
-            const names = trackKnowledgeTabEntries.map(entry => String(entry?.name || "")).filter(Boolean);
-            const activeIndex = Math.max(0, names.indexOf(activeTrackKnowledgeTabName));
-            const activeName = names[activeIndex];
-            const sequence = embeddedKnowledgeTabSequenceRef.current;
-            const isForward = Number.isInteger(currentIndex) && currentIndex > Number(sequence.subtitleIndex || -1);
-            if (!isForward) {
-                // Manual rewind/seeking has no dependable 1/n position.  Let
-                // the current tab establish a fresh cursor; never jump back to
-                // an earlier tab automatically.
-                sequence.tabName = activeName;
-                sequence.sourceLine = -1;
-                sequence.misses = 0;
-            }
-            const pickForwardMatch = (data, minimumLine = -1) => {
-                const matches = findKnowledgeSubtitleMatches(data.rawTxt, subtitleText, null, { index: data.index });
-                return matches
-                    .filter(match => Number(match?.score || 0) >= 0.84 && Number(match?.sourceLine) >= minimumLine)
-                    .sort((a, b) => Number(a.sourceLine) - Number(b.sourceLine) || Number(b.score) - Number(a.score))[0] || null;
-            };
+            let unreadable = 0;
+            const activeName = embeddedKnowledgeFileInfo.filename;
             const activeFile = getKnowledgeTxtFileByName(activeName);
-            if (!activeFile) return;
-            const activeData = await getEmbeddedKnowledgeTabSearchData(activeFile);
-            if (cancelled || !activeData.rawTxt) return;
-            const keepAfter = isForward && sequence.tabName === activeName ? Number(sequence.sourceLine || -1) : -1;
-            const activeMatch = pickForwardMatch(activeData, keepAfter);
-            if (activeMatch) {
-                sequence.subtitleIndex = currentIndex;
-                sequence.tabName = activeName;
-                sequence.sourceLine = Number(activeMatch.sourceLine);
-                sequence.misses = 0;
-                return;
+            const candidates = rankKnowledgeReferenceFiles(trackKnowledgeTabEntries, currentIndex, subtitles,
+                activeName, embeddedKnowledgeReferenceRangesRef.current);
+            setEmbeddedKnowledgeFollowStatus("按字幕尋找對應檔案…");
+            for (let index = 0; index < candidates.length; index += 1) {
+                if (!isCurrent()) return;
+                const entry = candidates[index];
+                setEmbeddedKnowledgeFollowStatus(`比對 ${entry.label} · 完整文件快取上限 2 份`);
+                let data;
+                try {
+                    data = await getEmbeddedKnowledgeTabSearchData(entry.file, { isCurrent, keepFile: activeFile });
+                } catch (_) { unreadable += 1; continue; }
+                if (!isCurrent() || !data) return;
+                const key = getKnowledgeReferenceFileKey(entry.file);
+                if (!embeddedKnowledgeReferenceRangesRef.current.has(key)) {
+                    embeddedKnowledgeReferenceRangesRef.current.set(key, getKnowledgeReferenceRange(data, lookup));
+                }
+                const evidence = getKnowledgeReferenceEvidence(data, subtitles, currentIndex);
+                if (evidence) {
+                    embeddedKnowledgeTabSequenceRef.current.subtitleIndex = currentIndex;
+                    embeddedKnowledgeTabSearchRef.current = searchKey;
+                    setEmbeddedKnowledgeLocatedCue({ ...evidence, filename: entry.name });
+                    setEmbeddedKnowledgeFollowStatus(`字幕已定位 ${entry.label} · 文件快取 ${embeddedKnowledgeTabIndexCacheRef.current.size}/2`);
+                    if (entry.name !== activeName) {
+                        await loadEmbeddedKnowledgeTxtFile(entry.file, { markSelected: true, isCurrent });
+                    }
+                    return;
+                }
+                const previousCue = embeddedKnowledgeTabSequenceRef.current.subtitleIndex;
+                const isShortCue = normalizeKnowledgeAlignmentText(subtitles[currentIndex]?.text).split(" ").length < 4;
+                if (entry.name === activeName && isShortCue && previousCue >= 0 && Math.abs(currentIndex - previousCue) <= 2) {
+                    embeddedKnowledgeTabSequenceRef.current.subtitleIndex = currentIndex;
+                    embeddedKnowledgeTabSearchRef.current = searchKey;
+                    setEmbeddedKnowledgeFollowStatus("短句無足夠前後文；暫留目前檔，下一句再確認");
+                    return;
+                }
+                // Yield between files: searching must not block playback or scrubbing.
+                await new Promise(resolve => setTimeout(resolve, 0));
             }
-            sequence.subtitleIndex = currentIndex;
-            sequence.tabName = activeName;
-            sequence.misses = Number(sequence.misses || 0) + 1;
-            if (!isForward) return;
-            const nextName = names[activeIndex + 1];
-            if (!nextName) return;
-            const nextFile = getKnowledgeTxtFileByName(nextName);
-            if (!nextFile) return;
-            const nextData = await getEmbeddedKnowledgeTabSearchData(nextFile);
-            if (cancelled || !nextData.rawTxt) return;
-            const nextMatch = pickForwardMatch(nextData, -1);
-            const lastActiveLine = activeData.index.entries.length
-                ? Number(activeData.index.entries[activeData.index.entries.length - 1].sourceLine)
-                : -1;
-            const reachedCurrentEnd = lastActiveLine >= 0 && Number(sequence.sourceLine || -1) >= lastActiveLine - 5;
-            // A small version discrepancy can miss one cue.  Do not abandon a
-            // tab on that one miss unless its previously matched line was at
-            // the end; otherwise require two consecutive misses.
-            if (nextMatch && (reachedCurrentEnd || sequence.misses >= 2)) {
-                sequence.tabName = nextName;
-                sequence.sourceLine = Number(nextMatch.sourceLine);
-                sequence.misses = 0;
-                setActiveTrackKnowledgeTabName(nextName);
-                setSelectedKnowledgeTxtName(nextName);
-                await loadEmbeddedKnowledgeTxtFile(nextFile, { markSelected: true });
-            }
-        })();
+            if (!isCurrent()) return;
+            embeddedKnowledgeTabSearchRef.current = searchKey;
+            setEmbeddedKnowledgeFollowStatus(unreadable
+                ? `未確認對應（${unreadable} 檔讀取失敗）；保留目前檔，可手動選擇`
+                : "字幕／前後文不足以確認；保留目前檔，可手動選擇");
+        })().catch(err => {
+            if (isCurrent()) setEmbeddedKnowledgeFollowStatus(`定位未完成：${String(err?.message || err)}`);
+        });
         return () => { cancelled = true; };
-    }, [activeTrackKnowledgeTabName, currentIndex, embeddedKnowledgeLoading, getEmbeddedKnowledgeTabSearchData, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile, subtitles, topPanelMode, trackKnowledgeTabEntries]);
+    }, [currentTrackIndex, currentIndex, embeddedKnowledgeAutoFollow, embeddedKnowledgeFileInfo?.filename,
+        getEmbeddedKnowledgeTabSearchData, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile,
+        subtitles, topPanelMode, isVideoMasked, trackKnowledgeTabEntries]);
     const renderTrackKnowledgeTabs = (target = "modal") => {
         if (!Array.isArray(trackKnowledgeTabEntries) || trackKnowledgeTabEntries.length <= 1) return null;
         const activeName = String(activeTrackKnowledgeTabName || "").trim();
         return (
             <div className="flex flex-wrap items-center gap-2">
+                {target === "embedded" && (
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 w-full text-[11px] text-slate-600">
+                        <label className="inline-flex items-center gap-1 cursor-pointer">
+                            <input type="checkbox" checked={embeddedKnowledgeAutoFollow}
+                                onChange={event => {
+                                    embeddedKnowledgeTabSearchRef.current = "";
+                                    setEmbeddedKnowledgeAutoFollow(event.target.checked);
+                                    setEmbeddedKnowledgeFollowStatus(event.target.checked ? "按字幕定位…" : "手動選檔（自動跟隨已暫停）");
+                                }} />
+                            跟隨播放（按需載入）
+                        </label>
+                        <span role="status">{embeddedKnowledgeFollowStatus || "僅載入目前文件及搜尋候選，最多快取 2 份"}</span>
+                    </div>
+                )}
                 {trackKnowledgeTabEntries.map((entry) => {
                     const name = String(entry?.name || "");
                     const active = activeName === name;
