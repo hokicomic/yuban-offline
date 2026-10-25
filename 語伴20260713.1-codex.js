@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.211 · lazy-knowledge-reference-follow";
+const APP_VERSION = "v5.212 · compact-reference-toolbar";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19500,21 +19500,20 @@ ${userQ}`;
         if (!Array.isArray(trackKnowledgeTabEntries) || trackKnowledgeTabEntries.length <= 1) return null;
         const activeName = String(activeTrackKnowledgeTabName || "").trim();
         return (
-            <div className="flex flex-wrap items-center gap-2">
+            <div data-knowledge-tabs={target} className={target === "embedded" ? "flex h-8 min-w-0 items-center gap-2" : "flex flex-wrap items-center gap-2"}>
                 {target === "embedded" && (
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 w-full text-[11px] text-slate-600">
-                        <label className="inline-flex items-center gap-1 cursor-pointer">
+                        <label className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap cursor-pointer text-[11px] text-slate-600"
+                            title={embeddedKnowledgeFollowStatus || "按字幕定位；按需載入，最多快取兩份文件"}>
                             <input type="checkbox" checked={embeddedKnowledgeAutoFollow}
                                 onChange={event => {
                                     embeddedKnowledgeTabSearchRef.current = "";
                                     setEmbeddedKnowledgeAutoFollow(event.target.checked);
                                     setEmbeddedKnowledgeFollowStatus(event.target.checked ? "按字幕定位…" : "手動選檔（自動跟隨已暫停）");
                                 }} />
-                            跟隨播放（按需載入）
+                            跟隨播放
                         </label>
-                        <span role="status">{embeddedKnowledgeFollowStatus || "僅載入目前文件及搜尋候選，最多快取 2 份"}</span>
-                    </div>
                 )}
+                <div data-knowledge-tab-list={target} className={target === "embedded" ? "flex min-w-0 flex-1 items-center gap-1 overflow-x-auto no-scrollbar" : "contents"}>
                 {trackKnowledgeTabEntries.map((entry) => {
                     const name = String(entry?.name || "");
                     const active = activeName === name;
@@ -19523,13 +19522,20 @@ ${userQ}`;
                             key={`${target}-${name}`}
                             type="button"
                             onClick={() => handleSelectTrackKnowledgeTab(name, { target })}
-                            className={`px-3 py-1.5 text-xs rounded-full border transition-colors ${active ? 'bg-cyan-100 text-cyan-800 border-cyan-300' : 'bg-white text-gray-600 border-gray-200 hover:bg-cyan-50 hover:text-cyan-700 hover:border-cyan-200'}`}
+                            className={`${target === "embedded" ? "shrink-0 whitespace-nowrap px-2 py-1" : "px-3 py-1.5"} text-xs rounded-full border transition-colors ${active ? 'bg-cyan-100 text-cyan-800 border-cyan-300' : 'bg-white text-gray-600 border-gray-200 hover:bg-cyan-50 hover:text-cyan-700 hover:border-cyan-200'}`}
                             title={name}
                         >
                             {String(entry?.label || name)}
                         </button>
                     );
                 })}
+                </div>
+                {target === "embedded" && (
+                    <span role="status" className="sr-only md:not-sr-only md:block md:max-w-[16rem] md:truncate md:text-[11px] md:text-slate-500"
+                        title={embeddedKnowledgeFollowStatus}>
+                        {embeddedKnowledgeFollowStatus || "按需載入 · 最多快取 2 份"}
+                    </span>
+                )}
             </div>
         );
     };
@@ -20049,7 +20055,7 @@ ${userQ}`;
                                     <button onClick={handleToggleMediaPanel} className="p-1.5 bg-gray-200 text-gray-700 rounded-full hover:bg-gray-300 z-20"><Minimize2 size={16} /></button>
                                 </div>
                                 {trackKnowledgeTabEntries.length > 1 && (
-                                    <div className="px-3 py-2 border-b border-gray-100 bg-white shrink-0 overflow-x-auto no-scrollbar">
+                                    <div className="px-3 py-0.5 border-b border-gray-100 bg-white shrink-0 min-w-0">
                                         {renderTrackKnowledgeTabs("embedded")}
                                     </div>
                                 )}
