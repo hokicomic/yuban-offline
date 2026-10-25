@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.214 · text-encoding-fix";
+const APP_VERSION = "v5.215 · sentence-loop-recovery";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8441,6 +8441,7 @@ export default function App() {
         mediaSeekRef.current.active = false;
         timerTokenRef.current += 1;
         if (workerRef.current) workerRef.current.postMessage({ type: 'STOP_TIMER' });
+        isGapPausing.current = false;
     };
 
     const clampEchoTime = (value, start = echoBounds.start, end = echoBounds.end) => {
@@ -9726,50 +9727,35 @@ export default function App() {
         }
     };
 
-    // [FIX] Updated togglePlay to handle Shadow Wait cancellation using REF
+    // Resume through the same verified seek path used by dragging and looping.
     const togglePlay = () => {
         if (mediaSeekRef.current.active) {
             setSeekNotice('正在定位，完成後才會播放。');
             return;
         }
-        if (playerRef.current) {
-            // Check REF for truth
-            if (isWaitingShadowRef.current) {
-                // Cancel worker wait via message if needed (or just ignore it by state change)
-                cancelWorkerTimer();
-                setIsWaitingShadow(false);
-                isWaitingShadowRef.current = false;
-                setShadowCountdown(0);
-                isGapPausing.current = false;
-
-                // Rewind to start of current sentence for drill practice
-                if (subtitles[currentIndex]) {
-                    playerRef.current.currentTime = getBufferedRange(subtitles[currentIndex]).start;
-                }
-                playerRef.current.play().catch(e => console.log("Toggle play blocked:", e));
-                setIsPlaying(true);
-            } else {
-                // Normal toggle
-                if (playerRef.current.paused) {
-                    // [FIX] If at end of subtitle, rewind to start to prevent immediate shadow re-trigger
-                    if (playbackMode !== 'continuous' && subtitles.length > 0 && currentIndex !== -1) {
-                        const currentSub = subtitles[currentIndex];
-                        const { start, end } = getBufferedRange(currentSub);
-                        // If we are very close to end or past it
-                        if (Math.abs(playerRef.current.currentTime - end) < 0.5 || playerRef.current.currentTime >= end) {
-                            playerRef.current.currentTime = start;
-                            currentRepeatRef.current = 0; // Reset repeat count for new cycle
-                        }
-                    }
-
-                    playerRef.current.play().catch(e => console.log("Play blocked:", e));
-                    setIsPlaying(true);
-                } else {
-                    playerRef.current.pause();
-                    setIsPlaying(false);
-                }
+        const player = playerRef.current;
+        if (!player) return;
+        if (!player.paused) {
+            cancelWorkerTimer();
+            player.pause();
+            setIsPlaying(false);
+            return;
+        }
+        const wasWaiting = isWaitingShadowRef.current;
+        cancelWorkerTimer();
+        setIsWaitingShadow(false);
+        isWaitingShadowRef.current = false;
+        setShadowCountdown(0);
+        const currentSub = subtitles[currentIndex];
+        if (playbackMode !== 'continuous' && currentSub) {
+            const { start, end } = getBufferedRange(currentSub);
+            if (wasWaiting || player.currentTime >= end - 0.5) {
+                currentRepeatRef.current = 0;
+                seekThenMaybePlay(start, true);
+                return;
             }
         }
+        player.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
     };
 
     // --- WORKER INTEGRATION ---
@@ -9955,14 +9941,16 @@ export default function App() {
             if (!state || !state.player) return;
 
             const { player, isPlaying, isGapPausingRef, subtitles, currentIndex, setCurrentIndex, isShadowing, isEchoMode, isWaitingShadowRef, loopMode, shadowGapAdjustment, shadowRepeatCount, isShadowInfinite, isShadowGapOriginal, playbackRate, currentRepeatRef, jumpToSubtitle, setIsPlaying, setIsWaitingShadow, setShadowCountdown, getBufferedRange, playbackMode, worker } = state;
-            if (progressSeekRef.current.dragging || mediaSeekRef.current.active || player.seeking) return;
+            if (progressSeekRef.current.dragging || mediaSeekRef.current.active) return;
             if (progressSeekRef.current.pendingIndex != null) {
                 if (currentIndex !== progressSeekRef.current.pendingIndex) return;
                 progressSeekRef.current.pendingIndex = null;
             }
 
             if (type === 'TICK') {
-                if (!isPlaying || isGapPausingRef.current) return;
+                if (player.seeking || isGapPausingRef.current) return;
+                const endedSingleSentence = player.ended && playbackMode !== 'continuous' && loopMode === 'single';
+                if (!isPlaying && !endedSingleSentence) return;
                 // Echo Method owns the A-B time range and must not trigger the
                 // normal subtitle-end pause/advance behavior.
                 if (isEchoMode) return;
@@ -9991,10 +9979,9 @@ export default function App() {
                     // subtitles and any opened reference document in sync.
                     const shouldPauseAtEnd = playbackMode !== 'continuous';
 
-                    if (now >= end) {
+                    if (now >= end || endedSingleSentence) {
                         if (shouldPauseAtEnd) {
                             player.pause();
-                            player.currentTime = end;
                             isGapPausingRef.current = true; // Lock
 
                             // SHADOW LOGIC
@@ -10045,9 +10032,7 @@ export default function App() {
                         if (isShadowInfinite || currentRepeatRef.current < shadowRepeatCount) {
                             if (player) {
                                 const currentSub = subtitles[currentIndex];
-                                player.currentTime = getBufferedRange(currentSub).start;
-                                player.play().catch(e => console.warn(e));
-                                setIsPlaying(true);
+                                seekThenMaybePlay(getBufferedRange(currentSub).start, true);
                             }
                         } else {
                             currentRepeatRef.current = 0;
@@ -10065,7 +10050,7 @@ export default function App() {
                                 if (currentIndex + 1 < subtitles.length) jumpToSubtitle(currentIndex + 1);
                                 else setIsPlaying(false);
                             } else {
-                                setIsPlaying(false);
+                                jumpToSubtitle(currentIndex);
                             }
                         }
                     }
@@ -10073,9 +10058,7 @@ export default function App() {
                     // Non-shadowing drill mode behavior (Simple pause -> Next/Repeat)
                     const currentSub = subtitles[currentIndex];
                     if (loopMode === 'single') {
-                        player.currentTime = getBufferedRange(currentSub).start;
-                        player.play().catch(e => console.warn(e));
-                        setIsPlaying(true);
+                        seekThenMaybePlay(getBufferedRange(currentSub).start, true);
                     } else if (loopMode === 'all') {
                         let nextIdx = currentIndex + 1;
                         if (nextIdx >= subtitles.length) {
@@ -19986,8 +19969,9 @@ ${userQ}`;
                                 // Ensure progress reaches 100% when the media completes
                                 markAllSubtitlesWatched();
                                 // In sentence-loop drill, never auto-switch track at media end.
-                                if (loopModeRef.current === 'single') {
-                                    setIsPlaying(false);
+                                if (loopModeRef.current === 'single' && latestStateRef.current.playbackMode !== 'continuous') {
+                                    // The last sentence may end exactly at media EOF, before a heartbeat.
+                                    workerRef.current?.onmessage?.({ data: { type: 'TICK' } });
                                     return;
                                 }
                                 // Use the single playlist transition path. It
