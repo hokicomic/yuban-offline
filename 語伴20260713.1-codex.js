@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.212 · compact-reference-toolbar";
+const APP_VERSION = "v5.213 · playlist-continuity";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19602,13 +19602,17 @@ ${userQ}`;
     }, [isEchoMode, isToolbarVisible, playbackMode]);
 
     useEffect(() => {
-        setIsVideoMasked(true);
-        setTopPanelMode(isAudioOnlyTrack ? 'document' : 'media');
+        // Track changes must not reset the user's top-panel choice. In
+        // particular, playlist autoplay should keep an open video/document
+        // panel open and keep the selected mode while the next track loads.
         setEmbeddedKnowledgeText("");
         setEmbeddedKnowledgeFileInfo(null);
         setEmbeddedKnowledgeError("");
         setEmbeddedKnowledgeLoading(false);
-    }, [currentTrackIndex, isAudioOnlyTrack]);
+        if (topPanelMode === 'document' && !isVideoMasked) {
+            void loadEmbeddedKnowledgePanel();
+        }
+    }, [currentTrackIndex]);
 
     const renderSeekTimeControls = () => !isEchoMode && (
         <form onSubmit={submitSeekTime} className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1 px-3 py-1">
@@ -19960,17 +19964,10 @@ ${userQ}`;
                                     setIsPlaying(false);
                                     return;
                                 }
-                                if (playlist.length === 0) return;
-                                const mode = playlistLoopModeRef.current;
-                                const idx = currentTrackIndexRef.current;
-                                if (mode === 'single') {
-                                    loadTrack(idx, playlist);
-                                } else if (mode === 'all') {
-                                    const nextIdx = (idx + 1) % playlist.length;
-                                    loadTrack(nextIdx, playlist);
-                                } else {
-                                    setIsPlaying(false);
-                                }
+                                // Use the single playlist transition path. It
+                                // arms autoplay before changing src, so
+                                // "清單全部" advances and starts the next track.
+                                handlePlaylistEnd();
                             }} />
                         {isVideoMasked && (
                             <div className="w-full h-full flex items-center justify-center">
