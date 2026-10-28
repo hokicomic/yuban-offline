@@ -99,6 +99,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         let tick;
         let pauses = 0;
         c.isEchoMode = true;
+        c.mediaSeekRef = { current: { active: false } };
         c.setCurrentTime = noop;
         c.useEffect = fn => fn();
         c.playerRef.current.pause = () => { pauses += 1; };

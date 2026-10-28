@@ -102,7 +102,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     });
     test('manual replay cancels gap lock and verifies A before playing: ' + file, () => {
         const { c, state, player } = setup();
-        Object.assign(c, { playerRef: { current: player }, isGapPausing: state.isGapPausingRef,
+        Object.assign(c, { trackLoadRef: { current: { active: false } }, mediaPlayRef: { current: { active: false } }, playerRef: { current: player }, isGapPausing: state.isGapPausingRef,
             subtitles: state.subtitles, currentIndex: 0, playbackMode: 'sentence',
             isWaitingShadowRef: state.isWaitingShadowRef, currentRepeatRef: state.currentRepeatRef,
             getBufferedRange: state.getBufferedRange, setIsPlaying: state.setIsPlaying,

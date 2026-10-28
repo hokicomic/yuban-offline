@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.215 · sentence-loop-recovery";
+const APP_VERSION = "v5.216 · managed-playback-start";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3522,6 +3522,7 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
     };
     const assignTarget = () => {
         if (player.readyState < 1 || player.seeking || attempts >= 3) return;
+        if (Math.abs(Number(player.currentTime) - target) <= 0.15) return;
         attempts += 1;
         try { player.currentTime = target; } catch (_) { /* Retry after metadata is available. */ }
     };
@@ -3549,6 +3550,63 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
     assignTarget();
     poll();
     return cancel;
+};
+
+// Keep one playback request alive while data arrives; only retry a transient
+// interruption. Permission/format failures require a visible, actionable result.
+const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, timeoutMs = 15000 }) => {
+    let finished = false;
+    let retryPending = false;
+    let retries = 0;
+    let timer = null;
+    const source = player.src;
+    const current = () => isCurrent() && player.src === source;
+    const cleanup = () => {
+        finished = true;
+        if (timer != null) clearTimeout(timer);
+        ['canplay', 'loadeddata'].forEach(name => player.removeEventListener(name, retry));
+        player.removeEventListener('error', mediaError);
+    };
+    const fail = (error) => {
+        if (finished) return;
+        const valid = current();
+        cleanup();
+        if (valid) { player.pause(); onFailure(error); }
+    };
+    const attempt = () => {
+        if (finished || !current()) { cleanup(); return; }
+        retryPending = false;
+        let result;
+        try { result = player.play(); } catch (error) { fail(error); return; }
+        Promise.resolve(result).then(() => {
+            if (finished) return;
+            const valid = current();
+            cleanup();
+            if (valid) onPlaying();
+        }).catch(error => {
+            if (finished || !current()) { cleanup(); return; }
+            if (error?.name === 'AbortError' && retries < 1 && !player.error) {
+                retries++;
+                retryPending = true;
+                // A deferred retry also avoids re-entering play() from its rejection.
+                queueMicrotask(retry);
+            } else fail(error);
+        });
+    };
+    const retry = () => {
+        if (retryPending && player.readyState >= 2) attempt();
+    };
+    const mediaError = () => fail({ name: 'MediaError', code: player.error?.code, message: player.error?.message || '媒體讀取失敗' });
+    ['canplay', 'loadeddata'].forEach(name => player.addEventListener(name, retry));
+    player.addEventListener('error', mediaError);
+    timer = setTimeout(() => fail({ name: 'TimeoutError', message: '等待媒體資料逾時' }), timeoutMs);
+    // This call stays in the original click handler whenever no seek is needed.
+    attempt();
+    return () => {
+        const pending = !finished;
+        cleanup();
+        if (pending) player.pause();
+    };
 };
 
 const parseSRT = (data) => {
@@ -8157,12 +8215,19 @@ export default function GeminiPlayer() {
 
     const lastUserSeekValueRef = useRef(0);
     const mediaSeekRef = useRef({ active: false, cancel: null });
+    const mediaPlayRef = useRef({ active: false, cancel: null });
+    const trackLoadRef = useRef({ token: 0, active: false });
+    useEffect(() => () => mediaPlayRef.current.cancel?.(), []);
+    // Release the previous URL only after React has attached the replacement.
+    useEffect(() => () => {
+        if (String(mediaSrc || '').startsWith('blob:')) URL.revokeObjectURL(mediaSrc);
+    }, [mediaSrc]);
     const [seekNotice, setSeekNotice] = useState("");
     const [seekTimeInput, setSeekTimeInput] = useState("");
     useEffect(() => {
         mediaSeekRef.current.cancel?.();
         mediaSeekRef.current.active = false;
-        setSeekNotice("");
+        if (!trackLoadRef.current.active) setSeekNotice("");
         return () => {
             mediaSeekRef.current.cancel?.();
             mediaSeekRef.current.active = false;
@@ -8458,6 +8523,8 @@ export default function GeminiPlayer() {
     }, [currentIndex]);
 
     const cancelWorkerTimer = () => {
+        mediaPlayRef.current.cancel?.();
+        mediaPlayRef.current.active = false;
         mediaSeekRef.current.cancel?.();
         mediaSeekRef.current.active = false;
         timerTokenRef.current += 1;
@@ -8650,7 +8717,7 @@ export default function GeminiPlayer() {
         const player = playerRef.current;
         if (!isEchoMode || !player) return undefined;
         const onEchoTimeUpdate = () => {
-            if (!echoModeRef.current) return;
+            if (!echoModeRef.current || mediaSeekRef.current.active || player.seeking) return;
             const { start, end } = getEchoPlaybackRange();
             if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
                 player.pause();
@@ -8664,11 +8731,7 @@ export default function GeminiPlayer() {
             setCurrentTime(player.currentTime);
             if (player.currentTime < end - 0.025) return;
             if (echoPhaseRef.current === 'selecting') {
-                const token = ++echoSessionTokenRef.current;
-                player.currentTime = start;
-                player.play().then(() => {
-                    if (echoModeRef.current && echoPhaseRef.current === 'selecting' && token === echoSessionTokenRef.current) setIsPlaying(true);
-                }).catch(() => setIsPlaying(false));
+                seekThenMaybePlay(start, true);
                 return;
             }
             player.pause();
@@ -8682,10 +8745,45 @@ export default function GeminiPlayer() {
         return () => player.removeEventListener('timeupdate', onEchoTimeUpdate);
     }, [isEchoMode]);
 
+    const requestMediaPlay = () => {
+        const player = playerRef.current;
+        if (!player || mediaPlayRef.current.active) return;
+        const session = { active: true, cancel: null };
+        mediaPlayRef.current = session;
+        setSeekNotice('正在準備播放…');
+        session.cancel = performManagedMediaPlay(player, {
+            isCurrent: () => mediaPlayRef.current === session && playerRef.current === player,
+            onPlaying: () => {
+                session.active = false;
+                setSeekNotice('');
+                setMediaError('');
+                setIsPlaying(true);
+            },
+            onFailure: (error) => {
+                session.active = false;
+                setIsPlaying(false);
+                const name = String(error?.name || 'Error');
+                setSeekNotice(name === 'NotAllowedError'
+                    ? '瀏覽器需要再次點擊授權播放，請按播放。'
+                    : name === 'TimeoutError'
+                        ? '媒體資料尚未就緒，請確認檔案已下載完成後再按播放。'
+                        : '播放未成功，請再按播放；若持續失敗，請重新選取本機檔案。');
+                recordPCloudDebug('media.play.fail', {
+                    sourceKind: player.src?.startsWith('blob:') ? 'local-file' : 'remote',
+                    name, message: String(error?.message || ''),
+                    code: Number(error?.code || player.error?.code || 0),
+                    currentTime: Number(player.currentTime) || 0, readyState: player.readyState
+                });
+            }
+        });
+    };
+
     const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null) => {
         const player = playerRef.current;
         if (!player) return;
         const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
+        mediaPlayRef.current.cancel?.();
+        mediaPlayRef.current.active = false;
         mediaSeekRef.current.cancel?.();
         const token = ++timerTokenRef.current;
         const session = { active: true, cancel: null, target: t, resume: shouldPlay };
@@ -8703,13 +8801,7 @@ export default function GeminiPlayer() {
                 syncActual(actual);
                 setSeekNotice('');
                 if (!shouldPlay) return;
-                player.play().then(() => {
-                    if (token === timerTokenRef.current) setIsPlaying(true);
-                }).catch(() => {
-                    if (token !== timerTokenRef.current) return;
-                    setIsPlaying(false);
-                    setSeekNotice('已定位，請按播放。');
-                });
+                requestMediaPlay();
             },
             onFailure: (actual) => {
                 session.active = false;
@@ -9390,7 +9482,7 @@ export default function GeminiPlayer() {
         const entries = pCloudDebugLogRef.current || [];
         const text = pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
         if (!entries.length) {
-            setPCloudDebugLogNotice("尚未有 pCloud 操作紀錄");
+            setPCloudDebugLogNotice("尚未有播放或 pCloud 操作紀錄");
             return;
         }
         try {
@@ -9660,11 +9752,31 @@ export default function GeminiPlayer() {
         if (folderInputRef.current) folderInputRef.current.click();
     };
 
+    const finishMediaLoad = () => {
+        const load = trackLoadRef.current;
+        if (!load.active || !load.metadataReady || !load.subtitlesReady) return;
+        load.active = false;
+        setSeekNotice('');
+        if (autoplayOnLoadRef.current) {
+            autoplayOnLoadRef.current = false;
+            requestMediaPlay();
+        }
+    };
+
     const loadTrack = async (index, list = null) => {
         const targetList = list || playlist;
         if (index < 0 || index >= targetList.length) return;
         const track = targetList[index];
+        const loadToken = trackLoadRef.current.token + 1;
+        trackLoadRef.current = { token: loadToken, active: true, metadataReady: false, subtitlesReady: false };
+        cancelWorkerTimer();
+        playerRef.current?.pause();
+        setIsPlaying(false);
+        setRawSubtitles([]);
+        setSubtitles([]);
+        setCurrentIndex(-1);
         setMediaError("");
+        setSeekNotice('正在載入媒體…');
         const prevTrack = (currentTrackIndexRef.current >= 0 && (playlistRef.current || [])[currentTrackIndexRef.current])
             ? (playlistRef.current || [])[currentTrackIndexRef.current]
             : null;
@@ -9677,7 +9789,6 @@ export default function GeminiPlayer() {
         tailMarkedRef.current = false;
         setCurrentTrackIndex(index);
         currentRepeatRef.current = 0;
-        if (mediaSrc && String(mediaSrc).startsWith("blob:")) URL.revokeObjectURL(mediaSrc);
         try {
             if (track?.mediaFile?.isRemotePCloud) {
                 recordPCloudDebug("media.stream.begin", { track: String(track?.name || ""), apiHost: String(track?.mediaFile?.pCloudConnection?.apiHost || ""), fileid: Number(track?.mediaFile?.pCloudFileId ?? -1) });
@@ -9685,15 +9796,25 @@ export default function GeminiPlayer() {
             const source = track?.mediaFile?.isRemotePCloud
                 ? await track.mediaFile.getStreamUrl()
                 : URL.createObjectURL(track.mediaFile);
+            if (loadToken !== trackLoadRef.current.token) {
+                if (String(source).startsWith('blob:')) URL.revokeObjectURL(source);
+                return;
+            }
+            trackLoadRef.current.source = source;
             setMediaSrc(source);
             if (track?.mediaFile?.isRemotePCloud) recordPCloudDebug("media.stream.success", { track: String(track?.name || ""), sourceHost: (() => { try { return new URL(source).host; } catch (_) { return ""; } })() });
         } catch (err) {
+            if (loadToken !== trackLoadRef.current.token) return;
+            trackLoadRef.current.active = false;
+            autoplayOnLoadRef.current = false;
+            setSeekNotice('');
             setMediaSrc(null);
             setMediaError(err?.message || `無法載入 ${track?.name || "pCloud 媒體"}`);
             if (track?.mediaFile?.isRemotePCloud) recordPCloudDebug("media.stream.fail", { track: String(track?.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
         }
         if (track.subFile) {
             const applySubtitleContent = (content) => {
+                if (loadToken !== trackLoadRef.current.token) return;
                 let parsed = [];
                 if (track.subFile.name.toLowerCase().endsWith('.lrc')) parsed = parseLRC(content);
                 else parsed = parseSRT(content);
@@ -9707,6 +9828,16 @@ export default function GeminiPlayer() {
                 else setSubtitles(parsed);
 
                 setCurrentIndex(0);
+                trackLoadRef.current.subtitlesReady = true;
+                finishMediaLoad();
+            };
+            const subtitleFailure = (err) => {
+                if (loadToken !== trackLoadRef.current.token) return;
+                setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
+                setMediaError(err?.message || '無法讀取字幕，請重新選取檔案。');
+                recordPCloudDebug('subtitle.read.fail', { name: String(track.subFile.name || ''), error: String(err?.message || err) });
+                trackLoadRef.current.subtitlesReady = true;
+                finishMediaLoad();
             };
             if (track.subFile.isRemotePCloud && typeof track.subFile.text === "function") {
                 recordPCloudDebug("subtitle.fetch.begin", { name: String(track.subFile.name || ""), fileid: Number(track.subFile.pCloudFileId ?? -1) });
@@ -9714,17 +9845,20 @@ export default function GeminiPlayer() {
                     recordPCloudDebug("subtitle.fetch.success", { name: String(track.subFile.name || ""), chars: String(content || "").length });
                     applySubtitleContent(content);
                 }).catch((err) => {
-                    setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
-                    setMediaError(err?.message || "無法下載 pCloud 字幕。");
+                    if (loadToken !== trackLoadRef.current.token) return;
+                    subtitleFailure(err);
                     recordPCloudDebug("subtitle.fetch.fail", { name: String(track.subFile.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
                 });
             } else {
                 const reader = new FileReader();
                 reader.onload = (e) => applySubtitleContent(e.target.result);
-                reader.readAsText(track.subFile);
+                reader.onerror = () => subtitleFailure(reader.error);
+                try { reader.readAsText(track.subFile); } catch (err) { subtitleFailure(err); }
             }
         } else {
             setRawSubtitles([]); setSubtitles([]); setTrackLanguage('en-US'); setCurrentIndex(-1);
+            trackLoadRef.current.subtitlesReady = true;
+            finishMediaLoad();
         }
         setIsWaitingShadow(false);
         isWaitingShadowRef.current = false; // Sync Ref
@@ -9750,6 +9884,23 @@ export default function GeminiPlayer() {
 
     // Resume through the same verified seek path used by dragging and looping.
     const togglePlay = () => {
+        if (trackLoadRef.current.active) {
+            const load = trackLoadRef.current;
+            if (load.source && playerRef.current?.src === load.source) {
+                // Mobile browsers may defer even metadata until a direct user play.
+                // Do not wait for loadedmetadata and lose this click's permission.
+                autoplayOnLoadRef.current = false;
+                requestMediaPlay();
+            } else {
+                autoplayOnLoadRef.current = true;
+                setSeekNotice('正在載入，完成後會嘗試播放。');
+            }
+            return;
+        }
+        if (mediaPlayRef.current.active) {
+            setSeekNotice('正在準備播放，請稍候…');
+            return;
+        }
         if (mediaSeekRef.current.active) {
             setSeekNotice('正在定位，完成後才會播放。');
             return;
@@ -9776,7 +9927,7 @@ export default function GeminiPlayer() {
                 return;
             }
         }
-        player.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+        requestMediaPlay();
     };
 
     // --- WORKER INTEGRATION ---
@@ -19667,7 +19818,6 @@ ${userQ}`;
                     className="w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-mono text-gray-800" />
             </label>
             <button type="submit" disabled={!mediaSrc} className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
-            {seekNotice && <span role="status" className="text-[11px] text-amber-800">{seekNotice}</span>}
         </form>
     );
 
@@ -19990,18 +20140,23 @@ ${userQ}`;
                             className={`w-full h-full object-contain ${!isVideoMasked && isTopPanelMediaMode ? 'block' : 'hidden'}`} controls={false} playsInline onLoadedMetadata={(e) => {
                                 setMediaError("");
                                 setDuration(e.target.duration);
-                                if (autoplayOnLoadRef.current && playerRef.current) {
-                                    autoplayOnLoadRef.current = false;
-                                    playerRef.current.play().then(() => {
-                                        setIsPlaying(true);
-                                    }).catch(() => {
-                                        setIsPlaying(false);
-                                    });
-                                }
+                                trackLoadRef.current.metadataReady = true;
+                                finishMediaLoad();
                             }} onError={(e) => {
+                                trackLoadRef.current.active = false;
+                                autoplayOnLoadRef.current = false;
                                 setIsPlaying(false);
+                                setSeekNotice('');
+                                recordPCloudDebug('media.error', {
+                                    track: String(currentPlaylistTrack?.name || ''),
+                                    sourceKind: currentPlaylistTrack?.mediaFile?.isRemotePCloud ? 'pcloud-stream' : 'local-file',
+                                    code: Number(e.currentTarget.error?.code || 0),
+                                    message: String(e.currentTarget.error?.message || ''),
+                                    currentTime: Number(e.currentTarget.currentTime) || 0,
+                                    readyState: e.currentTarget.readyState
+                                });
                                 setMediaError(buildMediaPlaybackErrorMessage(currentPlaylistTrack?.mediaFile, e?.currentTarget?.error || null));
-                            }} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onRateChange={(e) => setPlaybackRate(e.target.playbackRate)} onEnded={() => {
+                            }} onPlaying={() => { if (!mediaSeekRef.current.active) setIsPlaying(true); }} onPause={() => setIsPlaying(false)} onRateChange={(e) => setPlaybackRate(e.target.playbackRate)} onEnded={() => {
                                 // Ensure progress reaches 100% when the media completes
                                 markAllSubtitlesWatched();
                                 // In sentence-loop drill, never auto-switch track at media end.
@@ -20188,16 +20343,17 @@ ${userQ}`;
                             </div>
                         )}
                     </div>
+                    {seekNotice && <div role="status" aria-live="polite" className="w-full px-3 py-1 text-xs text-amber-800">{seekNotice}</div>}
                     {mediaError && (
                         <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 space-y-3">
                             <div className="flex flex-wrap items-center gap-3">
                                 <span className="min-w-0 flex-1">{mediaError}</span>
-                                <button type="button" onClick={copyPCloudDebugLog} className="px-2.5 py-1.5 rounded-lg border border-violet-300 bg-white text-violet-700 text-xs font-medium hover:bg-violet-50 shrink-0">複製 pCloud Log</button>
+                                <button type="button" onClick={copyPCloudDebugLog} className="px-2.5 py-1.5 rounded-lg border border-violet-300 bg-white text-violet-700 text-xs font-medium hover:bg-violet-50 shrink-0">複製播放 Log</button>
                                 <button type="button" onClick={() => setShowPCloudBrowser(true)} className="px-2.5 py-1.5 rounded-lg border border-sky-300 bg-white text-sky-700 text-xs font-medium hover:bg-sky-50 shrink-0">開啟 pCloud</button>
                             </div>
                             <details open className="rounded-lg border border-amber-200 bg-white/70 px-3 py-2">
-                                <summary className="cursor-pointer font-medium text-xs text-amber-900">pCloud 診斷 Log（可手動全選複製）</summary>
-                                <textarea readOnly value={pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries: pCloudDebugLogRef.current || [] }, null, 2)} className="mt-2 w-full min-h-48 max-h-80 resize-y rounded border border-amber-200 bg-white p-2 font-mono text-[11px] leading-relaxed text-slate-700" onFocus={(e) => e.currentTarget.select()} aria-label="pCloud 診斷 Log" />
+                                <summary className="cursor-pointer font-medium text-xs text-amber-900">播放診斷 Log（可手動全選複製）</summary>
+                                <textarea readOnly value={pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries: pCloudDebugLogRef.current || [] }, null, 2)} className="mt-2 w-full min-h-48 max-h-80 resize-y rounded border border-amber-200 bg-white p-2 font-mono text-[11px] leading-relaxed text-slate-700" onFocus={(e) => e.currentTarget.select()} aria-label="播放診斷 Log" />
                             </details>
                         </div>
                     )}
