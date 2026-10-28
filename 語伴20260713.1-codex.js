@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.216 · managed-playback-start";
+const APP_VERSION = "v5.217 · toolbar-toggle-position";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -19788,6 +19788,14 @@ ${userQ}`;
         </form>
     );
 
+    const renderToolbarToggle = () => !isEchoMode && (
+        <button type="button" onClick={() => setIsToolbarVisible(value => !value)}
+            className="absolute bottom-full mb-2 right-2 md:right-3 z-[80] p-1.5 bg-black/70 backdrop-blur border border-black/20 text-white rounded-full shadow-lg hover:bg-black/80 transition-colors"
+            title="下方控制列" aria-label={isToolbarVisible ? '收合下方控制列' : '展開下方控制列'} aria-expanded={isToolbarVisible}>
+            {isToolbarVisible ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+        </button>
+    );
+
     const renderSentenceTimeline = () => (
         <>
                         {playbackMode === 'sentence' && !isEchoMode && sentenceSub && (
@@ -20380,6 +20388,7 @@ ${userQ}`;
                 {/* FIXED BOTTOM TOOLBAR */}
                 {isToolbarVisible && (
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white border-t border-gray-200 z-50 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
+                        {renderToolbarToggle()}
                         {renderSentenceTimeline()}
                         {!isEchoMode && <div className="px-4 pt-3 pb-1">
                             <input type="range" min="0" max={duration || 0} step="0.1" value={progressPreview ?? currentTime}
@@ -20638,6 +20647,7 @@ ${userQ}`;
                 {/* COLLAPSED MINI PLAYER ROW (keep playback controls visible) */}
                 {!isToolbarVisible && !isEchoMode && (
                     <div ref={fixedToolbarRef} className="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur border-t border-gray-200 z-50 pb-safe shadow-[0_-3px_5px_-1px_rgba(0,0,0,0.06)]">
+                        {renderToolbarToggle()}
                         {renderSentenceTimeline()}
                         {renderSeekTimeControls()}
                         <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
@@ -20700,11 +20710,6 @@ ${userQ}`;
                         {isHeaderVisible ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                     </button>
                 </div>
-                {!isEchoMode && <div className={`fixed ${isToolbarVisible ? 'bottom-24' : 'bottom-16'} right-1 md:right-2 z-[80] flex flex-col gap-1.5 pointer-events-auto`}>
-                    <button onClick={() => setIsToolbarVisible(!isToolbarVisible)} className="p-1.5 bg-black/70 backdrop-blur border border-black/20 text-white rounded-full shadow-lg hover:bg-black/80 transition-colors" title="下方控制列">
-                        {isToolbarVisible ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
-                    </button>
-                </div>}
 
                 {/* FABs */}
                 <div className="fixed bottom-36 right-6 z-[60] flex flex-col gap-3 items-end pointer-events-auto">
