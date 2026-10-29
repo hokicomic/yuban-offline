@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.222 · buffered-subtitle-navigation";
+const APP_VERSION = "v5.223 · single-seek-subtitle-navigation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3646,10 +3646,10 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
     timer = setTimeout(() => fail({ name: 'TimeoutError', message: '等待媒體資料逾時' }), timeoutMs);
     // This call stays in the original click handler whenever no seek is needed.
     attempt();
-    return () => {
+    return ({ pause = true } = {}) => {
         const pending = !finished;
         cleanup();
-        if (pending) player.pause();
+        if (pending && pause) player.pause();
     };
 };
 
@@ -8549,8 +8549,8 @@ export default function App() {
 
     }, [currentIndex]);
 
-    const cancelWorkerTimer = () => {
-        mediaPlayRef.current.cancel?.();
+    const cancelWorkerTimer = ({ preservePlayback = false } = {}) => {
+        mediaPlayRef.current.cancel?.({ pause: !preservePlayback });
         mediaPlayRef.current.active = false;
         mediaSeekRef.current.cancel?.();
         mediaSeekRef.current.active = false;
@@ -8772,7 +8772,7 @@ export default function App() {
         return () => player.removeEventListener('timeupdate', onEchoTimeUpdate);
     }, [isEchoMode]);
 
-    const requestMediaPlay = ({ quiet = false, onStarted = null } = {}) => {
+    const requestMediaPlay = ({ quiet = false } = {}) => {
         const player = playerRef.current;
         if (!player || mediaPlayRef.current.active) return;
         const session = { active: true, cancel: null };
@@ -8782,7 +8782,7 @@ export default function App() {
             isCurrent: () => mediaPlayRef.current === session && playerRef.current === player,
             onPlaying: () => {
                 session.active = false;
-                if (onStarted && onStarted() === false) return;
+                setCurrentTime(Number(player.currentTime) || 0);
                 setSeekNotice('');
                 setMediaError('');
                 setIsPlaying(true);
@@ -8812,25 +8812,21 @@ export default function App() {
         const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
         if (shouldPlay && !onLocated && !mediaSeekRef.current.active && !mediaPlayRef.current.active &&
             isMediaReplayBuffered(player, t, bufferedEnd)) {
-            // Rewind once and let the native play request wait for its buffered
-            // seek. No second pause, polling loop or locating banner per repeat.
+            // A buffered seek already preserves native playback. Do not pause
+            // or issue play() again while it is running, and never seek back a
+            // second time merely because a play promise reports success late.
             try {
-                timerTokenRef.current += 1; // Retire the completed loop timer.
+                timerTokenRef.current += 1;
+                const keepPlaying = !player.paused && !player.ended;
                 player.currentTime = t;
                 setSeekNotice('');
-                requestMediaPlay({ quiet: true, onStarted: () => {
-                    const actual = Number(player.currentTime);
-                    if (player.seeking || !Number.isFinite(actual) || actual < t - 0.15 || actual > Math.min(bufferedEnd, t + 0.5)) {
-                        // If the browser did not actually return to A, use the
-                        // verified path rather than risk playing the wrong cue.
-                        seekThenMaybePlay(t, true);
-                        return false;
-                    }
-                    setCurrentTime(actual);
-                    return true;
-                } });
+                if (keepPlaying) {
+                    setIsPlaying(true);
+                } else {
+                    requestMediaPlay({ quiet: true });
+                }
                 return;
-            } catch (_) { /* Retry with the verified seek below. */ }
+            } catch (_) { /* A rejected assignment uses verified seeking below. */ }
         }
         mediaPlayRef.current.cancel?.();
         mediaPlayRef.current.active = false;
@@ -8893,7 +8889,8 @@ export default function App() {
             jumpTrackByOffset(-1);
             return;
         }
-        cancelWorkerTimer();
+        const player = playerRef.current;
+        cancelWorkerTimer({ preservePlayback: Boolean(player && !player.paused && !player.seeking && !player.ended) });
         currentRepeatRef.current = 0;
         setIsWaitingShadow(false);
         isWaitingShadowRef.current = false;

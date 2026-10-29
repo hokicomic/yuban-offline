@@ -55,7 +55,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         }
         assert.ok(notices.every(value => value === ''), 'normal repeat must not flash locating/loading notices');
     });
-    test('buffered next and previous start immediately without full verification even during playback: ' + file, async () => {
+    test('buffered next and previous preserve running native playback without pause or redundant play: ' + file, async () => {
         const { api, c, player, requests, plays, notices, pauses, locate } = setup();
         player.paused = false;
         for (const [index, target] of [[2, 20], [1, 10]]) {
@@ -63,14 +63,10 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.equal(c.currentIndex, index);
             assert.equal(c.mediaSeekRef.current.active, false);
             assert.equal(requests.at(-1), target);
-            // Native play() may resolve before seeked on an already-playing element.
-            plays.at(-1).resolve(); await flush();
-            assert.equal(c.mediaPlayRef.current.active, true, 'observe native completion without restarting the seek');
+            assert.equal(plays.length, 0, 'an already-playing native element does not need another play()');
             locate(target); await flush();
-            assert.equal(c.mediaPlayRef.current.active, false);
-            assert.equal(c.time, target);
             assert.equal(c.playing, true);
-            c.isGapPausing.current = false; // React commits the selected cue.
+            c.isGapPausing.current = false;
         }
         assert.deepEqual(requests, [20, 10]);
         assert.equal(pauses(), 0);
@@ -96,7 +92,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(c.mediaSeekRef.current.active, false);
         assert.equal(c.isGapPausing.current, false);
         assert.ok(!messages.includes('STOP_HEARTBEAT'));
-        locate(10); plays.at(-1).resolve(); await flush();
+        locate(10); await flush();
+        assert.equal(plays.length, 0);
         assert.equal(c.playing, true);
     });
     test('uncached or partially cached sentences use verified seeking: ' + file, async () => {
@@ -115,14 +112,34 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(c.mediaSeekRef.current.active, true); assert.equal(plays.length, 0);
         c.mediaSeekRef.current.cancel();
     });
-    test('incorrect native replay position falls back to verified seeking: ' + file, async () => {
-        const { api, c, requests, locate, startPlaying } = setup();
+    test('late play completion after spoken words never rewinds the sentence again: ' + file, async () => {
+        for (const elapsed of [0.6, 1.5, 3]) {
+            const { api, c, player, requests, locate, startPlaying, pauses } = setup();
+            api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 });
+            locate(10);
+            player.actual = 10 + elapsed; // audio already spoke these words before the promise callback
+            await startPlaying();
+            assert.equal(c.mediaSeekRef.current.active, false);
+            assert.deepEqual(requests, [10], 'no corrective second seek after audio has started');
+            assert.equal(c.time, 10 + elapsed);
+            assert.equal(pauses(), 0);
+            assert.equal(c.playing, true);
+        }
+    });
+    test('next sentence retires a late start callback without pausing audio already in progress: ' + file, async () => {
+        const { api, c, player, requests, plays, locate, pauses } = setup();
         api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 });
-        locate(15); await startPlaying(); // browser did not actually rewind
-        assert.equal(c.mediaSeekRef.current.active, true);
-        assert.deepEqual(requests, [10, 10]);
-        assert.equal(c.playing, false);
-        c.mediaSeekRef.current.cancel();
+        locate(10);
+        player.paused = false; player.actual = 10.7; // speech began, but play promise is still pending
+        api.jumpToSubtitle(2);
+        assert.deepEqual(requests, [10, 20]);
+        assert.equal(plays.length, 1, 'continue playback rather than making another play request');
+        assert.equal(pauses(), 0);
+        locate(20);
+        plays[0].resolve(); await flush();
+        assert.deepEqual(requests, [10, 20], 'late completion cannot start another seek');
+        assert.equal(c.mediaSeekRef.current.active, false);
+        assert.equal(c.playing, true);
     });
     test('new manual seek cancels a pending buffered replay and ignores its late play completion: ' + file, async () => {
         const { api, c, plays, locate, startPlaying } = setup();
