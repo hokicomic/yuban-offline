@@ -9,7 +9,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     test('sentence linking defaults on and preserves duration at bounds: ' + file, () => {
         const effects = [];
         const sub = { start: 10, end: 15 };
-        const c = { useRef: current => ({ current }), useState: initial => [initial, noop],
+        const c = { sentenceTimelineBuffers: { before: 3, after: 3 }, useRef: current => ({ current }), useState: initial => [initial, noop],
             useEffect: effect => effects.push(effect), subtitles: [sub], currentIndex: 0,
             currentTrackIndex: 0, playbackMode: 'sentence', duration: 100 };
         const code = source.slice(source.indexOf('    const sentenceTimelineRef ='), source.indexOf('    const getBufferedRange ='));

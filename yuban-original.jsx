@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.217 · toolbar-toggle-position";
+const APP_VERSION = "v5.218 · adjustable-sentence-buffers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3482,6 +3482,12 @@ const clampSubtitles = (subs) => {
         }
     }
     return subs;
+};
+
+const normalizeSentenceTimelineBuffers = (value = {}) => {
+    const seconds = (raw) => Number.isFinite(Number(raw)) && raw != null
+        ? Math.max(0, Math.min(60, Number(raw))) : 3;
+    return { before: seconds(value?.before), after: seconds(value?.after) };
 };
 
 const parsePlaybackTimeInput = (input) => {
@@ -7326,6 +7332,13 @@ export default function GeminiPlayer() {
 
     // [NEW] Customizable Timing
     const [timePadding, setTimePadding] = useState(0);
+    const [sentenceTimelineBuffers, setSentenceTimelineBuffers] = useState(() => {
+        try { return normalizeSentenceTimelineBuffers(JSON.parse(localStorage.getItem('yuban-sentence-timeline-buffers') || '{}')); }
+        catch (_) { return { before: 3, after: 3 }; }
+    });
+    useEffect(() => {
+        try { localStorage.setItem('yuban-sentence-timeline-buffers', JSON.stringify(sentenceTimelineBuffers)); } catch (_) { }
+    }, [sentenceTimelineBuffers]);
     const [timeBuffer, setTimeBuffer] = useState(0);
     const [minDuration, setMinDuration] = useState(3.0);
     // Reader groups stop at this cap without inventing terminal punctuation.
@@ -8291,7 +8304,14 @@ export default function GeminiPlayer() {
 
     const resolveSentenceRange = (sub) => {
         const previous = sentenceRangeRef.current;
-        if (previous?.sub === sub && previous.track === currentTrackIndex) return previous;
+        if (previous?.sub === sub && previous.track === currentTrackIndex) {
+            const minimum = Math.max(0, Number(sub.start) - sentenceTimelineBuffers.before);
+            const maximum = Math.min(Number(duration) > 0 ? Number(duration) : Infinity, Number(sub.end) + sentenceTimelineBuffers.after);
+            const length = Math.min(previous.end - previous.start, Math.max(0, maximum - minimum));
+            const start = Math.max(minimum, Math.min(previous.start, maximum - length));
+            if (start === previous.start && start + length === previous.end) return previous;
+            return { ...previous, start, end: start + length };
+        }
         const index = subtitles.indexOf(sub);
         const carriesPreviousEnd = previous?.track === currentTrackIndex
             && index > 0 && subtitles[index - 1] === previous.sub;
@@ -8302,7 +8322,7 @@ export default function GeminiPlayer() {
         const originalStart = Math.max(0, Number(sub.start) || 0);
         const end = Number(sub.end) || originalStart;
         const mediaEnd = Number(duration) > 0 ? Number(duration) : Infinity;
-        const shift = Math.max(-3, -originalStart, Math.min(offset, 3, mediaEnd - end));
+        const shift = Math.max(-sentenceTimelineBuffers.before, -originalStart, Math.min(offset, sentenceTimelineBuffers.after, mediaEnd - end));
         return {
             sub, track: currentTrackIndex,
             start: originalStart + shift,
@@ -8316,15 +8336,15 @@ export default function GeminiPlayer() {
             ? resolveSentenceRange(sub)
             : null;
         refreshSentenceRange(value => value + 1);
-    }, [currentTrackIndex, currentIndex, subtitles, playbackMode]);
+    }, [currentTrackIndex, currentIndex, subtitles, playbackMode, sentenceTimelineBuffers]);
 
     const sentenceSub = subtitles[currentIndex];
     const sentenceOriginalStart = Math.max(0, Number(sentenceSub?.start) || 0);
     const sentenceOriginalEnd = Math.max(sentenceOriginalStart, Number(sentenceSub?.end) || 0);
-    const sentenceTimelineStart = Math.max(0, sentenceOriginalStart - 3);
-    const sentenceTimelineEnd = Math.min(Number(duration) > 0 ? Number(duration) : Infinity, sentenceOriginalEnd + 3);
-    const sentenceSelectedRange = sentenceRangeRef.current?.sub === sentenceSub
-        ? sentenceRangeRef.current
+    const sentenceTimelineStart = Math.max(0, sentenceOriginalStart - sentenceTimelineBuffers.before);
+    const sentenceTimelineEnd = Math.min(Number(duration) > 0 ? Number(duration) : Infinity, sentenceOriginalEnd + sentenceTimelineBuffers.after);
+    const sentenceSelectedRange = sentenceSub
+        ? resolveSentenceRange(sentenceSub)
         : { start: sentenceOriginalStart, end: sentenceOriginalEnd };
     const sentencePosition = (time) => `${Math.max(0, Math.min(100, (time - sentenceTimelineStart) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100))}%`;
 
@@ -20003,6 +20023,24 @@ ${userQ}`;
                                 </option>
                             ))}
                         </select>
+
+                        <fieldset className="mt-4 mb-3">
+                            <legend className="text-sm font-bold text-gray-800 mb-2">單句時間軸 buffer</legend>
+                            <div className="grid grid-cols-2 gap-3">
+                                {['before', 'after'].map(side => (
+                                    <label key={side} className="text-xs font-medium text-gray-700">
+                                        {side === 'before' ? '前 buffer（秒）' : '後 buffer（秒）'}
+                                        <input type="number" min="0" max="60" step="0.5" value={sentenceTimelineBuffers[side]}
+                                            onChange={event => {
+                                                const seconds = event.target.valueAsNumber;
+                                                if (Number.isFinite(seconds)) setSentenceTimelineBuffers(previous => normalizeSentenceTimelineBuffers({ ...previous, [side]: seconds }));
+                                            }}
+                                            className="mt-1 w-full rounded border border-gray-300 bg-white px-2 py-1.5 text-sm" />
+                                    </label>
+                                ))}
+                            </div>
+                            <p className="mt-1 text-[10px] leading-relaxed text-gray-500">前後可各設 0–60 秒，預設各 3 秒。擴大 A／B 可拖曳範圍，不會自動增加播放長度；設定會保存在此瀏覽器。</p>
+                        </fieldset>
 
                         {/* TIMING CONTROLS */}
                         <h3 className="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2 mt-4"><Clock size={16} /> Timing Adjustment</h3>

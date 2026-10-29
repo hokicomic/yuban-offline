@@ -10,7 +10,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const sub = { id: 1, start: 10, end: 15, text: 'Example.' };
         const effects = [];
         const context = {
-            useRef: current => ({ current }),
+            sentenceTimelineBuffers: { before: 3, after: 3 }, useRef: current => ({ current }),
             useState: () => [0, () => {}],
             useEffect: callback => effects.push(callback),
             subtitles: [sub], currentIndex: 0, currentTrackIndex: 0,
