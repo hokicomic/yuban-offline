@@ -8,6 +8,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const helpers = source.slice(source.indexOf('// Only reuse the light replay path'), source.indexOf('const parseSRT ='));
     const actions = source.slice(source.indexOf('    const requestMediaPlay ='), source.indexOf('    const jumpTrackByOffset ='));
+    const navigation = source.slice(source.indexOf('    const jumpToSubtitle ='), source.indexOf('    const resetShadowStateForSeek ='));
+    const cancel = source.slice(source.indexOf('    const cancelWorkerTimer ='), source.indexOf('    const clampEchoTime ='));
     const setup = (ranges = [[0, 100]]) => {
         const requests = [], plays = [], notices = [], timers = new Map(), listeners = new Map();
         let id = 0, pauses = 0;
@@ -23,10 +25,15 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const c = { queueMicrotask, setTimeout: (fn, delay) => { timers.set(++id, { fn, delay }); return id; },
             clearTimeout: key => timers.delete(key), playerRef: { current: player }, duration: 100,
             mediaPlayRef: { current: { active: false } }, mediaSeekRef: { current: { active: false } },
-            timerTokenRef: { current: 0 }, setSeekNotice: value => notices.push(value),
+            timerTokenRef: { current: 0 }, workerRef: { current: null },
+            subtitles: [{ start: 0, end: 5 }, { start: 10, end: 15 }, { start: 20, end: 25 }], currentIndex: 1,
+            currentRepeatRef: { current: 0 }, isGapPausing: { current: false }, isWaitingShadowRef: { current: false },
+            setIsWaitingShadow() {}, setShadowCountdown() {}, getBufferedRange: sub => sub,
+            setCurrentIndex: index => { c.currentIndex = index; }, jumpTrackByOffset: offset => { c.trackOffset = offset; },
+            setSeekNotice: value => notices.push(value),
             setIsPlaying: value => { c.playing = value; }, setMediaError() {},
             setCurrentTime: value => { c.time = value; }, recordPCloudDebug() {} };
-        const api = vm.runInNewContext(helpers + '\n' + actions + '\n({seekThenMaybePlay})', c);
+        const api = vm.runInNewContext(helpers + '\n' + actions + cancel + navigation + '\n({seekThenMaybePlay,jumpToSubtitle})', c);
         const locate = time => { player.actual = time; player.seeking = false; player.emit('seeked'); };
         const startPlaying = async () => { player.paused = false; plays.at(-1).resolve(); await flush(); };
         return { api, c, player, requests, plays, notices, timers, locate, startPlaying, pauses: () => pauses };
@@ -35,7 +42,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const { api, c, player, requests, plays, notices, timers, locate, startPlaying, pauses } = setup();
         for (let cycle = 0; cycle < 3; cycle++) {
             player.actual = 15; player.paused = true;
-            api.seekThenMaybePlay(10, true, null, { repeatEnd: 15 });
+            api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 });
             assert.equal(requests.length, cycle + 1);
             assert.equal(c.timerTokenRef.current, cycle + 1, 'completed timer cannot trigger a duplicate replay');
             assert.equal(plays.length, cycle + 1, 'play request immediately follows the buffered rewind');
@@ -48,10 +55,54 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         }
         assert.ok(notices.every(value => value === ''), 'normal repeat must not flash locating/loading notices');
     });
+    test('buffered next and previous start immediately without full verification even during playback: ' + file, async () => {
+        const { api, c, player, requests, plays, notices, pauses, locate } = setup();
+        player.paused = false;
+        for (const [index, target] of [[2, 20], [1, 10]]) {
+            api.jumpToSubtitle(index);
+            assert.equal(c.currentIndex, index);
+            assert.equal(c.mediaSeekRef.current.active, false);
+            assert.equal(requests.at(-1), target);
+            // Native play() may resolve before seeked on an already-playing element.
+            plays.at(-1).resolve(); await flush();
+            assert.equal(c.mediaPlayRef.current.active, true, 'observe native completion without restarting the seek');
+            locate(target); await flush();
+            assert.equal(c.mediaPlayRef.current.active, false);
+            assert.equal(c.time, target);
+            assert.equal(c.playing, true);
+            c.isGapPausing.current = false; // React commits the selected cue.
+        }
+        assert.deepEqual(requests, [20, 10]);
+        assert.equal(pauses(), 0);
+        assert.ok(notices.every(value => value === ''));
+    });
+    test('uncached next sentence remains verified and crossing tracks still loads the adjacent track: ' + file, () => {
+        const { api, c, requests, plays } = setup([[0, 15]]);
+        api.jumpToSubtitle(2);
+        assert.equal(c.mediaSeekRef.current.active, true);
+        assert.equal(plays.length, 0);
+        assert.deepEqual(requests, [20]);
+        c.mediaSeekRef.current.cancel();
+        api.jumpToSubtitle(3);
+        assert.equal(c.trackOffset, 1);
+        assert.deepEqual(requests, [20]);
+    });
+    test('same-cue restart keeps the heartbeat running and avoids the full seek when buffered: ' + file, async () => {
+        const { api, c, player, plays, locate } = setup();
+        const messages = [];
+        c.workerRef.current = { postMessage: message => messages.push(message.type) };
+        player.paused = false;
+        api.jumpToSubtitle(1);
+        assert.equal(c.mediaSeekRef.current.active, false);
+        assert.equal(c.isGapPausing.current, false);
+        assert.ok(!messages.includes('STOP_HEARTBEAT'));
+        locate(10); plays.at(-1).resolve(); await flush();
+        assert.equal(c.playing, true);
+    });
     test('uncached or partially cached sentences use verified seeking: ' + file, async () => {
         for (const ranges of [[], [[11, 100]], [[0, 12], [13, 100]]]) {
             const { api, c, plays, notices, locate, startPlaying } = setup(ranges);
-            api.seekThenMaybePlay(10, true, null, { repeatEnd: 15 });
+            api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 });
             assert.equal(c.mediaSeekRef.current.active, true); assert.equal(plays.length, 0);
             assert.ok(notices.includes('正在定位…'));
             locate(10); assert.equal(plays.length, 1);
@@ -66,7 +117,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     });
     test('incorrect native replay position falls back to verified seeking: ' + file, async () => {
         const { api, c, requests, locate, startPlaying } = setup();
-        api.seekThenMaybePlay(10, true, null, { repeatEnd: 15 });
+        api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 });
         locate(15); await startPlaying(); // browser did not actually rewind
         assert.equal(c.mediaSeekRef.current.active, true);
         assert.deepEqual(requests, [10, 10]);
@@ -75,7 +126,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     });
     test('new manual seek cancels a pending buffered replay and ignores its late play completion: ' + file, async () => {
         const { api, c, plays, locate, startPlaying } = setup();
-        api.seekThenMaybePlay(10, true, null, { repeatEnd: 15 });
+        api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 });
         api.seekThenMaybePlay(30, true);
         plays[0].resolve(); await flush();
         assert.equal(c.mediaSeekRef.current.active, true);

@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.221 · buffered-sentence-replay";
+const APP_VERSION = "v5.222 · buffered-subtitle-navigation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3575,6 +3575,7 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
 const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, timeoutMs = 15000 }) => {
     let finished = false;
     let retryPending = false;
+    let playResolved = false;
     let retries = 0;
     let timer = null;
     const source = player.src;
@@ -3584,6 +3585,13 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
         if (timer != null) clearTimeout(timer);
         ['canplay', 'loadeddata'].forEach(name => player.removeEventListener(name, retry));
         player.removeEventListener('error', mediaError);
+        player.removeEventListener('seeked', finishPlaying);
+    };
+    const finishPlaying = () => {
+        if (finished || !playResolved || player.seeking) return;
+        const valid = current();
+        cleanup();
+        if (valid) onPlaying();
     };
     const fail = (error) => {
         if (finished) return;
@@ -3597,10 +3605,8 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
         let result;
         try { result = player.play(); } catch (error) { fail(error); return; }
         Promise.resolve(result).then(() => {
-            if (finished) return;
-            const valid = current();
-            cleanup();
-            if (valid) onPlaying();
+            playResolved = true;
+            finishPlaying();
         }).catch(error => {
             if (finished || !current()) { cleanup(); return; }
             if (error?.name === 'AbortError' && retries < 1 && !player.error) {
@@ -3617,6 +3623,7 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
     const mediaError = () => fail({ name: 'MediaError', code: player.error?.code, message: player.error?.message || '媒體讀取失敗' });
     ['canplay', 'loadeddata'].forEach(name => player.addEventListener(name, retry));
     player.addEventListener('error', mediaError);
+    player.addEventListener('seeked', finishPlaying);
     timer = setTimeout(() => fail({ name: 'TimeoutError', message: '等待媒體資料逾時' }), timeoutMs);
     // This call stays in the original click handler whenever no seek is needed.
     attempt();
@@ -8819,12 +8826,12 @@ export default function GeminiPlayer() {
         });
     };
 
-    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { repeatEnd = null } = {}) => {
+    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { bufferedEnd = null } = {}) => {
         const player = playerRef.current;
         if (!player) return;
         const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
         if (shouldPlay && !onLocated && !mediaSeekRef.current.active && !mediaPlayRef.current.active &&
-            isMediaReplayBuffered(player, t, repeatEnd)) {
+            isMediaReplayBuffered(player, t, bufferedEnd)) {
             // Rewind once and let the native play request wait for its buffered
             // seek. No second pause, polling loop or locating banner per repeat.
             try {
@@ -8833,7 +8840,7 @@ export default function GeminiPlayer() {
                 setSeekNotice('');
                 requestMediaPlay({ quiet: true, onStarted: () => {
                     const actual = Number(player.currentTime);
-                    if (player.seeking || !Number.isFinite(actual) || actual < t - 0.15 || actual > Math.min(repeatEnd, t + 0.5)) {
+                    if (player.seeking || !Number.isFinite(actual) || actual < t - 0.15 || actual > Math.min(bufferedEnd, t + 0.5)) {
                         // If the browser did not actually return to A, use the
                         // verified path rather than risk playing the wrong cue.
                         seekThenMaybePlay(t, true);
@@ -8907,45 +8914,19 @@ export default function GeminiPlayer() {
             return;
         }
         cancelWorkerTimer();
-        // Clear any pending shadow wait state before manual jumps
         currentRepeatRef.current = 0;
         setIsWaitingShadow(false);
         isWaitingShadowRef.current = false;
         setShadowCountdown(0);
 
-        // [FIX] Same-index check: Avoid mutex lock if index is not changing.
-        // This handles loops on single items or manual replays.
-        if (index === currentIndex) {
-            if (playerRef.current) {
-                const { start } = getBufferedRange(subtitles[index]);
-                // Manual State Reset for same-index replay
-                currentRepeatRef.current = 0;
-                setIsWaitingShadow(false);
-                isWaitingShadowRef.current = false;
-                setShadowCountdown(0);
-
-                // [Worker] Cancel wait
-                if (workerRef.current) workerRef.current.postMessage({ type: 'STOP_HEARTBEAT' }); // Temp stop
-                if (workerRef.current) workerRef.current.postMessage({ type: 'START_HEARTBEAT' }); // Restart
-
-                seekThenMaybePlay(start, true);
-                setIsPlaying(true); // Force UI update
-            }
-            return;
+        if (index !== currentIndex) {
+            // Ignore the previous cue's boundary until React commits this index.
+            isGapPausing.current = true;
+            setCurrentIndex(index);
         }
-
-        // [FIX] Protect against stale `checkPlayback` triggering pause during transition
-        // This acts as a mutex until the new currentIndex effect resets it
-        isGapPausing.current = true;
-
-        setCurrentIndex(index);
-
-        // State reset handled by useEffect above
-
         if (playerRef.current) {
-            const { start } = getBufferedRange(subtitles[index]);
-            seekThenMaybePlay(start, true);
-            setIsPlaying(true); // Ensure RAF loop knows we are playing
+            const range = getBufferedRange(subtitles[index]);
+            seekThenMaybePlay(range.start, true, null, { bufferedEnd: range.end });
         }
     };
 
@@ -10268,7 +10249,7 @@ export default function GeminiPlayer() {
                             if (player) {
                                 const currentSub = subtitles[currentIndex];
                                 const range = getBufferedRange(currentSub);
-                                seekThenMaybePlay(range.start, true, null, { repeatEnd: range.end });
+                                seekThenMaybePlay(range.start, true, null, { bufferedEnd: range.end });
                             }
                         } else {
                             currentRepeatRef.current = 0;
@@ -10287,7 +10268,7 @@ export default function GeminiPlayer() {
                                 else setIsPlaying(false);
                             } else {
                                 const range = getBufferedRange(subtitles[currentIndex]);
-                                seekThenMaybePlay(range.start, true, null, { repeatEnd: range.end });
+                                seekThenMaybePlay(range.start, true, null, { bufferedEnd: range.end });
                             }
                         }
                     }
@@ -10296,7 +10277,7 @@ export default function GeminiPlayer() {
                     const currentSub = subtitles[currentIndex];
                     if (loopMode === 'single') {
                         const range = getBufferedRange(currentSub);
-                        seekThenMaybePlay(range.start, true, null, { repeatEnd: range.end });
+                        seekThenMaybePlay(range.start, true, null, { bufferedEnd: range.end });
                     } else if (loopMode === 'all') {
                         let nextIdx = currentIndex + 1;
                         if (nextIdx >= subtitles.length) {
