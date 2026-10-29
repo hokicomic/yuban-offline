@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.223 · single-seek-subtitle-navigation";
+const APP_VERSION = "v5.224 · responsive-subtitle-rendering";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -5765,6 +5765,8 @@ const QuickSpeakBtn = ({ text, size = 16, className = "", rate = 1.0, mode = 'na
     );
 };
 
+const MemoizedQuickSpeakBtn = React.memo(QuickSpeakBtn);
+
 const normalizeKnowledgeAlignmentText = (value = "") => String(value || "")
     .replace(/<[^>]*>/g, " ")
     .replace(/\{\{(.*?)\}\}/g, "$1")
@@ -6491,7 +6493,10 @@ const MarkdownView = ({
         }
         return Array.from(variants);
     };
+    const latinInflectionCache = useMemo(() => new Map(), []);
     const getLatinInflectedForms = (word = "") => {
+        const key = normalizeLatinWordForMatch(word);
+        if (latinInflectionCache.has(key)) return latinInflectionCache.get(key);
         const forms = new Set();
         for (const base of getLatinSpellingVariants(word)) {
             forms.add(base);
@@ -6520,6 +6525,7 @@ const MarkdownView = ({
             if (/al$/.test(base)) forms.add(`${base}ly`);
             else forms.add(`${base}ly`);
         }
+        latinInflectionCache.set(key, forms);
         return forms;
     };
     const isInflectedLatinMatch = (baseWord = "", candidateWord = "") => {
@@ -6590,6 +6596,7 @@ const MarkdownView = ({
         if (!isKnowledgeLatinBoundaryChar(next)) return 0;
         return candidateWord.length;
     };
+    const knowledgeTermInitials = useMemo(() => new Map(), [knowledgeTermEntries]);
     const getKnowledgeTermMatchLengthAt = (text, at, entry) => {
         const source = String(text || "");
         const term = String(entry?.term || "");
@@ -6597,6 +6604,14 @@ const MarkdownView = ({
         if (at < 0 || at >= source.length) return 0;
 
         if (entry?.latinOnly) {
+            if (at > 0 && !isKnowledgeLatinBoundaryChar(source[at - 1])) return 0;
+            let initials = knowledgeTermInitials.get(entry);
+            if (!initials) {
+                const firstWord = term.trim().split(/\s+/)[0] || '';
+                initials = new Set([firstWord[0]?.toLowerCase(), ...Array.from(getLatinInflectedForms(firstWord), form => form[0]?.toLowerCase())]);
+                knowledgeTermInitials.set(entry, initials);
+            }
+            if (!initials.has(source[at].toLowerCase())) return 0;
             if ((at + term.length) <= source.length) {
                 const slice = source.slice(at, at + term.length);
                 if (slice.toLowerCase() === term.toLowerCase()) {
@@ -6728,7 +6743,13 @@ const MarkdownView = ({
         return out.join("\n").trim();
     };
 
-    const matchedMultiUsageItemKeysForPreview = findMatchedMultiUsageItemKeys(extractOriginalPreviewText(content));
+    const matchedMultiUsageItemKeysForPreview = useMemo(() => enableKnowledgeTermLinks
+        ? findMatchedMultiUsageItemKeys(extractOriginalPreviewText(sourceContent)) : new Set(),
+    [sourceContent, knowledgeTermEntries, enableKnowledgeTermLinks]);
+    const knowledgeLinkedNodesCache = useMemo(() => new Map(),
+        [sourceContent, knowledgeTermEntries, enableKnowledgeTermLinks, matchedMultiUsageItemKeysForPreview]);
+    const knowledgeTermClickRef = useRef(onKnowledgeTermClick);
+    React.useLayoutEffect(() => { knowledgeTermClickRef.current = onKnowledgeTermClick; }, [onKnowledgeTermClick]);
 
     const buildKnowledgeLinkedNodes = (text, keyPrefix = "mdk") => {
         const source = String(text || "");
@@ -6737,6 +6758,8 @@ const MarkdownView = ({
         if (!Array.isArray(knowledgeTermEntries) || knowledgeTermEntries.length === 0) return source;
         if (typeof onKnowledgeTermClick !== "function") return source;
 
+        const cacheKey = `${keyPrefix}::${source}`;
+        if (knowledgeLinkedNodesCache.has(cacheKey)) return knowledgeLinkedNodesCache.get(cacheKey);
         const nodes = [];
         let cursor = 0;
         let tokenIdx = 0;
@@ -6818,7 +6841,7 @@ const MarkdownView = ({
                         e.preventDefault();
                         e.stopPropagation();
                         if (!popupItems.length) return;
-                        onKnowledgeTermClick({
+                        knowledgeTermClickRef.current?.({
                             term: cleanQuizDisplayText(matchedText || longestEntry?.term || ""),
                             items: popupItems
                         });
@@ -6831,7 +6854,10 @@ const MarkdownView = ({
 
             cursor = hitPos + longestLen;
         }
-        return nodes.length > 0 ? nodes : source;
+        const result = nodes.length > 0 ? nodes : source;
+        if (knowledgeLinkedNodesCache.size >= 2000) knowledgeLinkedNodesCache.delete(knowledgeLinkedNodesCache.keys().next().value);
+        knowledgeLinkedNodesCache.set(cacheKey, result);
+        return result;
     };
 
     const buildSentenceHighlightedKnowledgeNodes = (text, subtitleText, keyPrefix = "mdk-active") => {
@@ -6970,7 +6996,7 @@ const MarkdownView = ({
 
     // The clickable knowledge links in the active source sentence should also
     // drive an already-open knowledge preview.  This intentionally reports
-    // only the first visible link, using exactly the same matching and item
+    // all visible links, using exactly the same matching and item
     // filtering as buildKnowledgeLinkedNodes below.  It does not open a panel
     // by itself, so normal reading remains uninterrupted.
     useEffect(() => {
@@ -7174,7 +7200,7 @@ const MarkdownView = ({
                                     <div dangerouslySetInnerHTML={{ __html: html }} />
                                 )}
                                 {shouldShowSpeaker && speakerText && (
-                                    <QuickSpeakBtn text={speakerText} mode={getSpeakMode(speakerText)} forceNativeLang={preferredSpeakerLanguage} pauseBetweenLinesMs={1000} size={14} className="mt-0.5 shrink-0" />
+                                    <MemoizedQuickSpeakBtn text={speakerText} mode={getSpeakMode(speakerText)} forceNativeLang={preferredSpeakerLanguage} pauseBetweenLinesMs={1000} size={14} className="mt-0.5 shrink-0" />
                                 )}
                             </div>
                         );
@@ -7259,7 +7285,7 @@ const MarkdownView = ({
                                                                 <div className="flex items-start gap-1">
                                                                     <span dangerouslySetInnerHTML={{ __html: renderedHtml }} />
                                                                     {shouldShowSpeaker && (
-                                                                        <QuickSpeakBtn text={targetForAudio} mode={speakMode} forceNativeLang={preferredSpeakerLanguage} pauseBetweenLinesMs={1000} size={14} className="mt-0.5 shrink-0" />
+                                                                        <MemoizedQuickSpeakBtn text={targetForAudio} mode={speakMode} forceNativeLang={preferredSpeakerLanguage} pauseBetweenLinesMs={1000} size={14} className="mt-0.5 shrink-0" />
                                                                     )}
                                                                 </div>
                                                             </td>
@@ -7283,6 +7309,8 @@ const MarkdownView = ({
 // ============================================================================
 // [MODULE 3]: MAIN APP COMPONENT
 // ============================================================================
+
+const MemoizedMarkdownView = React.memo(MarkdownView);
 
 export default function GeminiPlayer() {
     const [currentApiKey, setCurrentApiKey] = useState(apiKey);
@@ -8285,6 +8313,11 @@ export default function GeminiPlayer() {
             }
         } catch (_) { }
     }, []);
+
+    const audioCacheContextValue = useMemo(() => ({
+        cache: audioCache, addToCache: addToAudioCache, currentKey: currentApiKey,
+        trackLanguage, preferredVoice, globalAudioRef
+    }), [audioCache, addToAudioCache, currentApiKey, trackLanguage, preferredVoice, globalAudioRef]);
 
     const playerRef = useRef(null);
     const shadowTimerRef = useRef(null);
@@ -17690,9 +17723,12 @@ ${userQ}`;
     const embeddedKnowledgeDocumentKey = useMemo(() => {
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
+    // Paint the already-known subtitle first; defer document alignment and its
+    // memoized view together, so the media clock never waits for a TXT scan.
+    const embeddedKnowledgeRenderIndex = React.useDeferredValue(currentIndex);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
-        const subtitleText = subtitles[currentIndex]?.text || "";
-        const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
+        const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
+        const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;
         const manualSourceLine = Number(embeddedKnowledgeManualAnchors[manualAnchorKey]);
         const progress = embeddedKnowledgePlaybackProgressRef.current;
         let documentReset = false;
@@ -17709,7 +17745,7 @@ ${userQ}`;
             documentReset = true;
         }
         const locatedCue = embeddedKnowledgeLocatedCue?.filename === embeddedKnowledgeFileInfo?.filename &&
-            embeddedKnowledgeLocatedCue?.subtitleIndex === currentIndex ? embeddedKnowledgeLocatedCue : null;
+            embeddedKnowledgeLocatedCue?.subtitleIndex === embeddedKnowledgeRenderIndex ? embeddedKnowledgeLocatedCue : null;
         // A verified cross-file/content search supersedes the old sequential
         // cursor, including large backwards seeks within the same TXT.
         if (locatedCue) {
@@ -17722,7 +17758,7 @@ ${userQ}`;
         // 正常往後播放時，不能因為模糊匹配回頭標記已讀原文。
         // 只有兩個有效 LRC 索引真的倒退時，才視為使用者回播。播放時短暫的 -1
         // 不能清掉防回頭保護，否則下一段會重新選中先前原文並把視窗捲上去。
-        const hasCurrentSubtitleIndex = Number.isInteger(currentIndex) && currentIndex >= 0;
+        const hasCurrentSubtitleIndex = Number.isInteger(embeddedKnowledgeRenderIndex) && embeddedKnowledgeRenderIndex >= 0;
         const hadSubtitleIndex = Number.isInteger(progress.subtitleIndex) && progress.subtitleIndex >= 0;
         const progressBefore = {
             subtitleIndex: progress.subtitleIndex,
@@ -17732,11 +17768,11 @@ ${userQ}`;
             trustedSourceLines: Array.isArray(progress.trustedSourceLines) ? [...progress.trustedSourceLines] : [],
             forwardMisses: Number(progress.forwardMisses || 0)
         };
-        const isRewindPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex < progress.subtitleIndex;
+        const isRewindPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && embeddedKnowledgeRenderIndex < progress.subtitleIndex;
         // Keep a proven body anchor during rewind.  Resetting it forced a large
         // EPUB/TXT back to the first 480 lines, where the previous line could
         // never be found once playback had reached the body of the book.
-        const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && currentIndex > progress.subtitleIndex;
+        const isForwardPlayback = hasCurrentSubtitleIndex && hadSubtitleIndex && embeddedKnowledgeRenderIndex > progress.subtitleIndex;
         const diagnostics = {};
         // Once an anchor exists, this is a sequential reading task.  Search a
         // small forward window only; a miss is surfaced for confirmation rather
@@ -17779,7 +17815,7 @@ ${userQ}`;
         // implausibly large number of source lines.  The allowance grows when
         // playback has genuinely skipped several LRC cues.
         const subtitleAdvance = isForwardPlayback
-            ? Math.max(1, currentIndex - Number(progressBefore.subtitleIndex || currentIndex - 1))
+            ? Math.max(1, embeddedKnowledgeRenderIndex - Number(progressBefore.subtitleIndex || embeddedKnowledgeRenderIndex - 1))
             : 1;
         const maxPlausibleForwardLineAdvance = Math.min(260, 48 + (subtitleAdvance - 1) * 18);
         const forwardCursorLimit = Number(progressBefore.maxSourceLine) + maxPlausibleForwardLineAdvance;
@@ -17827,8 +17863,8 @@ ${userQ}`;
             const score = Number(bestMatch.score || 0);
             const isSequentialConfirmation = candidate &&
                 hasCurrentSubtitleIndex &&
-                currentIndex > Number(candidate.subtitleIndex || -1) &&
-                currentIndex - Number(candidate.subtitleIndex || -1) <= 4 &&
+                embeddedKnowledgeRenderIndex > Number(candidate.subtitleIndex || -1) &&
+                embeddedKnowledgeRenderIndex - Number(candidate.subtitleIndex || -1) <= 4 &&
                 bestMatch.sourceLine >= Number(candidate.sourceLine || 0) &&
                 bestMatch.sourceLine - Number(candidate.sourceLine || 0) <= 120;
             // Require two nearby forward cues before treating a body position
@@ -17841,7 +17877,7 @@ ${userQ}`;
                 progress.forwardMisses = 0;
                 anchorEvent = "anchor_confirmed";
             } else if (score >= 0.88) {
-                progress.anchorCandidate = { subtitleIndex: currentIndex, sourceLine: bestMatch.sourceLine, score };
+                progress.anchorCandidate = { subtitleIndex: embeddedKnowledgeRenderIndex, sourceLine: bestMatch.sourceLine, score };
                 anchorEvent = "anchor_candidate";
             } else {
                 anchorEvent = "untrusted_opening_match";
@@ -17863,14 +17899,14 @@ ${userQ}`;
                 score: Number(item.observedScore || item.acceptedScore || 0),
                 preview: String(item.preview || "")
             })).filter(item => item.score >= 0.58).slice(0, 5);
-        if (hasCurrentSubtitleIndex) progress.subtitleIndex = currentIndex;
+        if (hasCurrentSubtitleIndex) progress.subtitleIndex = embeddedKnowledgeRenderIndex;
         if (hasCurrentSubtitleIndex) {
-            const signature = `${embeddedKnowledgeText.length}:${currentIndex}:${subtitleText}`;
+            const signature = `${embeddedKnowledgeText.length}:${embeddedKnowledgeRenderIndex}:${subtitleText}`;
             if (embeddedKnowledgeAlignmentLogSignatureRef.current !== signature) {
                 embeddedKnowledgeAlignmentLogSignatureRef.current = signature;
                 const entry = {
                     at: new Date().toISOString(),
-                    subtitleIndex: currentIndex,
+                    subtitleIndex: embeddedKnowledgeRenderIndex,
                     subtitleText: String(subtitleText || ""),
                     documentReset,
                     progressBefore,
@@ -17901,10 +17937,11 @@ ${userQ}`;
             }
         }
         return visibleMatches;
-    }, [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeLocatedCue, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, currentIndex]);
+    }, [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeLocatedCue, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, embeddedKnowledgeRenderIndex]);
     useEffect(() => {
         setEmbeddedKnowledgeMatchCandidates(embeddedKnowledgeMatchCandidatesRef.current || []);
-    }, [embeddedKnowledgeDocumentKey, currentIndex, embeddedKnowledgeSubtitleMatches]);
+    }, [embeddedKnowledgeDocumentKey, embeddedKnowledgeRenderIndex, embeddedKnowledgeSubtitleMatches]);
+    const embeddedKnowledgeSourceLines = useMemo(() => embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine), [embeddedKnowledgeSubtitleMatches]);
     const copyEmbeddedKnowledgeAlignmentLog = useCallback(async () => {
         const entries = embeddedKnowledgeAlignmentLogRef.current || [];
         const text = JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
@@ -17961,7 +17998,7 @@ ${userQ}`;
             cancelAnimationFrame(outerFrame);
             cancelAnimationFrame(revealFrame);
         };
-    }, [topPanelMode, currentIndex, embeddedKnowledgeSubtitleMatches]);
+    }, [topPanelMode, embeddedKnowledgeRenderIndex, embeddedKnowledgeSubtitleMatches]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
         const source = String(text || "");
@@ -18274,6 +18311,7 @@ ${userQ}`;
         knowledgePreviewManualOverrideRef.current = { documentKey: "", subtitleIndex: -1 };
     }, [currentIndex, embeddedKnowledgeDocumentKey, currentTrackIndex]);
 
+    const knowledgePreviewIsOpen = Boolean(knowledgePreviewTermPopup);
     const handleKnowledgePreviewTermClick = useCallback((payload) => {
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const rawItems = Array.isArray(payload?.items) ? payload.items : [];
@@ -18298,9 +18336,9 @@ ${userQ}`;
         if (!term || items.length === 0) return;
         knowledgePreviewManualOverrideRef.current = {
             documentKey: embeddedKnowledgeDocumentKey,
-            subtitleIndex: currentIndex
+            subtitleIndex: embeddedKnowledgeRenderIndex
         };
-        const nextPos = !knowledgePreviewTermPopup
+        const nextPos = !knowledgePreviewIsOpen
             ? getKnowledgePreviewPopupDefaultPos()
             : {
                 x: Number(knowledgePreviewPopupPosRef.current?.x) || 0,
@@ -18308,22 +18346,54 @@ ${userQ}`;
             };
         setKnowledgePreviewPopupPos(clampKnowledgePreviewPopupPos(nextPos.x, nextPos.y));
         setKnowledgePreviewTermPopup({ term, items });
-    }, [clampKnowledgePreviewPopupPos, currentIndex, embeddedKnowledgeDocumentKey, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
+    }, [clampKnowledgePreviewPopupPos, embeddedKnowledgeRenderIndex, embeddedKnowledgeDocumentKey, getKnowledgePreviewPopupDefaultPos, knowledgePreviewIsOpen]);
     const syncOpenKnowledgePreviewToActiveTerm = useCallback((payload) => {
         // Do not create a popup during playback.  This only keeps a preview
         // that the learner has explicitly opened in sync with the highlighted
         // source sentence, whether it is floating or docked on the right.
-        if (!knowledgePreviewTermPopup) return;
         const manualOverride = knowledgePreviewManualOverrideRef.current || {};
-        if (manualOverride.documentKey === embeddedKnowledgeDocumentKey && manualOverride.subtitleIndex === currentIndex) return;
+        if (manualOverride.documentKey === embeddedKnowledgeDocumentKey && manualOverride.subtitleIndex === embeddedKnowledgeRenderIndex) return;
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const items = Array.isArray(payload?.items) ? payload.items : [];
         if (!term || items.length === 0) return;
-        const currentKey = `${knowledgePreviewTermPopup.term}::${(knowledgePreviewTermPopup.items || []).map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
-        const nextKey = `${term}::${items.map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
-        if (currentKey === nextKey) return;
-        setKnowledgePreviewTermPopup({ term, items });
-    }, [currentIndex, embeddedKnowledgeDocumentKey, knowledgePreviewTermPopup]);
+        setKnowledgePreviewTermPopup(previous => {
+            if (!previous) return previous;
+            const currentKey = `${previous.term}::${(previous.items || []).map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
+            const nextKey = `${term}::${items.map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
+            return currentKey === nextKey ? previous : { term, items };
+        });
+    }, [embeddedKnowledgeRenderIndex, embeddedKnowledgeDocumentKey]);
+    const handleEmbeddedKnowledgeSourceLineConfirm = useCallback((sourceLine) => {
+        const key = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;
+        embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = sourceLine;
+        embeddedKnowledgePlaybackProgressRef.current.anchorState = "anchored";
+        embeddedKnowledgePlaybackProgressRef.current.anchorCandidate = null;
+        embeddedKnowledgePlaybackProgressRef.current.trustedSourceLines = [sourceLine];
+        embeddedKnowledgePlaybackProgressRef.current.forwardMisses = 0;
+        setEmbeddedKnowledgeManualAnchors(previous => ({ ...previous, [key]: sourceLine }));
+        setEmbeddedKnowledgeMatchCandidates([]);
+        setEmbeddedKnowledgeManualAnchorMode(false);
+        setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${sourceLine + 1} 行為目前字幕對應。`);
+    }, [embeddedKnowledgeDocumentKey, embeddedKnowledgeRenderIndex]);
+    const embeddedKnowledgeViewProps = useMemo(() => ({
+        content: embeddedKnowledgeText || "（文件內容為空）",
+        fontSize: embeddedKnowledgeFontSize,
+        trackLanguage,
+        speakerLanguage: String(embeddedKnowledgeFileInfo?.targetLanguage || trackLanguage || "").trim(),
+        enableKnowledgeTermLinks: !embeddedKnowledgeIsDirectBookText,
+        knowledgeTermEntries: embeddedKnowledgeTermEntries,
+        onKnowledgeTermClick: handleKnowledgePreviewTermClick,
+        onActiveKnowledgeTermsChange: syncOpenKnowledgePreviewToActiveTerm,
+        activeKnowledgeSourceLines: embeddedKnowledgeSourceLines,
+        activeKnowledgeSubtitleText: subtitles[embeddedKnowledgeRenderIndex]?.text || "",
+        treatWholeDocumentAsOriginal: embeddedKnowledgeAlignmentIndex.useWholeDocument,
+        manualKnowledgeAnchorMode: embeddedKnowledgeManualAnchorMode,
+        onKnowledgeSourceLineConfirm: handleEmbeddedKnowledgeSourceLineConfirm
+    }), [embeddedKnowledgeText, embeddedKnowledgeFontSize, trackLanguage, embeddedKnowledgeFileInfo?.targetLanguage,
+        embeddedKnowledgeIsDirectBookText, embeddedKnowledgeTermEntries, handleKnowledgePreviewTermClick,
+        syncOpenKnowledgePreviewToActiveTerm, embeddedKnowledgeSourceLines, subtitles, embeddedKnowledgeRenderIndex,
+        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm]);
+
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
         
@@ -19964,7 +20034,7 @@ ${userQ}`;
     );
 
     return (
-        <AudioCacheContext.Provider value={{ cache: audioCache, addToCache: addToAudioCache, currentKey: currentApiKey, trackLanguage: trackLanguage, preferredVoice: preferredVoice, globalAudioRef }}>
+        <AudioCacheContext.Provider value={audioCacheContextValue}>
             <div className="bg-gray-50 text-gray-800 flex flex-col font-sans h-screen overflow-hidden">
                 {/* [HEADER] */}
                 {isHeaderVisible && (
@@ -20405,32 +20475,7 @@ ${userQ}`;
                                                 </button>
                                             </div>
                                         ) : (
-                                            <MarkdownView
-                                                content={embeddedKnowledgeText || "（文件內容為空）"}
-                                                fontSize={embeddedKnowledgeFontSize}
-                                                trackLanguage={trackLanguage}
-                                                speakerLanguage={String(embeddedKnowledgeFileInfo?.targetLanguage || trackLanguage || "").trim()}
-                                                enableKnowledgeTermLinks={!embeddedKnowledgeIsDirectBookText}
-                                                knowledgeTermEntries={embeddedKnowledgeTermEntries}
-                                                onKnowledgeTermClick={handleKnowledgePreviewTermClick}
-                                                onActiveKnowledgeTermsChange={syncOpenKnowledgePreviewToActiveTerm}
-                                                activeKnowledgeSourceLines={embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine)}
-                                                activeKnowledgeSubtitleText={subtitles[currentIndex]?.text || ""}
-                                                treatWholeDocumentAsOriginal={embeddedKnowledgeAlignmentIndex.useWholeDocument}
-                                                manualKnowledgeAnchorMode={embeddedKnowledgeManualAnchorMode}
-                                                onKnowledgeSourceLineConfirm={(sourceLine) => {
-                                                    const key = `${embeddedKnowledgeDocumentKey}:${currentIndex}`;
-                                                    embeddedKnowledgePlaybackProgressRef.current.maxSourceLine = sourceLine;
-                                                    embeddedKnowledgePlaybackProgressRef.current.anchorState = "anchored";
-                                                    embeddedKnowledgePlaybackProgressRef.current.anchorCandidate = null;
-                                                    embeddedKnowledgePlaybackProgressRef.current.trustedSourceLines = [sourceLine];
-                                                    embeddedKnowledgePlaybackProgressRef.current.forwardMisses = 0;
-                                                    setEmbeddedKnowledgeManualAnchors(prev => ({ ...prev, [key]: sourceLine }));
-                                                    setEmbeddedKnowledgeMatchCandidates([]);
-                                                    setEmbeddedKnowledgeManualAnchorMode(false);
-                                                    setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${sourceLine + 1} 行為目前字幕對應。`);
-                                                }}
-                                            />
+                                            <MemoizedMarkdownView {...embeddedKnowledgeViewProps} />
                                         )}
                                     </div>
                                     {!showModal && knowledgePreviewPopupMode === 'split' && knowledgePreviewTermPopup && (

@@ -9,7 +9,7 @@ const payload = (...terms) => ({ term: terms.length > 1 ? '本句知識點：' +
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const start = source.indexOf('    // Scope manual knowledge selection');
-    const handlers = source.slice(start >= 0 ? start : source.indexOf('    const handleKnowledgePreviewTermClick ='), source.indexOf('    const renderKnowledgePreviewPopupPanel ='));
+    const handlers = source.slice(start >= 0 ? start : source.indexOf('    const handleKnowledgePreviewTermClick ='), source.indexOf('    const handleEmbeddedKnowledgeSourceLineConfirm ='));
     const setup = () => {
         let previousDeps;
         let layout;
@@ -20,14 +20,15 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             } },
             useCallback: fn => fn, cleanQuizDisplayText: value => value,
             knowledgePreviewManualOverrideRef: { current: { documentKey: '', subtitleIndex: -1 } },
-            currentIndex: 8, currentTrackIndex: 0, embeddedKnowledgeDocumentKey: 'document-A',
+            currentIndex: 8, embeddedKnowledgeRenderIndex: 8, currentTrackIndex: 0, embeddedKnowledgeDocumentKey: 'document-A',
             knowledgePreviewTermPopup: null, knowledgePreviewPopupPosRef: { current: { x: 0, y: 0 } },
-            setKnowledgePreviewTermPopup: value => { c.knowledgePreviewTermPopup = value; },
+            setKnowledgePreviewTermPopup: value => { c.knowledgePreviewTermPopup = typeof value === 'function' ? value(c.knowledgePreviewTermPopup) : value; },
             setKnowledgePreviewPopupPos() {}, getKnowledgePreviewPopupDefaultPos: () => ({ x: 0, y: 0 }),
             clampKnowledgePreviewPopupPos: (x, y) => ({ x, y }), QUIZ_FOCUS_TYPE_LABELS: { vocab: '單字' }
         };
         const context = vm.createContext(c);
         const render = () => {
+            c.embeddedKnowledgeRenderIndex = c.currentIndex;
             const api = vm.runInContext('(() => {' + handlers + '\nreturn { click: handleKnowledgePreviewTermClick, sync: syncOpenKnowledgePreviewToActiveTerm }; })()', context);
             // React flushes layout effects before the child's passive reporter.
             layout?.(); layout = null;
