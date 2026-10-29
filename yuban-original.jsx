@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.220 · knowledge-preview-follow-reset";
+const APP_VERSION = "v5.221 · buffered-sentence-replay";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3498,6 +3498,18 @@ const parsePlaybackTimeInput = (input) => {
     if (parts.length === 3 && parts[1] >= 60) return null;
     const seconds = parts.reduce((total, part) => total * 60 + part, 0);
     return Number.isFinite(seconds) ? seconds : null;
+};
+
+// Only reuse the light replay path when the entire selected sentence is cached.
+const isMediaReplayBuffered = (player, start, end) => {
+    if (!player || player.error || player.seeking || player.readyState < 2 ||
+        !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
+    try {
+        for (let index = 0; index < player.buffered.length; index++) {
+            if (player.buffered.start(index) <= start && player.buffered.end(index) >= end) return true;
+        }
+    } catch (_) { }
+    return false;
 };
 
 // A seek request is not proof that audio decoding has reached the target.
@@ -8773,16 +8785,17 @@ export default function GeminiPlayer() {
         return () => player.removeEventListener('timeupdate', onEchoTimeUpdate);
     }, [isEchoMode]);
 
-    const requestMediaPlay = () => {
+    const requestMediaPlay = ({ quiet = false, onStarted = null } = {}) => {
         const player = playerRef.current;
         if (!player || mediaPlayRef.current.active) return;
         const session = { active: true, cancel: null };
         mediaPlayRef.current = session;
-        setSeekNotice('正在準備播放…');
+        if (!quiet) setSeekNotice('正在準備播放…');
         session.cancel = performManagedMediaPlay(player, {
             isCurrent: () => mediaPlayRef.current === session && playerRef.current === player,
             onPlaying: () => {
                 session.active = false;
+                if (onStarted && onStarted() === false) return;
                 setSeekNotice('');
                 setMediaError('');
                 setIsPlaying(true);
@@ -8806,10 +8819,32 @@ export default function GeminiPlayer() {
         });
     };
 
-    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null) => {
+    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { repeatEnd = null } = {}) => {
         const player = playerRef.current;
         if (!player) return;
         const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
+        if (shouldPlay && !onLocated && !mediaSeekRef.current.active && !mediaPlayRef.current.active &&
+            isMediaReplayBuffered(player, t, repeatEnd)) {
+            // Rewind once and let the native play request wait for its buffered
+            // seek. No second pause, polling loop or locating banner per repeat.
+            try {
+                timerTokenRef.current += 1; // Retire the completed loop timer.
+                player.currentTime = t;
+                setSeekNotice('');
+                requestMediaPlay({ quiet: true, onStarted: () => {
+                    const actual = Number(player.currentTime);
+                    if (player.seeking || !Number.isFinite(actual) || actual < t - 0.15 || actual > Math.min(repeatEnd, t + 0.5)) {
+                        // If the browser did not actually return to A, use the
+                        // verified path rather than risk playing the wrong cue.
+                        seekThenMaybePlay(t, true);
+                        return false;
+                    }
+                    setCurrentTime(actual);
+                    return true;
+                } });
+                return;
+            } catch (_) { /* Retry with the verified seek below. */ }
+        }
         mediaPlayRef.current.cancel?.();
         mediaPlayRef.current.active = false;
         mediaSeekRef.current.cancel?.();
@@ -10232,7 +10267,8 @@ export default function GeminiPlayer() {
                         if (isShadowInfinite || currentRepeatRef.current < shadowRepeatCount) {
                             if (player) {
                                 const currentSub = subtitles[currentIndex];
-                                seekThenMaybePlay(getBufferedRange(currentSub).start, true);
+                                const range = getBufferedRange(currentSub);
+                                seekThenMaybePlay(range.start, true, null, { repeatEnd: range.end });
                             }
                         } else {
                             currentRepeatRef.current = 0;
@@ -10250,7 +10286,8 @@ export default function GeminiPlayer() {
                                 if (currentIndex + 1 < subtitles.length) jumpToSubtitle(currentIndex + 1);
                                 else setIsPlaying(false);
                             } else {
-                                jumpToSubtitle(currentIndex);
+                                const range = getBufferedRange(subtitles[currentIndex]);
+                                seekThenMaybePlay(range.start, true, null, { repeatEnd: range.end });
                             }
                         }
                     }
@@ -10258,7 +10295,8 @@ export default function GeminiPlayer() {
                     // Non-shadowing drill mode behavior (Simple pause -> Next/Repeat)
                     const currentSub = subtitles[currentIndex];
                     if (loopMode === 'single') {
-                        seekThenMaybePlay(getBufferedRange(currentSub).start, true);
+                        const range = getBufferedRange(currentSub);
+                        seekThenMaybePlay(range.start, true, null, { repeatEnd: range.end });
                     } else if (loopMode === 'all') {
                         let nextIdx = currentIndex + 1;
                         if (nextIdx >= subtitles.length) {

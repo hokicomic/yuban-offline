@@ -81,7 +81,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(state.currentRepeatRef.current, 1);
         located(); player.time = 15;
         send('TICK'); send('TIMER_DONE');
-        assert.deepEqual(jumps, [0]);
+        assert.deepEqual(jumps, []);
+        assert.equal(c.mediaSeekRef.current.target, 10, 'the next shadow cycle replays this sentence without changing its index');
         assert.equal(state.currentRepeatRef.current, 0);
     });
     test('native ended dispatches a sentence tick or advances the continuous playlist: ' + file, () => {
