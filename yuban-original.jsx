@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.219 · visible-sentence-buffers";
+const APP_VERSION = "v5.220 · knowledge-preview-follow-reset";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -18251,6 +18251,13 @@ ${userQ}`;
             knowledgePreviewPopupSpeakLang || undefined
         );
     }, [knowledgePreviewPopupSpeakLang]);
+    // Scope manual knowledge selection to one visit to the current cue.
+    // Reset before MarkdownView's passive sync effect; a passive reset here
+    // would run too late when returning to the previously pinned cue.
+    React.useLayoutEffect(() => {
+        knowledgePreviewManualOverrideRef.current = { documentKey: "", subtitleIndex: -1 };
+    }, [currentIndex, embeddedKnowledgeDocumentKey, currentTrackIndex]);
+
     const handleKnowledgePreviewTermClick = useCallback((payload) => {
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const rawItems = Array.isArray(payload?.items) ? payload.items : [];

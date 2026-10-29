@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.219 · visible-sentence-buffers";
+const APP_VERSION = "v5.220 · knowledge-preview-follow-reset";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7632,6 +7632,7 @@ export default function App() {
     const manualKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeContentRef = useRef(null);
+    const knowledgePreviewManualOverrideRef = useRef({ documentKey: "", subtitleIndex: -1 });
     const embeddedKnowledgeHeightMigrationRef = useRef(false);
     const embeddedKnowledgeTabSearchRef = useRef("");
     const embeddedKnowledgeTabIndexCacheRef = useRef(createKnowledgeReferenceCache(2));
@@ -18224,6 +18225,13 @@ ${userQ}`;
             knowledgePreviewPopupSpeakLang || undefined
         );
     }, [knowledgePreviewPopupSpeakLang]);
+    // Scope manual knowledge selection to one visit to the current cue.
+    // Reset before MarkdownView's passive sync effect; a passive reset here
+    // would run too late when returning to the previously pinned cue.
+    React.useLayoutEffect(() => {
+        knowledgePreviewManualOverrideRef.current = { documentKey: "", subtitleIndex: -1 };
+    }, [currentIndex, embeddedKnowledgeDocumentKey, currentTrackIndex]);
+
     const handleKnowledgePreviewTermClick = useCallback((payload) => {
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const rawItems = Array.isArray(payload?.items) ? payload.items : [];
@@ -18246,6 +18254,10 @@ ${userQ}`;
             if (items.length >= 12) break;
         }
         if (!term || items.length === 0) return;
+        knowledgePreviewManualOverrideRef.current = {
+            documentKey: embeddedKnowledgeDocumentKey,
+            subtitleIndex: currentIndex
+        };
         const nextPos = !knowledgePreviewTermPopup
             ? getKnowledgePreviewPopupDefaultPos()
             : {
@@ -18254,12 +18266,14 @@ ${userQ}`;
             };
         setKnowledgePreviewPopupPos(clampKnowledgePreviewPopupPos(nextPos.x, nextPos.y));
         setKnowledgePreviewTermPopup({ term, items });
-    }, [clampKnowledgePreviewPopupPos, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
+    }, [clampKnowledgePreviewPopupPos, currentIndex, embeddedKnowledgeDocumentKey, getKnowledgePreviewPopupDefaultPos, knowledgePreviewTermPopup]);
     const syncOpenKnowledgePreviewToActiveTerm = useCallback((payload) => {
         // Do not create a popup during playback.  This only keeps a preview
         // that the learner has explicitly opened in sync with the highlighted
         // source sentence, whether it is floating or docked on the right.
         if (!knowledgePreviewTermPopup) return;
+        const manualOverride = knowledgePreviewManualOverrideRef.current || {};
+        if (manualOverride.documentKey === embeddedKnowledgeDocumentKey && manualOverride.subtitleIndex === currentIndex) return;
         const term = cleanQuizDisplayText(String(payload?.term || ""));
         const items = Array.isArray(payload?.items) ? payload.items : [];
         if (!term || items.length === 0) return;
@@ -18267,7 +18281,7 @@ ${userQ}`;
         const nextKey = `${term}::${items.map(item => `${item?.category || ""}:${item?.id || ""}:${item?.front || ""}`).join("|")}`;
         if (currentKey === nextKey) return;
         setKnowledgePreviewTermPopup({ term, items });
-    }, [knowledgePreviewTermPopup]);
+    }, [currentIndex, embeddedKnowledgeDocumentKey, knowledgePreviewTermPopup]);
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
         
