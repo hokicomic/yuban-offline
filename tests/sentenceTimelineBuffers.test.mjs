@@ -47,12 +47,18 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         c.currentIndex = 1; c.currentTrackIndex = 1; effects[0]();
         assert.equal(api.getBufferedRange(next).start, 25, 'offset never transfers between media files');
     });
-    test('larger buffers never extend the timeline beyond media boundaries: ' + file, () => {
+    test('visible buffers remain complete while draggable audio respects media boundaries: ' + file, () => {
         const c = { useRef: current => ({ current }), useState: initial => [initial, () => {}], useEffect() {},
             subtitles: [{ start: 2, end: 7 }], currentIndex: 0, currentTrackIndex: 0,
             playbackMode: 'sentence', duration: 10, sentenceTimelineBuffers: { before: 60, after: 60 } };
         const code = source.slice(source.indexOf('    const sentenceTimelineRef ='), source.indexOf('    const getBufferedRange ='));
-        const bounds = vm.runInNewContext(code + '\n({start:sentenceTimelineStart,end:sentenceTimelineEnd})', c);
-        assert.equal(bounds.start, 0); assert.equal(bounds.end, 10);
+        const bounds = vm.runInNewContext(code + '\n({start:sentenceTimelineStart,end:sentenceTimelineEnd,playableStart:sentencePlayableStart,playableEnd:sentencePlayableEnd,adjustSentenceMarker,sentenceRangeRef,sentenceTimelineRef})', c);
+        assert.equal(bounds.start, -58); assert.equal(bounds.end, 67);
+        assert.equal(bounds.playableStart, 0); assert.equal(bounds.playableEnd, 10);
+        bounds.sentenceTimelineRef.current = { getBoundingClientRect: () => ({ left: 0, width: 125 }) };
+        bounds.adjustSentenceMarker('A', { clientX: 0 });
+        assert.equal(bounds.sentenceRangeRef.current.start, 0, 'unavailable front buffer cannot seek before zero');
+        bounds.adjustSentenceMarker('B', { clientX: 125 });
+        assert.equal(bounds.sentenceRangeRef.current.end, 10, 'unavailable tail buffer cannot seek past EOF');
     });
 }

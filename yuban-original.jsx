@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.218 · adjustable-sentence-buffers";
+const APP_VERSION = "v5.219 · visible-sentence-buffers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8341,8 +8341,16 @@ export default function GeminiPlayer() {
     const sentenceSub = subtitles[currentIndex];
     const sentenceOriginalStart = Math.max(0, Number(sentenceSub?.start) || 0);
     const sentenceOriginalEnd = Math.max(sentenceOriginalStart, Number(sentenceSub?.end) || 0);
-    const sentenceTimelineStart = Math.max(0, sentenceOriginalStart - sentenceTimelineBuffers.before);
-    const sentenceTimelineEnd = Math.min(Number(duration) > 0 ? Number(duration) : Infinity, sentenceOriginalEnd + sentenceTimelineBuffers.after);
+    // Keep the configured buffers visible even at EOF/zero. Playback boundaries
+    // are separate: unavailable audio is shown explicitly instead of disappearing.
+    const sentenceTimelineStart = sentenceOriginalStart - sentenceTimelineBuffers.before;
+    const sentenceTimelineEnd = sentenceOriginalEnd + sentenceTimelineBuffers.after;
+    const sentencePlayableStart = Math.max(0, sentenceTimelineStart);
+    const sentencePlayableEnd = Math.min(Number(duration) > 0 ? Number(duration) : Infinity, sentenceTimelineEnd);
+    const sentenceTimelineSpan = Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart);
+    const sentenceTickStep = sentenceTimelineSpan <= 30 ? 1 : sentenceTimelineSpan <= 120 ? 5 : 10;
+    const sentenceTimelineTicks = Array.from({ length: Math.max(0, Math.floor(sentenceTimelineEnd / sentenceTickStep) - Math.ceil(sentenceTimelineStart / sentenceTickStep) + 1) },
+        (_, index) => (Math.ceil(sentenceTimelineStart / sentenceTickStep) + index) * sentenceTickStep);
     const sentenceSelectedRange = sentenceSub
         ? resolveSentenceRange(sentenceSub)
         : { start: sentenceOriginalStart, end: sentenceOriginalEnd };
@@ -8355,12 +8363,12 @@ export default function GeminiPlayer() {
         const previous = sentenceRangeRef.current?.sub === sentenceSub ? sentenceRangeRef.current : sentenceSelectedRange;
         const range = { ...previous, sub: sentenceSub, track: currentTrackIndex, start: previous.start, end: previous.end };
         if (sentenceAbLinked) {
-            const delta = Math.max(sentenceTimelineStart - range.start,
-                Math.min(time - (point === 'A' ? range.start : range.end), sentenceTimelineEnd - range.end));
+            const delta = Math.max(sentencePlayableStart - range.start,
+                Math.min(time - (point === 'A' ? range.start : range.end), sentencePlayableEnd - range.end));
             range.start += delta;
             range.end += delta;
-        } else if (point === 'A') range.start = Math.max(sentenceTimelineStart, Math.min(time, range.end - 0.08));
-        else range.end = Math.min(sentenceTimelineEnd, Math.max(time, range.start + 0.08));
+        } else if (point === 'A') range.start = Math.max(sentencePlayableStart, Math.min(time, range.end - 0.08));
+        else range.end = Math.min(sentencePlayableEnd, Math.max(time, range.start + 0.08));
         sentenceRangeRef.current = range;
         refreshSentenceRange(value => value + 1);
     };
@@ -19858,7 +19866,29 @@ ${userQ}`;
                                         <input type="checkbox" checked={sentenceAbLinked} onChange={event => setSentenceAbLinked(event.target.checked)} className="h-3 w-3 accent-violet-600" />
                                         AB 連動
                                     </label>
-                                    <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-200" />
+                                    <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-slate-200" />
+                                    {[
+                                        { side: '前', start: sentenceTimelineStart, end: sentenceOriginalStart, seconds: sentenceTimelineBuffers.before },
+                                        { side: '後', start: sentenceOriginalEnd, end: sentenceTimelineEnd, seconds: sentenceTimelineBuffers.after }
+                                    ].filter(buffer => buffer.seconds > 0).map(buffer => (
+                                        <div key={buffer.side} data-sentence-buffer={buffer.side === '前' ? 'before' : 'after'}
+                                            aria-label={`${buffer.side} buffer ${buffer.seconds} 秒`}
+                                            className="absolute top-1/2 h-2 -translate-y-1/2 bg-violet-200 pointer-events-none"
+                                            style={{ left: sentencePosition(buffer.start), width: `${buffer.seconds / sentenceTimelineSpan * 100}%` }}>
+                                            <span className={`absolute top-4 whitespace-nowrap text-[9px] text-slate-500 ${buffer.side === '前' ? 'left-0' : 'right-0'}`}>{buffer.side} {buffer.seconds}s</span>
+                                        </div>
+                                    ))}
+                                    {[
+                                        { start: sentenceTimelineStart, end: sentencePlayableStart },
+                                        { start: sentencePlayableEnd, end: sentenceTimelineEnd }
+                                    ].filter(range => range.end > range.start).map((range, index) => (
+                                        <div key={index} aria-label="超出音檔範圍，無可播放音訊" title="超出音檔範圍，無可播放音訊"
+                                            className="absolute top-1/2 h-2 -translate-y-1/2 pointer-events-none"
+                                            style={{ left: sentencePosition(range.start), width: `${(range.end - range.start) / sentenceTimelineSpan * 100}%`, background: 'repeating-linear-gradient(135deg, #cbd5e1 0 3px, #f1f5f9 3px 6px)' }} />
+                                    ))}
+                                    {sentenceTimelineTicks.map(time => (
+                                        <span key={time} aria-hidden="true" className="absolute top-1/2 h-3 -translate-y-1/2 border-l border-slate-400/70 pointer-events-none" style={{ left: sentencePosition(time) }} />
+                                    ))}
                                     <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-600" style={{ left: sentencePosition(sentenceSelectedRange.start), width: `${Math.max(0, (sentenceSelectedRange.end - sentenceSelectedRange.start) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100)}%` }} />
                                     {['start', 'end'].map(edge => (
                                         <div key={edge} className="absolute inset-y-0 z-[15] pointer-events-none" style={{ left: sentencePosition(edge === 'start' ? sentenceOriginalStart : sentenceOriginalEnd) }}>
@@ -19899,6 +19929,11 @@ ${userQ}`;
                                             onPointerCancel={() => { sentenceDragRef.current = null; }}
                                         >{point}</button>
                                     ))}
+                                </div>
+                                <div className="flex justify-between gap-2 pb-1 text-[9px] leading-3 text-slate-500" aria-label="單句時間軸可用範圍">
+                                    <span>前可用 {Math.max(0, sentenceOriginalStart - sentencePlayableStart).toFixed(1)}s</span>
+                                    <span>每格 {sentenceTickStep}s{sentenceTimelineStart < 0 || sentenceTimelineEnd > sentencePlayableEnd ? ' · 斜線區無音訊' : ''}</span>
+                                    <span>後可用 {Math.max(0, sentencePlayableEnd - sentenceOriginalEnd).toFixed(1)}s</span>
                                 </div>
                             </div>
                         )}
