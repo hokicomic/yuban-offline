@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.226 · visible-subtitle-selector";
+const APP_VERSION = "v5.227 · subtitle-word-blanks";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7325,6 +7325,130 @@ const MarkdownView = ({
 // [MODULE 3]: MAIN APP COMPONENT
 // ============================================================================
 
+// Keep exercise state inside a memoized caption component: typing must not
+// rerender the media engine or rescan the reference document.
+const tokenizeSubtitlePractice = (text, language = 'en') => {
+    const source = String(text || '');
+    let pieces;
+    try {
+        pieces = Array.from(new Intl.Segmenter(language, { granularity: 'word' }).segment(source),
+            item => ({ text: item.segment, word: item.isWordLike }));
+    } catch (_) {
+        pieces = (source.match(/[\p{L}\p{M}\p{N}]+(?:['’ʼ][\p{L}\p{M}\p{N}]+)*|[^\p{L}\p{M}\p{N}]+/gu) || [])
+            .map(text => ({ text, word: /[\p{L}\p{N}]/u.test(text) }));
+    }
+    let wordIndex = 0;
+    return pieces.map(piece => {
+        if (!piece.word) return { kind: 'literal', text: piece.text };
+        let partIndex = 0;
+        const parts = (piece.text.match(/[\p{L}\p{M}\p{N}]+|[^\p{L}\p{M}\p{N}]+/gu) || [])
+            .map(text => /[\p{L}\p{N}]/u.test(text)
+                ? { kind: 'letters', text, index: partIndex++ } : { kind: 'literal', text });
+        return { kind: 'word', index: wordIndex++, parts };
+    });
+};
+const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composing = false) => {
+    if (previous?.revealed) return previous;
+    const values = [...(previous?.values || [])];
+    values[partIndex] = value;
+    const revealed = !composing && value.includes('?');
+    return { values: revealed ? word.parts.filter(part => part.kind === 'letters').map(part => part.text) : values, revealed };
+};
+const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && word.parts
+    .filter(part => part.kind === 'letters')
+    .every(part => String(answer?.values?.[part.index] || '').normalize('NFC') === part.text.normalize('NFC'));
+
+// A paragraph's line box includes empty space. Test actual character rectangles
+// so tapping the trailing space or between lines still switches caption modes.
+const isSubtitlePracticeTextHit = (event) => {
+    const target = event.target;
+    if (target?.closest?.('input, button, select, textarea, a')) return true;
+    const doc = target?.ownerDocument;
+    if (!doc) return false;
+    const selection = doc.getSelection?.();
+    if (selection && !selection.isCollapsed && selection.toString()) return true;
+    let node, offset;
+    const caret = doc.caretPositionFromPoint?.(event.clientX, event.clientY);
+    if (caret) { node = caret.offsetNode; offset = caret.offset; }
+    else {
+        const range = doc.caretRangeFromPoint?.(event.clientX, event.clientY);
+        node = range?.startContainer; offset = range?.startOffset;
+    }
+    if (node?.nodeType !== 3 || !event.currentTarget.contains(node)) return false;
+    for (const index of [offset - 1, offset]) {
+        if (index < 0 || index >= node.length || /\s/u.test(node.textContent[index])) continue;
+        const range = doc.createRange();
+        range.setStart(node, index); range.setEnd(node, index + 1);
+        for (const rect of Array.from(range.getClientRects())) {
+            if (event.clientX >= rect.left && event.clientX <= rect.right &&
+                event.clientY >= rect.top && event.clientY <= rect.bottom) return true;
+        }
+    }
+    return false;
+};
+
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef }) => {
+    const answerCache = useRef(new WeakMap());
+    const [, refreshAnswers] = useState(0);
+    const editorRef = useRef(null);
+    const containerRef = useRef(null);
+    const source = subtitle && editsRef.current.has(subtitle) ? editsRef.current.get(subtitle) : text;
+    const tokens = useMemo(() => tokenizeSubtitlePractice(source, language), [source, language]);
+    const cached = subtitle ? answerCache.current.get(subtitle) : null;
+    const answers = cached?.text === source ? cached.answers : {};
+    React.useLayoutEffect(() => {
+        if ((!blankMode || !subtitle) && editorRef.current) editorRef.current.textContent = source;
+    }, [subtitle, text, blankMode, editsRef]);
+    const update = (word, part, value, composing) => {
+        if (!subtitle) return;
+        const latest = answerCache.current.get(subtitle);
+        const previous = latest?.text === source ? latest.answers : {};
+        const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
+        answerCache.current.set(subtitle, { text: source, answers: next });
+        refreshAnswers(revision => revision + 1);
+    };
+    const nextBlank = event => {
+        if (event.nativeEvent?.isComposing || !['Enter', ' '].includes(event.key)) return;
+        event.preventDefault();
+        const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
+        const index = fields.indexOf(event.currentTarget);
+        fields[index + 1]?.focus();
+    };
+    return (
+        <div ref={textRef} aria-label="字幕文字" className="w-full font-bold text-gray-900 leading-snug whitespace-pre-wrap"
+            style={{ fontSize: `${blankMode ? Math.max(16, fontSize) : fontSize}px` }}>
+            {blankMode && subtitle ? (
+                <div ref={containerRef}>
+                    {tokens.map((token, index) => token.kind === 'literal' ? <span key={index}>{token.text}</span> : (
+                        <span key={index} className="inline-block whitespace-nowrap align-baseline max-w-full">
+                            {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : (
+                                <input key={partIndex} type="text" value={answers[token.index]?.values?.[part.index] || ''}
+                                    readOnly={Boolean(answers[token.index]?.revealed)}
+                                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '正確' : '填空'}`}
+                                    autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
+                                    onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
+                                    onCompositionEnd={event => update(token, part, event.currentTarget.value, false)}
+                                    onKeyDown={nextBlank}
+                                    className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-mono font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
+                                    style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
+                                        maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit',
+                                        color: answers[token.index]?.revealed ? '#dc2626' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '#166534' : '#334155' }}
+                                />
+                            ))}
+                        </span>
+                    ))}
+                </div>
+            ) : (
+                <p ref={editorRef} contentEditable={subtitle ? 'plaintext-only' : false} suppressContentEditableWarning
+                    role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" aria-multiline="true" tabIndex={subtitle ? 0 : -1}
+                    onInput={event => { if (subtitle) editsRef.current.set(subtitle, event.currentTarget.textContent || ''); }}
+                    className="w-fit max-w-full mx-auto select-text cursor-text outline-none"
+                />
+            )}
+        </div>
+    );
+});
+
 const MemoizedMarkdownView = React.memo(MarkdownView);
 
 export default function App() {
@@ -7441,7 +7565,7 @@ export default function App() {
     const [embeddedKnowledgeManualAnchors, setEmbeddedKnowledgeManualAnchors] = useState({});
     const [embeddedKnowledgeManualAnchorMode, setEmbeddedKnowledgeManualAnchorMode] = useState(false);
     const [isHeaderExpanded, setIsHeaderExpanded] = useState(true);
-    const [isSubtitleHidden, setIsSubtitleHidden] = useState(true);
+    const [isSubtitleBlankMode, setIsSubtitleBlankMode] = useState(true);
     const [isHeaderVisible, setIsHeaderVisible] = useState(true);
     const [isToolbarVisible, setIsToolbarVisible] = useState(true);
     const [echoToolbarHeight, setEchoToolbarHeight] = useState(0);
@@ -19496,14 +19620,6 @@ ${userQ}`;
     const isTopPanelMediaMode = topPanelMode === 'media';
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
     const subtitleDisplayText = subtitles[currentIndex]?.text || "Load File...";
-    useEffect(() => {
-        const element = subtitleTextRef.current;
-        const sub = subtitles[currentIndex];
-        if (element) element.textContent = sub && subtitleTextEditsRef.current.has(sub)
-            ? subtitleTextEditsRef.current.get(sub)
-            : subtitleDisplayText;
-    }, [subtitleDisplayText, currentIndex, currentTrackIndex, subtitles]);
-
     // The divider keeps the top reference/media panel and the subtitle panel as
     // one adjustable reading surface.  The subtitle card itself flexes into all
     // remaining vertical space, so no empty strip is left below it.
@@ -19545,7 +19661,7 @@ ${userQ}`;
     // Measuring the actual DOM handles different screen widths and CJK/Latin mixes.
     useEffect(() => {
         setFittedSubtitleFontSize(effectiveSubtitleFontSize);
-    }, [subtitleDisplayText, effectiveSubtitleFontSize]);
+    }, [subtitleDisplayText, effectiveSubtitleFontSize, isSubtitleBlankMode]);
     useEffect(() => {
         const card = subtitleCardRef.current;
         const text = subtitleTextRef.current;
@@ -19553,7 +19669,7 @@ ${userQ}`;
         const fitIfNeeded = () => {
             const usableHeight = Math.max(0, card.clientHeight - 32); // p-4 top + bottom
             if (text.scrollHeight > usableHeight + 1) {
-                setFittedSubtitleFontSize(previous => Math.max(12, previous - 1));
+                setFittedSubtitleFontSize(previous => Math.max(isSubtitleBlankMode ? 16 : 12, previous - 1));
             }
         };
         const frame = requestAnimationFrame(fitIfNeeded);
@@ -19565,7 +19681,7 @@ ${userQ}`;
             cancelAnimationFrame(frame);
             observer?.disconnect();
         };
-    }, [subtitleDisplayText, effectiveSubtitleFontSize, fittedSubtitleFontSize]);
+    }, [subtitleDisplayText, effectiveSubtitleFontSize, fittedSubtitleFontSize, isSubtitleBlankMode]);
 
     const getEmbeddedKnowledgeTabSearchData = useCallback((file, { isCurrent = () => true, keepFile = null } = {}) =>
         embeddedKnowledgeTabIndexCacheRef.current.load(file, async candidate => {
@@ -20568,22 +20684,24 @@ ${userQ}`;
 
                     <div className={`w-full flex-1 min-h-0 flex flex-col ${!mediaSrc ? 'opacity-50 pointer-events-none' : ''}`}>
                         {/* LARGE SUBTITLE CARD */}
-                        <div className="relative group cursor-pointer flex-1 min-h-0" onClick={() => { if (!isSubtitleHidden) { window.getSelection()?.removeAllRanges(); subtitleTextRef.current?.blur(); } setIsSubtitleHidden(!isSubtitleHidden); }}>
-                            <div ref={subtitleCardRef} className={`w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-hidden transition-all duration-300 border ${isSubtitleHidden ? 'bg-gray-50 border-gray-100 text-transparent blur-sm select-none' : 'bg-white border-gray-200 shadow-sm'}`}>
-                                <p ref={subtitleTextRef}
-                                    contentEditable={isSubtitleHidden ? false : 'plaintext-only'}
-                                    suppressContentEditableWarning
-                                    role={isSubtitleHidden ? undefined : 'textbox'}
-                                    aria-label="字幕文字" aria-multiline="true"
-                                    tabIndex={isSubtitleHidden ? -1 : 0}
-                                    onClick={event => { if (!isSubtitleHidden) event.stopPropagation(); }}
-                                    onInput={event => {
-                                        const sub = subtitles[currentIndex];
-                                        if (sub && !isSubtitleHidden) subtitleTextEditsRef.current.set(sub, event.currentTarget.textContent || '');
-                                    }}
-                                    className={`w-fit max-w-full self-center font-bold text-gray-900 leading-snug whitespace-pre-wrap outline-none ${isSubtitleHidden ? 'select-none' : 'select-text cursor-text'}`}
-                                    style={{ fontSize: `${fittedSubtitleFontSize}px` }}
-                                />
+                        <div className="relative group flex-1 min-h-0 outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
+                            role="group" aria-label={isSubtitleBlankMode ? '字幕區：填空模式' : '字幕區：全文模式'} tabIndex={0}
+                            title={isSubtitleBlankMode ? '輸入 ? 以紅字揭示單字；點字幕空白處顯示全文' : '點字幕空白處切換填空'}
+                            onClick={event => {
+                                if (isSubtitlePracticeTextHit(event)) return;
+                                const active = event.currentTarget.ownerDocument.activeElement;
+                                if (event.currentTarget.contains(active)) active?.blur();
+                                setIsSubtitleBlankMode(mode => !mode);
+                            }}
+                            onKeyDown={event => {
+                                if (event.target === event.currentTarget && ['Enter', ' '].includes(event.key)) {
+                                    event.preventDefault(); setIsSubtitleBlankMode(mode => !mode);
+                                }
+                            }}>
+                            <div ref={subtitleCardRef} className="w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-auto border bg-white border-gray-200 shadow-sm">
+                                <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                    blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
+                                    textRef={subtitleTextRef} editsRef={subtitleTextEditsRef} />
                             </div>
 
                             {/* SHADOWING PROGRESS BAR */}
