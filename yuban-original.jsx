@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.227 · subtitle-word-blanks";
+const APP_VERSION = "v5.228 · subtitle-practice-feedback";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7343,6 +7343,58 @@ const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && w
     .filter(part => part.kind === 'letters')
     .every(part => String(answer?.values?.[part.index] || '').normalize('NFC') === part.text.normalize('NFC'));
 
+const getSubtitlePracticeProgress = (tokens, answers) => {
+    const words = tokens.filter(token => token.kind === 'word');
+    const completed = words.filter(word => answers[word.index]?.revealed || isSubtitlePracticeAnswerCorrect(word, answers[word.index])).length;
+    const hints = words.filter(word => answers[word.index]?.revealed).length;
+    return { total: words.length, completed, hints, done: words.length > 0 && completed === words.length };
+};
+const canAutoFocusSubtitlePractice = (environment) => {
+    const nav = environment?.navigator;
+    if (!nav || nav.userAgentData?.mobile || /Android|iPhone|iPad|iPod|Mobile/i.test(nav.userAgent || '')) return false;
+    // iPadOS can identify itself as a desktop Mac, even with a mouse attached.
+    if (/Mac/i.test(nav.platform || nav.userAgent || '') && Number(nav.maxTouchPoints) > 1) return false;
+    return !environment.matchMedia?.('(pointer: coarse)').matches;
+};
+const findSubtitlePracticeBlank = (fields) => {
+    const pending = Array.from(fields).filter(field => !field.disabled && !field.readOnly && field.dataset.subtitlePartComplete !== 'true');
+    return pending.find(field => !field.value) || pending[0] || null;
+};
+const focusSubtitlePracticeBlank = (container) => {
+    const doc = container?.ownerDocument;
+    if (!doc || !canAutoFocusSubtitlePractice(doc.defaultView) || doc.visibilityState === 'hidden') return;
+    const active = doc.activeElement;
+    // Playback buttons may yield focus, while settings, editors and dialogs keep it.
+    if (active && !container.contains(active) && (active.isContentEditable ||
+        active.closest?.('input, textarea, select, [role="dialog"], [aria-modal="true"]'))) return;
+    if (doc.getSelection?.()?.toString()) return;
+    const field = findSubtitlePracticeBlank(container.querySelectorAll('input'));
+    if (field) {
+        if (field !== active) field.focus({ preventScroll: true });
+    } else if (container.contains(active)) active?.blur();
+};
+const installSubtitlePracticeFocus = (container) => {
+    const doc = container?.ownerDocument;
+    const win = doc?.defaultView;
+    if (!canAutoFocusSubtitlePractice(win)) return () => {};
+    let frame;
+    const schedule = () => {
+        win.cancelAnimationFrame(frame);
+        frame = win.requestAnimationFrame(() => focusSubtitlePracticeBlank(container));
+    };
+    const afterPlaybackControl = event => {
+        if (event.target?.closest?.('button')?.closest('[data-subtitle-focus-restore]')) schedule();
+    };
+    doc.addEventListener('click', afterPlaybackControl, true);
+    win.addEventListener('focus', schedule);
+    schedule();
+    return () => {
+        win.cancelAnimationFrame(frame);
+        doc.removeEventListener('click', afterPlaybackControl, true);
+        win.removeEventListener('focus', schedule);
+    };
+};
+
 // A paragraph's line box includes empty space. Test actual character rectangles
 // so tapping the trailing space or between lines still switches caption modes.
 const isSubtitlePracticeTextHit = (event) => {
@@ -7372,8 +7424,9 @@ const isSubtitlePracticeTextHit = (event) => {
     return false;
 };
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true }) => {
     const answerCache = useRef(new WeakMap());
+    const advanceFocusRef = useRef(false);
     const [, refreshAnswers] = useState(0);
     const editorRef = useRef(null);
     const containerRef = useRef(null);
@@ -7381,6 +7434,15 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const tokens = useMemo(() => tokenizeSubtitlePractice(source, language), [source, language]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source ? cached.answers : {};
+    const progress = getSubtitlePracticeProgress(tokens, answers);
+    useEffect(() => {
+        if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
+    }, [subtitle, source, blankMode, autoFocusEnabled]);
+    React.useLayoutEffect(() => {
+        if (!advanceFocusRef.current) return;
+        advanceFocusRef.current = false;
+        if (blankMode && autoFocusEnabled) focusSubtitlePracticeBlank(containerRef.current);
+    });
     React.useLayoutEffect(() => {
         if ((!blankMode || !subtitle) && editorRef.current) editorRef.current.textContent = source;
     }, [subtitle, text, blankMode, editsRef]);
@@ -7390,14 +7452,32 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const previous = latest?.text === source ? latest.answers : {};
         const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
         answerCache.current.set(subtitle, { text: source, answers: next });
+        advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticeAnswerCorrect(word, next[word.index]));
         refreshAnswers(revision => revision + 1);
     };
+    React.useLayoutEffect(() => {
+        const container = containerRef.current;
+        const fields = Array.from(container?.querySelectorAll('input') || []);
+        if (!fields.length) return;
+        // The normal caption font is proportional. Measure it rather than
+        // assuming every letter has the same width as a monospace zero.
+        const doc = container.ownerDocument;
+        const context = doc.createElement('canvas').getContext('2d');
+        if (!context) return;
+        context.font = doc.defaultView.getComputedStyle(fields[0]).font;
+        const parts = tokens.filter(token => token.kind === 'word').flatMap(word => word.parts.filter(part => part.kind === 'letters'));
+        fields.forEach((field, index) => {
+            field.style.width = `${Math.ceil(Math.max(context.measureText('00').width, context.measureText(parts[index].text).width) + 8)}px`;
+        });
+    }, [tokens, fontSize, blankMode]);
     const nextBlank = event => {
         if (event.nativeEvent?.isComposing || !['Enter', ' '].includes(event.key)) return;
         event.preventDefault();
+        // A desktop correct answer already advanced focus; a following space
+        // must not skip the newly focused empty word.
+        if (!event.currentTarget.value) return;
         const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
-        const index = fields.indexOf(event.currentTarget);
-        fields[index + 1]?.focus();
+        findSubtitlePracticeBlank(fields)?.focus();
     };
     return (
         <div ref={textRef} aria-label="字幕文字" className="w-full font-bold text-gray-900 leading-snug whitespace-pre-wrap"
@@ -7409,15 +7489,16 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : (
                                 <input key={partIndex} type="text" value={answers[token.index]?.values?.[part.index] || ''}
                                     readOnly={Boolean(answers[token.index]?.revealed)}
+                                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || String(answers[token.index]?.values?.[part.index] || '').normalize('NFC') === part.text.normalize('NFC')}
                                     aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '正確' : '填空'}`}
                                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
                                     onCompositionEnd={event => update(token, part, event.currentTarget.value, false)}
                                     onKeyDown={nextBlank}
-                                    className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-mono font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
+                                    className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
                                     style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
-                                        maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit',
-                                        color: answers[token.index]?.revealed ? '#dc2626' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '#166534' : '#334155' }}
+                                        maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit', fontFamily: 'inherit', fontWeight: 'inherit',
+                                        color: answers[token.index]?.revealed ? '#dc2626' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '#2f7d57' : '#6b4c9a' }}
                                 />
                             ))}
                         </span>
@@ -7426,9 +7507,15 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             ) : (
                 <p ref={editorRef} contentEditable={subtitle ? 'plaintext-only' : false} suppressContentEditableWarning
                     role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" aria-multiline="true" tabIndex={subtitle ? 0 : -1}
-                    onInput={event => { if (subtitle) editsRef.current.set(subtitle, event.currentTarget.textContent || ''); }}
+                    onInput={event => { if (subtitle) { editsRef.current.set(subtitle, event.currentTarget.textContent || ''); refreshAnswers(revision => revision + 1); } }}
                     className="w-fit max-w-full mx-auto select-text cursor-text outline-none"
                 />
+            )}
+            {subtitle && progress.done && (
+                <span role="status" aria-live="polite" className="inline-flex items-center gap-1 mt-2 px-2 py-0.5 rounded-full text-xs font-semibold"
+                    style={{ color: '#2f7d57', backgroundColor: '#edf5f0' }}>
+                    <CheckCircle size={14} aria-hidden="true" />本句完成{progress.hints > 0 ? `（含 ${progress.hints} 字提示）` : ''}
+                </span>
             )}
         </div>
     );
@@ -20082,7 +20169,7 @@ ${userQ}`;
                     autoComplete="off" spellCheck={false}
                     className="w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-mono text-gray-800" />
             </label>
-            <button type="submit" disabled={!mediaSrc} className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
+            <button type="submit" disabled={!mediaSrc} data-subtitle-focus-restore className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
         </form>
     );
 
@@ -20276,7 +20363,7 @@ ${userQ}`;
                                     <button onClick={toggleSmartMode} className={`flex items-center gap-1 px-3 py-1.5 rounded-md border text-xs font-medium shrink-0 transition-colors ${isSmartMode ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-gray-50 text-gray-600 border-gray-200'}`}><Puzzle size={14} /><span>智能斷句</span></button>
                                     <button
                                         type="button"
-                                        onClick={togglePlaybackMode}
+                                        onClick={togglePlaybackMode} data-subtitle-focus-restore
                                         title={playbackMode === 'continuous'
                                             ? '連續播放：影音不中斷；字幕與已開啟的參照文件仍依時間軸同步。點此切回單句學習。'
                                             : '單句學習：每個字幕段落結束時暫停。點此切換為不中斷的連續播放。'}
@@ -20698,7 +20785,8 @@ ${userQ}`;
                             <div ref={subtitleCardRef} className="w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-auto border bg-white border-gray-200 shadow-sm">
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
-                                    textRef={subtitleTextRef} editsRef={subtitleTextEditsRef} />
+                                    textRef={subtitleTextRef} editsRef={subtitleTextEditsRef}
+                                    autoFocusEnabled={!showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode} />
                             </div>
 
                             {/* SHADOWING PROGRESS BAR */}
@@ -20753,7 +20841,7 @@ ${userQ}`;
                                         <div className="flex items-center gap-1.5 text-xs font-bold text-violet-800"><Ear size={15} />回音法：短段聆聽</div>
                                         <div className="text-[11px] text-violet-700 mt-0.5">{echoNotice}</div>
                                     </div>
-                                    <button type="button" onClick={stopEchoMode} className="px-2.5 py-1 rounded-full border border-violet-300 bg-white text-[11px] font-bold text-violet-700 hover:bg-violet-100">結束回音法</button>
+                                    <button type="button" onClick={stopEchoMode} data-subtitle-focus-restore className="px-2.5 py-1 rounded-full border border-violet-300 bg-white text-[11px] font-bold text-violet-700 hover:bg-violet-100">結束回音法</button>
                                 </div>
                                 <div ref={echoTimelineRef} className="relative h-16 touch-none select-none" aria-label="回音法 A-B 片段進度條">
                                     <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-200" />
@@ -20837,7 +20925,7 @@ ${userQ}`;
                                         >B</button>
                                     )}
                                 </div>
-                                <div className="mt-2 flex items-center justify-center gap-2">
+                                <div className="mt-2 flex items-center justify-center gap-2" data-subtitle-focus-restore>
                                     <button type="button" onClick={() => shiftEchoRange(-1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
                                     <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
                                     <button type="button" onClick={() => shiftEchoRange(1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
@@ -20846,12 +20934,12 @@ ${userQ}`;
                         )}
 
                         {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-x-6 gap-y-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
-                            <div className="flex items-center gap-3 shrink-0" aria-label="播放控制">
+                            <div className="flex items-center gap-3 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
                                 <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
                             </div>
-                            <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習">
+                            <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習" data-subtitle-focus-restore>
                                 <button onClick={() => { const modes = ['single', 'all', 'none']; setLoopMode(modes[(modes.indexOf(loopMode) + 1) % modes.length]); }} className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${loopMode !== 'none' ? 'text-blue-600 bg-blue-50' : 'text-gray-400'}`}>
                                     {loopMode === 'single' && <><Repeat1 size={16} /><span className="text-[9px]">單句</span></>}
                                     {loopMode === 'all' && <><Repeat size={16} /><span className="text-[9px]">全部</span></>}
@@ -20988,7 +21076,7 @@ ${userQ}`;
                         {renderSentenceTimeline()}
                         {renderSeekTimeControls()}
                         <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
-                            <div className="flex items-center gap-2 shrink-0" aria-label="播放控制">
+                            <div className="flex items-center gap-2 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipBack size={16} />
                                 </button>
@@ -20999,7 +21087,7 @@ ${userQ}`;
                                     <SkipForward size={16} />
                                 </button>
                             </div>
-                            <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習">
+                            <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習" data-subtitle-focus-restore>
                             <div className="flex items-center gap-1 shrink-0">
                                 <button
                                     type="button"
