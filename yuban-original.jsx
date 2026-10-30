@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.225 · subtitle-file-variants";
+const APP_VERSION = "v5.226 · visible-subtitle-selector";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -20103,7 +20103,7 @@ ${userQ}`;
                                         </select>
                                     )}
                                     {currentPlaylistTrack?.subtitleFiles?.length > 0 && (
-                                        <label className="flex items-center gap-1 min-w-0 max-w-[220px] text-xs text-gray-600" title={currentPlaylistTrack.subFile?.name || '選擇字幕'}>
+                                        <label className="flex items-center gap-1 shrink-0 max-w-[220px] text-xs text-gray-600" title={currentPlaylistTrack.subFile?.name || '選擇字幕'}>
                                             <span className="shrink-0">字幕</span>
                                             <select aria-label="選擇字幕檔"
                                                 value={currentPlaylistTrack.subtitleFiles.indexOf(currentPlaylistTrack.subFile)}
