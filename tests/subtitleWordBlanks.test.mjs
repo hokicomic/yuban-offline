@@ -27,6 +27,32 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const fallback = vm.runInNewContext(code + '\ntokenizeSubtitlePractice', { Intl: {} });
         assert.equal(join(fallback("Don't stop!\n再見。")), "Don't stop!\n再見。");
     });
+    test('bracketed stage directions are visible literals and excluded from exercise totals: ' + file, () => {
+        const source = '[ Applause ] - Good afternoon. [Music, laughing\ncontinues] ［掌聲］';
+        const parts = tokens(source);
+        assert.equal(join(parts), source);
+        assert.deepEqual(Array.from(parts.filter(part => part.kind === 'word'), word => word.parts.map(part => part.text).join('')), ['Good', 'afternoon']);
+        assert.equal(api.getSubtitlePracticeProgress(parts, {}).total, 2);
+        assert.equal(tokens('[Applause]').filter(part => part.kind === 'word').length, 0);
+        const fallback = vm.runInNewContext(code + '\ntokenizeSubtitlePractice', { Intl: {} });
+        assert.equal(fallback(source).filter(part => part.kind === 'word').length, 2);
+    });
+    test('case differences are accepted and replaced by the original subtitle casing: ' + file, () => {
+        for (const [target, typed] of [['Good', 'good'], ['afternoon', 'AFTERNOON'], ['iPhone', 'IPHONE'], ['CAFÉ', 'cafe\u0301']]) {
+            const word = tokens(target)[0];
+            const answer = api.updateSubtitlePracticeAnswer(word, null, 0, typed);
+            assert.equal(answer.values[0], target);
+            assert.equal(api.isSubtitlePracticeAnswerCorrect(word, answer), true);
+            assert.equal(api.isSubtitlePracticeAnswerCorrect(word, { values: [typed] }), true);
+            assert.equal(answer.revealed, false);
+        }
+        const word = tokens('Hope')[0];
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(word, api.updateSubtitlePracticeAnswer(word, null, 0, 'hop')), false);
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(word, api.updateSubtitlePracticeAnswer(word, null, 0, 'hoped')), false);
+        const composing = api.updateSubtitlePracticeAnswer(word, null, 0, 'hope', true);
+        assert.equal(composing.values[0], 'hope', 'do not rewrite IME input before composition ends');
+        assert.equal(api.updateSubtitlePracticeAnswer(word, composing, 0, 'hope').values[0], 'Hope');
+    });
     test('only the complete word is correct, and ? reveals the entire word: ' + file, () => {
         const word = tokens("don't").find(item => item.kind === 'word');
         let answer = api.updateSubtitlePracticeAnswer(word, null, 0, 'don');
@@ -155,6 +181,22 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.ok(render({ ...props, blankMode: false }).some(node => node.props?.role === 'status'));
         const other = { ...props, subtitle: { text: 'Other.' }, text: 'Other.' };
         assert.equal(render(other).some(node => node.props?.role === 'status'), false);
+    });
+    test('annotation display, case correction and sentence completion work together in the input component: ' + file, () => {
+        const render = setup();
+        const text = '[Applause] Good afternoon!';
+        const props = { ...base(), text, subtitle: { text } };
+        let nodes = render(props), inputs = fields(nodes);
+        assert.equal(inputs.length, 2);
+        assert.ok(nodes.some(node => node.type === 'span' && node.props.children === '[Applause]'));
+        type(inputs[0], 'good'); inputs = fields(render(props));
+        assert.equal(inputs[0].props.value, 'Good');
+        assert.equal(inputs[0].props.style.color, '#2f7d57');
+        assert.equal(inputs[0].props['data-subtitle-part-complete'], true);
+        type(inputs[1], 'AFTERNOON'); nodes = render(props);
+        assert.equal(fields(nodes)[1].props.value, 'afternoon');
+        const badge = nodes.find(node => node.props?.role === 'status');
+        assert.ok(badge); assert.doesNotMatch(JSON.stringify(badge.props.children), /字提示/);
     });
     test('full subtitle editing is preserved and edited text becomes the next exercise: ' + file, () => {
         const render = setup(), props = base();

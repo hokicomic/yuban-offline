@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.228 · subtitle-practice-feedback";
+const APP_VERSION = "v5.229 · subtitle-annotations-and-case";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7329,14 +7329,16 @@ const MarkdownView = ({
 // rerender the media engine or rescan the reference document.
 const tokenizeSubtitlePractice = (text, language = 'en') => {
     const source = String(text || '');
-    let pieces;
-    try {
-        pieces = Array.from(new Intl.Segmenter(language, { granularity: 'word' }).segment(source),
-            item => ({ text: item.segment, word: item.isWordLike }));
-    } catch (_) {
-        pieces = (source.match(/[\p{L}\p{M}\p{N}]+(?:['’ʼ][\p{L}\p{M}\p{N}]+)*|[^\p{L}\p{M}\p{N}]+/gu) || [])
+    let segmenter;
+    try { segmenter = new Intl.Segmenter(language, { granularity: 'word' }); } catch (_) {}
+    // SRT/LRC stage directions are visible context, never dictation answers.
+    // Keep the complete bracketed span, including its original whitespace.
+    const pieces = source.split(/(\[[^\]]*\]|［[^］]*］)/u).flatMap(chunk => {
+        if (/^(?:\[[^\]]*\]|［[^］]*］)$/u.test(chunk)) return [{ text: chunk, word: false }];
+        if (segmenter) return Array.from(segmenter.segment(chunk), item => ({ text: item.segment, word: item.isWordLike }));
+        return (chunk.match(/[\p{L}\p{M}\p{N}]+(?:['’ʼ][\p{L}\p{M}\p{N}]+)*|[^\p{L}\p{M}\p{N}]+/gu) || [])
             .map(text => ({ text, word: /[\p{L}\p{N}]/u.test(text) }));
-    }
+    });
     let wordIndex = 0;
     return pieces.map(piece => {
         if (!piece.word) return { kind: 'literal', text: piece.text };
@@ -7347,16 +7349,18 @@ const tokenizeSubtitlePractice = (text, language = 'en') => {
         return { kind: 'word', index: wordIndex++, parts };
     });
 };
+const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
 const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composing = false) => {
     if (previous?.revealed) return previous;
     const values = [...(previous?.values || [])];
-    values[partIndex] = value;
+    const target = word.parts.find(part => part.kind === 'letters' && part.index === partIndex);
+    values[partIndex] = !composing && target && isSubtitlePracticePartCorrect(target.text, value) ? target.text : value;
     const revealed = !composing && value.includes('?');
     return { values: revealed ? word.parts.filter(part => part.kind === 'letters').map(part => part.text) : values, revealed };
 };
 const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && word.parts
     .filter(part => part.kind === 'letters')
-    .every(part => String(answer?.values?.[part.index] || '').normalize('NFC') === part.text.normalize('NFC'));
+    .every(part => isSubtitlePracticePartCorrect(part.text, answer?.values?.[part.index]));
 
 const getSubtitlePracticeProgress = (tokens, answers) => {
     const words = tokens.filter(token => token.kind === 'word');
@@ -7504,7 +7508,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : (
                                 <input key={partIndex} type="text" value={answers[token.index]?.values?.[part.index] || ''}
                                     readOnly={Boolean(answers[token.index]?.revealed)}
-                                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || String(answers[token.index]?.values?.[part.index] || '').normalize('NFC') === part.text.normalize('NFC')}
+                                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index])}
                                     aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '正確' : '填空'}`}
                                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
