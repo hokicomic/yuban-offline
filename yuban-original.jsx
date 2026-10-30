@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.224 · responsive-subtitle-rendering";
+const APP_VERSION = "v5.225 · subtitle-file-variants";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9090,21 +9090,31 @@ export default function GeminiPlayer() {
         jumpToSubtitle(currentIndex + 1);
     };
 
-    const getSubtitleBaseKeys = (fileName) => {
-        const lower = fileName.toLowerCase();
-        const base = lower.substring(0, lower.lastIndexOf('.'));
-        // Subtitle distributors commonly append BCP-47 tags such as
-        // `.en-US.srt`.  Remove the complete tag before matching the subtitle
-        // with the media filename, otherwise the track silently has no captions.
-        const langSuffixes = ['.en-original', '.en-orig', '.en-forced', '.en-cc', '.zh-original', '.zh-orig', '.ja-original', '.ja-orig', '.en-us', '.en-gb', '.en-au', '.en-ca', '.zh-tw', '.zh-hk', '.zh-cn', '.ja-jp', '.ko-kr', '.en_us', '.en_gb', '.zh_tw', '.zh_hk', '.zh_cn', '.ja_jp', '.ko_kr', '.en', '.eng', '.ja', '.jp', '.ko', '.kr', '.zh', '.cht', '.chs', '.cn', '.tw', '.hk', '.chinese', '.han', '.zht', '.zhs'];
-        let baseNoLang = base;
-        for (const suf of langSuffixes) {
-            if (base.endsWith(suf)) {
-                baseNoLang = base.slice(0, -suf.length);
-                break;
-            }
-        }
-        return baseNoLang && baseNoLang != base ? [base, baseNoLang] : [base];
+    const getMatchingSubtitleFiles = (mediaFile, files) => {
+        const stem = file => String(file?.name || '').normalize('NFC').replace(/\.[^.]+$/, '').toLowerCase();
+        const folder = file => String(file?.webkitRelativePath || '').replace(/[^/]*$/, '');
+        const mediaStem = stem(mediaFile);
+        if (!mediaStem) return [];
+        const sameFolder = file => folder(file) === folder(mediaFile);
+        const matches = (subtitleStem, base) => subtitleStem === base ||
+            (subtitleStem.startsWith(base) && /^[. _-]/.test(subtitleStem.slice(base.length)));
+        // A suffix belongs to the longest matching media filename, so e.g.
+        // "Lesson 10.en.srt" is never attached to "Lesson 1.mp4".
+        const mediaStems = files.filter(file => sameFolder(file) &&
+            /\.(mp4|webm|ogg|mp3|wav|m4a)$/i.test(file.name)).map(stem);
+        return files.filter(file => sameFolder(file) && /\.(srt|lrc)$/i.test(file.name) &&
+            matches(stem(file), mediaStem) && !mediaStems.some(other =>
+                other.length > mediaStem.length && matches(stem(file), other)))
+            .sort((a, b) => Number(stem(b) === mediaStem) - Number(stem(a) === mediaStem) ||
+                a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    };
+
+    const getSubtitleVariantLabel = (subtitleFile, mediaFile) => {
+        const name = String(subtitleFile?.name || '').normalize('NFC');
+        const base = String(mediaFile?.name || '').normalize('NFC').replace(/\.[^.]+$/, '');
+        if (!base || !name.toLowerCase().startsWith(base.toLowerCase())) return name;
+        const suffix = name.slice(base.length);
+        return /^\.(srt|lrc)$/i.test(suffix) ? `同檔名${suffix}` : suffix.replace(/^[. _-]+/, '');
     };
 
     const pickSubtitleFile = (candidates) => {
@@ -9722,28 +9732,13 @@ export default function GeminiPlayer() {
         audioCacheIndexRef.current = {};
 
         const mediaExts = ['.mp4', '.webm', '.ogg', '.mp3', '.wav', '.m4a'];
-        const subExts = ['.srt', '.lrc'];
-        const subMap = new Map();
-
-        files.forEach(f => {
-            const fName = f.name.toLowerCase();
-            if (subExts.some(ext => fName.endsWith(ext))) {
-                const keys = getSubtitleBaseKeys(fName);
-                keys.forEach(k => {
-                    if (!subMap.has(k)) subMap.set(k, []);
-                    subMap.get(k).push(f);
-                });
-            }
-        });
-
         const newPlaylist = [];
         files.forEach(f => {
             const name = f.name.toLowerCase();
             if (f.type.startsWith('video/') || f.type.startsWith('audio/') || mediaExts.some(ext => name.endsWith(ext))) {
-                const baseName = name.substring(0, name.lastIndexOf('.'));
-                const candidates = subMap.get(baseName) || [];
+                const candidates = getMatchingSubtitleFiles(f, files);
                 const subFile = pickSubtitleFile(candidates);
-                newPlaylist.push({ name: f.name, mediaFile: f, subFile: subFile || null });
+                newPlaylist.push({ name: f.name, mediaFile: f, subFile: subFile || null, subtitleFiles: candidates });
             }
         });
         newPlaylist.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
@@ -9837,6 +9832,86 @@ export default function GeminiPlayer() {
         }
     };
 
+    const loadTrackSubtitles = (track, loadToken, keepPosition = false) => {
+        const subtitleToken = (trackLoadRef.current.subtitleToken || 0) + 1;
+        trackLoadRef.current.subtitleToken = subtitleToken;
+        const isCurrent = () => loadToken === trackLoadRef.current.token && subtitleToken === trackLoadRef.current.subtitleToken;
+        const complete = () => {
+            if (keepPosition) setSeekNotice('');
+            finishMediaLoad();
+        };
+        if (track.subFile) {
+            const applySubtitleContent = (content) => {
+                if (!isCurrent()) return;
+                let parsed = [];
+                if (track.subFile.name.toLowerCase().endsWith('.lrc')) parsed = parseLRC(content);
+                else parsed = parseSRT(content);
+                setRawSubtitles(parsed);
+
+                // Calculate language FIRST so we can pass it to smart generator
+                const detectedLang = detectTrackLanguageGlobal(parsed);
+                setTrackLanguage(detectedLang);
+
+                const displaySubtitles = isSmartMode
+                    ? generateSmartSubtitles(parsed, timeBuffer, minDuration, maxMergeCount, detectedLang, smartTimingMode) : parsed;
+                setSubtitles(displaySubtitles);
+                const now = Number(playerRef.current?.currentTime || 0);
+                setCurrentIndex(keepPosition ? displaySubtitles.findIndex(sub => now >= sub.start && now < sub.end) : 0);
+                trackLoadRef.current.subtitlesReady = true;
+                complete();
+            };
+            const subtitleFailure = (err) => {
+                if (!isCurrent()) return;
+                setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
+                setMediaError(err?.message || '無法讀取字幕，請重新選取檔案。');
+                recordPCloudDebug('subtitle.read.fail', { name: String(track.subFile.name || ''), error: String(err?.message || err) });
+                trackLoadRef.current.subtitlesReady = true;
+                complete();
+            };
+            if (track.subFile.isRemotePCloud && typeof track.subFile.text === "function") {
+                recordPCloudDebug("subtitle.fetch.begin", { name: String(track.subFile.name || ""), fileid: Number(track.subFile.pCloudFileId ?? -1) });
+                track.subFile.text().then((content) => {
+                    recordPCloudDebug("subtitle.fetch.success", { name: String(track.subFile.name || ""), chars: String(content || "").length });
+                    applySubtitleContent(content);
+                }).catch((err) => {
+                    if (!isCurrent()) return;
+                    subtitleFailure(err);
+                    recordPCloudDebug("subtitle.fetch.fail", { name: String(track.subFile.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
+                });
+            } else {
+                const reader = new FileReader();
+                reader.onload = (e) => applySubtitleContent(e.target.result);
+                reader.onerror = () => subtitleFailure(reader.error);
+                try { reader.readAsText(track.subFile); } catch (err) { subtitleFailure(err); }
+            }
+        } else {
+            setRawSubtitles([]); setSubtitles([]); setTrackLanguage('en-US'); setCurrentIndex(-1);
+            trackLoadRef.current.subtitlesReady = true;
+            complete();
+        }
+    };
+
+    const selectTrackSubtitle = (value) => {
+        const index = currentTrackIndexRef.current;
+        const track = (playlistRef.current || [])[index];
+        const subFile = track?.subtitleFiles?.[Number(value)];
+        if (!subFile || subFile === track.subFile || trackLoadRef.current.active) return;
+        cancelWorkerTimer({ preservePlayback: true });
+        currentRepeatRef.current = 0;
+        isWaitingShadowRef.current = false;
+        setIsWaitingShadow(false);
+        const nextTrack = { ...track, subFile };
+        const nextList = [...playlistRef.current];
+        nextList[index] = nextTrack;
+        playlistRef.current = nextList;
+        setPlaylist(nextList);
+        setMediaError('');
+        setSeekNotice('正在載入字幕…');
+        setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
+        // Only replace captions. Keep the media URL, playhead and playback intact.
+        loadTrackSubtitles(nextTrack, trackLoadRef.current.token, true);
+    };
+
     const loadTrack = async (index, list = null) => {
         const targetList = list || playlist;
         if (index < 0 || index >= targetList.length) return;
@@ -9886,54 +9961,7 @@ export default function GeminiPlayer() {
             setMediaError(err?.message || `無法載入 ${track?.name || "pCloud 媒體"}`);
             if (track?.mediaFile?.isRemotePCloud) recordPCloudDebug("media.stream.fail", { track: String(track?.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
         }
-        if (track.subFile) {
-            const applySubtitleContent = (content) => {
-                if (loadToken !== trackLoadRef.current.token) return;
-                let parsed = [];
-                if (track.subFile.name.toLowerCase().endsWith('.lrc')) parsed = parseLRC(content);
-                else parsed = parseSRT(content);
-                setRawSubtitles(parsed);
-
-                // Calculate language FIRST so we can pass it to smart generator
-                const detectedLang = detectTrackLanguageGlobal(parsed);
-                setTrackLanguage(detectedLang);
-
-                if (isSmartMode) setSubtitles(generateSmartSubtitles(parsed, timeBuffer, minDuration, maxMergeCount, detectedLang, smartTimingMode));
-                else setSubtitles(parsed);
-
-                setCurrentIndex(0);
-                trackLoadRef.current.subtitlesReady = true;
-                finishMediaLoad();
-            };
-            const subtitleFailure = (err) => {
-                if (loadToken !== trackLoadRef.current.token) return;
-                setRawSubtitles([]); setSubtitles([]); setCurrentIndex(-1);
-                setMediaError(err?.message || '無法讀取字幕，請重新選取檔案。');
-                recordPCloudDebug('subtitle.read.fail', { name: String(track.subFile.name || ''), error: String(err?.message || err) });
-                trackLoadRef.current.subtitlesReady = true;
-                finishMediaLoad();
-            };
-            if (track.subFile.isRemotePCloud && typeof track.subFile.text === "function") {
-                recordPCloudDebug("subtitle.fetch.begin", { name: String(track.subFile.name || ""), fileid: Number(track.subFile.pCloudFileId ?? -1) });
-                track.subFile.text().then((content) => {
-                    recordPCloudDebug("subtitle.fetch.success", { name: String(track.subFile.name || ""), chars: String(content || "").length });
-                    applySubtitleContent(content);
-                }).catch((err) => {
-                    if (loadToken !== trackLoadRef.current.token) return;
-                    subtitleFailure(err);
-                    recordPCloudDebug("subtitle.fetch.fail", { name: String(track.subFile.name || ""), error: String(err?.message || err), request: err?.pCloudDebug || null });
-                });
-            } else {
-                const reader = new FileReader();
-                reader.onload = (e) => applySubtitleContent(e.target.result);
-                reader.onerror = () => subtitleFailure(reader.error);
-                try { reader.readAsText(track.subFile); } catch (err) { subtitleFailure(err); }
-            }
-        } else {
-            setRawSubtitles([]); setSubtitles([]); setTrackLanguage('en-US'); setCurrentIndex(-1);
-            trackLoadRef.current.subtitlesReady = true;
-            finishMediaLoad();
-        }
+        loadTrackSubtitles(track, loadToken);
         setIsWaitingShadow(false);
         isWaitingShadowRef.current = false; // Sync Ref
     };
@@ -20073,6 +20101,20 @@ ${userQ}`;
                                                 );
                                             })}
                                         </select>
+                                    )}
+                                    {currentPlaylistTrack?.subtitleFiles?.length > 0 && (
+                                        <label className="flex items-center gap-1 min-w-0 max-w-[220px] text-xs text-gray-600" title={currentPlaylistTrack.subFile?.name || '選擇字幕'}>
+                                            <span className="shrink-0">字幕</span>
+                                            <select aria-label="選擇字幕檔"
+                                                value={currentPlaylistTrack.subtitleFiles.indexOf(currentPlaylistTrack.subFile)}
+                                                onChange={e => selectTrackSubtitle(e.target.value)}
+                                                disabled={trackLoadRef.current.active}
+                                                className="min-w-0 max-w-[180px] bg-gray-50 border border-gray-200 rounded-md px-2 py-1.5 outline-none">
+                                                {currentPlaylistTrack.subtitleFiles.map((file, index) => (
+                                                    <option key={index} value={index} title={file.name}>{getSubtitleVariantLabel(file, currentPlaylistTrack.mediaFile)}</option>
+                                                ))}
+                                            </select>
+                                        </label>
                                     )}
                                     <button onClick={handlePickFolder} className="cursor-pointer bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0"><FolderOpen size={14} /><span className="hidden sm:inline">授權影音資料夾</span></button>
                                     <button onClick={openPCloudBrowser} className="cursor-pointer bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0" title="登入 pCloud，瀏覽雲端資料夾並按需串流目前教材"><Globe size={14} /><span className="hidden sm:inline">pCloud</span></button>
