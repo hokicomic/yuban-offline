@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus})');
+    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -26,6 +26,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         }
         const fallback = vm.runInNewContext(code + '\ntokenizeSubtitlePractice', { Intl: {} });
         assert.equal(join(fallback("Don't stop!\n再見。")), "Don't stop!\n再見。");
+    });
+    test('letter hints find the longest contiguous fragment without changing what was typed: ' + file, () => {
+        const runs = (answer, typed) => Array.from(api.getSubtitlePracticeLetterHints(answer, typed), run => ({ text: run.text, matched: run.matched }));
+        assert.deepEqual(runs('afternoon', 'aftex'), [{ text: 'afte', matched: true }, { text: 'x', matched: false }]);
+        assert.deepEqual(runs('afternoon', 'xternooy'), [{ text: 'x', matched: false }, { text: 'ternoo', matched: true }, { text: 'y', matched: false }]);
+        assert.deepEqual(runs('attending', 'tten'), [{ text: 'tten', matched: true }]);
+        assert.deepEqual(runs('abc', 'xyz'), [{ text: 'xyz', matched: false }]);
+        assert.deepEqual(runs('banana', 'anaxban'), [{ text: 'ana', matched: true }, { text: 'xban', matched: false }], 'leftmost wins equal-length ties');
+        assert.deepEqual(runs('CAFÉ', 'xCafe\u0301y'), [{ text: 'x', matched: false }, { text: 'Cafe\u0301', matched: true }, { text: 'y', matched: false }]);
+        assert.deepEqual(runs('word', ''), []);
+        const fallback = vm.runInNewContext(code + '\ngetSubtitlePracticeLetterHints', { Intl: {} });
+        assert.equal(fallback('CAFÉ', 'cafe\u0301')[0].matched, true);
+    });
+    test('letter overlays follow the native input horizontal scroll: ' + file, () => {
+        const overlay = { scrollLeft: 0 };
+        const field = { scrollLeft: 37, parentElement: { querySelector: () => overlay } };
+        api.syncSubtitlePracticeLetterOverlay(field); assert.equal(overlay.scrollLeft, 37);
+        field.scrollLeft = 0; api.syncSubtitlePracticeLetterOverlay(field); assert.equal(overlay.scrollLeft, 0);
     });
     test('bracketed stage directions are visible literals and excluded from exercise totals: ' + file, () => {
         const source = '[ Applause ] - Good afternoon. [Music, laughing\ncontinues] ［掌聲］';
@@ -164,7 +182,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         let inputs = fields(render(props));
         assert.equal(inputs.length, 4); assert.ok(inputs.every(input => input.props.value === ''));
         type(inputs[0], 'Hell'); inputs = fields(render(props));
-        assert.equal(inputs[0].props.style.color, '#6b4c9a');
+        assert.equal(inputs[0].props.style.color, 'transparent', 'partial matches are painted by the letter overlay');
         type(inputs[0], 'Hello'); inputs = fields(render(props));
         assert.equal(inputs[0].props.style.color, '#2f7d57');
         type(inputs[1], '?'); inputs = fields(render(props));
@@ -175,6 +193,25 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.ok(fields(render(next)).every(input => input.props.value === ''));
         inputs = fields(render(props));
         assert.equal(inputs[0].props.value, 'Hello'); assert.equal(inputs[1].props.style.color, '#dc2626');
+    });
+    test('mixed letter colors stay hints until the whole blank is correct, and IME retains native text: ' + file, () => {
+        const render = setup(); const props = { ...base(), text: 'Afternoon', subtitle: { text: 'Afternoon' } };
+        let input = fields(render(props))[0];
+        type(input, 'aftex'); let nodes = render(props); input = fields(nodes)[0];
+        assert.equal(input.props.value, 'aftex'); assert.equal(input.props['data-subtitle-part-complete'], false);
+        assert.equal(input.props.style.caretColor, '#6b4c9a');
+        const overlay = nodes.find(node => node.props?.['data-subtitle-letter-overlay'] !== undefined);
+        assert.ok(overlay); assert.equal(String(overlay.props['aria-hidden']), 'true');
+        const colored = flatten(overlay).filter(node => node.type === 'span' && typeof node.props.children === 'string');
+        assert.deepEqual(colored.map(node => [node.props.children, node.props.style.color]), [['afte', '#2f7d57'], ['x', '#6b4c9a']]);
+        assert.equal(nodes.some(node => node.props?.role === 'status'), false);
+        input.props.onCompositionStart({ currentTarget: { value: 'aftex' } }); nodes = render(props); input = fields(nodes)[0];
+        assert.equal(input.props.style.color, '#6b4c9a');
+        assert.equal(nodes.some(node => node.props?.['data-subtitle-letter-overlay'] !== undefined), false);
+        input.props.onCompositionEnd({ currentTarget: { value: 'afternoon' } }); nodes = render(props); input = fields(nodes)[0];
+        assert.equal(input.props.value, 'Afternoon'); assert.equal(input.props.style.color, '#2f7d57');
+        assert.ok(nodes.some(node => node.props?.role === 'status'));
+        assert.equal(nodes.some(node => node.props?.['data-subtitle-letter-overlay'] !== undefined), false);
     });
     test('each correct blank becomes green before the whole contraction is finished: ' + file, () => {
         const render = setup(), props = base();

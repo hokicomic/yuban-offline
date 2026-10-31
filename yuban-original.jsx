@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.230 · mobile-subtitle-focus";
+const APP_VERSION = "v5.231 · subtitle-letter-hints";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7335,13 +7335,48 @@ const tokenizeSubtitlePractice = (text, language = 'en') => {
     });
 };
 const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
+// Return one longest contiguous match (leftmost on ties). Display fragments
+// never change the answer value, correctness, completion or focus decisions.
+const getSubtitlePracticeLetterHints = (expected, typed) => {
+    const graphemes = value => {
+        const text = String(value || '');
+        try { return Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text), item => item.segment); }
+        catch (_) { return text.match(/\P{M}\p{M}*|\p{M}+/gu) || []; }
+    };
+    const target = graphemes(expected).map(char => char.normalize('NFC').toLowerCase());
+    const entered = graphemes(typed);
+    let previous = new Uint32Array(target.length + 1);
+    let longest = 0, matchEnd = 0;
+    entered.forEach((char, i) => {
+        const current = new Uint32Array(target.length + 1);
+        const folded = char.normalize('NFC').toLowerCase();
+        target.forEach((letter, j) => {
+            if (folded !== letter) return;
+            current[j + 1] = previous[j] + 1;
+            if (current[j + 1] > longest) { longest = current[j + 1]; matchEnd = i + 1; }
+        });
+        previous = current;
+    });
+    const runs = [];
+    entered.forEach((char, i) => {
+        const matched = longest > 0 && i >= matchEnd - longest && i < matchEnd;
+        if (runs.length && runs[runs.length - 1].matched === matched) runs[runs.length - 1].text += char;
+        else runs.push({ text: char, matched });
+    });
+    return runs;
+};
+const syncSubtitlePracticeLetterOverlay = (field) => {
+    const overlay = field.parentElement?.querySelector('[data-subtitle-letter-overlay]');
+    if (overlay) overlay.scrollLeft = field.scrollLeft;
+};
+
 const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composing = false) => {
     if (previous?.revealed) return previous;
     const values = [...(previous?.values || [])];
     const target = word.parts.find(part => part.kind === 'letters' && part.index === partIndex);
     values[partIndex] = !composing && target && isSubtitlePracticePartCorrect(target.text, value) ? target.text : value;
     const revealed = !composing && value.includes('?');
-    return { values: revealed ? word.parts.filter(part => part.kind === 'letters').map(part => part.text) : values, revealed };
+    return { values: revealed ? word.parts.filter(part => part.kind === 'letters').map(part => part.text) : values, revealed, composing: Boolean(composing) };
 };
 const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && word.parts
     .filter(part => part.kind === 'letters')
@@ -7435,6 +7470,7 @@ const isSubtitlePracticeTextHit = (event) => {
 const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
+    const composingBlankRef = useRef(null);
     const [, refreshAnswers] = useState(0);
     const editorRef = useRef(null);
     const containerRef = useRef(null);
@@ -7443,6 +7479,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source ? cached.answers : {};
     const progress = getSubtitlePracticeProgress(tokens, answers);
+    React.useLayoutEffect(() => { composingBlankRef.current = null; }, [subtitle, source]);
     React.useLayoutEffect(() => {
         if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
     }, [subtitle, source, blankMode, autoFocusEnabled]);
@@ -7461,6 +7498,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     }, [subtitle, text, blankMode, editsRef]);
     const update = (word, part, value, composing) => {
         if (!subtitle) return;
+        composing = Boolean(composing || composingBlankRef.current === `${word.index}:${part.index}`);
         const latest = answerCache.current.get(subtitle);
         const previous = latest?.text === source ? latest.answers : {};
         const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
@@ -7492,6 +7530,53 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
         findSubtitlePracticeBlank(fields)?.focus();
     };
+    React.useLayoutEffect(() => {
+        for (const field of Array.from(containerRef.current?.querySelectorAll('input') || [])) syncSubtitlePracticeLetterOverlay(field);
+    });
+    const renderBlank = (token, part, key) => {
+        const answer = answers[token.index];
+        const value = answer?.values?.[part.index] || '';
+        const correct = isSubtitlePracticePartCorrect(part.text, value);
+        const color = answer?.revealed ? '#dc2626' : correct ? '#2f7d57' : '#6b4c9a';
+        const runs = !answer?.revealed && !correct && !answer?.composing ? getSubtitlePracticeLetterHints(part.text, value) : [];
+        const hasHints = runs.some(run => run.matched);
+        return (
+            <span key={key} className="relative inline-block align-baseline max-w-full">
+                <input type="text" value={value}
+                    readOnly={Boolean(answers[token.index]?.revealed)}
+                    data-subtitle-blank={`${token.index}:${part.index}`}
+                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index])}
+                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
+                    aria-description={hasHints ? '綠色字母與答案相符，整字正確後才跳格' : undefined}
+                    autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
+                    onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
+                    onCompositionStart={event => {
+                        composingBlankRef.current = `${token.index}:${part.index}`;
+                        update(token, part, event.currentTarget.value, true);
+                    }}
+                    onCompositionEnd={event => {
+                        composingBlankRef.current = null;
+                        update(token, part, event.currentTarget.value, false);
+                    }}
+                    onScroll={event => syncSubtitlePracticeLetterOverlay(event.currentTarget)}
+                    onKeyDown={nextBlank}
+                    className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
+                    style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
+                        maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit', fontFamily: 'inherit', fontWeight: 'inherit',
+                        color: hasHints ? 'transparent' : color, WebkitTextFillColor: hasHints ? 'transparent' : color, caretColor: '#6b4c9a' }}
+                />
+                {hasHints && (
+                    <span aria-hidden="true" data-subtitle-letter-overlay
+                        className="absolute inset-0 overflow-hidden pointer-events-none select-none"
+                        style={{ padding: '0.05em 0', borderBottom: '2px solid transparent', whiteSpace: 'nowrap' }}>
+                        <span style={{ display: 'inline-block', width: 'max-content', minWidth: '100%', textAlign: 'center', verticalAlign: 'top' }}>
+                            {runs.map((run, index) => <span key={index} style={{ color: run.matched ? '#2f7d57' : '#6b4c9a' }}>{run.text}</span>)}
+                        </span>
+                    </span>
+                )}
+            </span>
+        );
+    };
     return (
         <div ref={textRef} aria-label="字幕文字" className="w-full font-bold text-gray-900 leading-snug whitespace-pre-wrap"
             style={{ fontSize: `${blankMode ? Math.max(16, fontSize) : fontSize}px` }}>
@@ -7499,22 +7584,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 <div ref={containerRef}>
                     {tokens.map((token, index) => token.kind === 'literal' ? <span key={index}>{token.text}</span> : (
                         <span key={index} className="inline-block whitespace-nowrap align-baseline max-w-full">
-                            {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : (
-                                <input key={partIndex} type="text" value={answers[token.index]?.values?.[part.index] || ''}
-                                    readOnly={Boolean(answers[token.index]?.revealed)}
-                                    data-subtitle-blank={`${token.index}:${part.index}`}
-                                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index])}
-                                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
-                                    autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
-                                    onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
-                                    onCompositionEnd={event => update(token, part, event.currentTarget.value, false)}
-                                    onKeyDown={nextBlank}
-                                    className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
-                                    style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
-                                        maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit', fontFamily: 'inherit', fontWeight: 'inherit',
-                                        color: answers[token.index]?.revealed ? '#dc2626' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '#2f7d57' : '#6b4c9a' }}
-                                />
-                            ))}
+                            {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : renderBlank(token, part, partIndex))}
                         </span>
                     ))}
                 </div>
