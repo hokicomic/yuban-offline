@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.231 · subtitle-letter-hints";
+const APP_VERSION = "v5.232 · subtitle-letter-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7335,39 +7335,53 @@ const tokenizeSubtitlePractice = (text, language = 'en') => {
     });
 };
 const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
-// Return one longest contiguous match (leftmost on ties). Display fragments
-// never change the answer value, correctness, completion or focus decisions.
-const getSubtitlePracticeLetterHints = (expected, typed) => {
-    const graphemes = value => {
-        const text = String(value || '');
-        try { return Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text), item => item.segment); }
-        catch (_) { return text.match(/\P{M}\p{M}*|\p{M}+/gu) || []; }
-    };
-    const target = graphemes(expected).map(char => char.normalize('NFC').toLowerCase());
-    const entered = graphemes(typed);
-    let previous = new Uint32Array(target.length + 1);
-    let longest = 0, matchEnd = 0;
-    entered.forEach((char, i) => {
-        const current = new Uint32Array(target.length + 1);
-        const folded = char.normalize('NFC').toLowerCase();
-        target.forEach((letter, j) => {
-            if (folded !== letter) return;
-            current[j + 1] = previous[j] + 1;
-            if (current[j + 1] > longest) { longest = current[j + 1]; matchEnd = i + 1; }
-        });
-        previous = current;
-    });
-    const runs = [];
-    entered.forEach((char, i) => {
-        const matched = longest > 0 && i >= matchEnd - longest && i < matchEnd;
-        if (runs.length && runs[runs.length - 1].matched === matched) runs[runs.length - 1].text += char;
-        else runs.push({ text: char, matched });
-    });
-    return runs;
+const splitSubtitlePracticeGraphemes = value => {
+    const text = String(value || '');
+    try { return Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text), item => item.segment); }
+    catch (_) { return text.match(/\P{M}\p{M}*|\p{M}+/gu) || []; }
 };
+// Align an ordered subsequence, without reusing repeated letters or changing
+// the draft. On ties keep the earliest available answer position.
+const getSubtitlePracticeLetterAlignment = (expected, typed) => {
+    const target = splitSubtitlePracticeGraphemes(expected);
+    const entered = splitSubtitlePracticeGraphemes(typed);
+    const fold = char => char.normalize('NFC').toLowerCase();
+    const answer = target.map(fold), draft = entered.map(fold);
+    const lengths = Array.from({ length: answer.length + 1 }, () => new Uint32Array(draft.length + 1));
+    for (let i = answer.length - 1; i >= 0; i--) {
+        for (let j = draft.length - 1; j >= 0; j--) {
+            lengths[i][j] = answer[i] === draft[j] ? 1 + lengths[i + 1][j + 1] : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
+        }
+    }
+    const positions = new Map(), matched = new Set();
+    let i = 0, j = 0;
+    while (i < answer.length && j < draft.length) {
+        if (answer[i] === draft[j]) { positions.set(i, j); matched.add(j); i++; j++; }
+        else if (lengths[i + 1][j] > lengths[i][j + 1]) i++;
+        else j++;
+    }
+    const runs = [];
+    entered.forEach((char, index) => {
+        const hit = matched.has(index);
+        if (runs.length && runs[runs.length - 1].matched === hit) runs[runs.length - 1].text += char;
+        else runs.push({ text: char, matched: hit });
+    });
+    return { runs, slots: target.map((text, index) => ({ text, matched: positions.has(index) })), matchedCount: positions.size };
+};
+const getSubtitlePracticeLetterHints = (expected, typed) => getSubtitlePracticeLetterAlignment(expected, typed).runs;
 const syncSubtitlePracticeLetterOverlay = (field) => {
     const overlay = field.parentElement?.querySelector('[data-subtitle-letter-overlay]');
     if (overlay) overlay.scrollLeft = field.scrollLeft;
+};
+const copySubtitlePracticeField = async field => {
+    field.focus({ preventScroll: true });
+    field.select();
+    const doc = field.ownerDocument;
+    try {
+        const clipboard = doc.defaultView?.navigator?.clipboard;
+        if (typeof clipboard?.writeText === 'function') { await clipboard.writeText(field.value); return true; }
+    } catch (_) { /* Keep the selection and try the browser's copy fallback. */ }
+    try { return Boolean(doc.execCommand?.('copy')); } catch (_) { return false; }
 };
 
 const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composing = false) => {
@@ -7471,6 +7485,9 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
+    const lastBlankTapRef = useRef(null);
+    const handledTouchDoubleRef = useRef(null);
+    const [copyNotice, setCopyNotice] = useState(null);
     const [, refreshAnswers] = useState(0);
     const editorRef = useRef(null);
     const containerRef = useRef(null);
@@ -7479,7 +7496,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source ? cached.answers : {};
     const progress = getSubtitlePracticeProgress(tokens, answers);
-    React.useLayoutEffect(() => { composingBlankRef.current = null; }, [subtitle, source]);
+    React.useLayoutEffect(() => { composingBlankRef.current = null; lastBlankTapRef.current = null; handledTouchDoubleRef.current = null; }, [subtitle, source]);
     React.useLayoutEffect(() => {
         if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
     }, [subtitle, source, blankMode, autoFocusEnabled]);
@@ -7498,6 +7515,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     }, [subtitle, text, blankMode, editsRef]);
     const update = (word, part, value, composing) => {
         if (!subtitle) return;
+        setCopyNotice(null);
         composing = Boolean(composing || composingBlankRef.current === `${word.index}:${part.index}`);
         const latest = answerCache.current.get(subtitle);
         const previous = latest?.text === source ? latest.answers : {};
@@ -7518,7 +7536,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         context.font = doc.defaultView.getComputedStyle(fields[0]).font;
         const parts = tokens.filter(token => token.kind === 'word').flatMap(word => word.parts.filter(part => part.kind === 'letters'));
         fields.forEach((field, index) => {
-            field.style.width = `${Math.ceil(Math.max(context.measureText('00').width, context.measureText(parts[index].text).width) + 8)}px`;
+            field.style.width = `${Math.ceil(Math.max(context.measureText('00').width, context.measureText(parts[index].text).width, context.measureText('0').width * splitSubtitlePracticeGraphemes(parts[index].text).length * 0.75 * 1.12) + 8)}px`;
         });
     }, [tokens, fontSize, blankMode]);
     const nextBlank = event => {
@@ -7533,21 +7551,46 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     React.useLayoutEffect(() => {
         for (const field of Array.from(containerRef.current?.querySelectorAll('input') || [])) syncSubtitlePracticeLetterOverlay(field);
     });
+    const doubleBlankAction = async (event, token, part) => {
+        event.preventDefault(); event.stopPropagation();
+        if (composingBlankRef.current) return;
+        const field = event.currentTarget;
+        if (!field.value) update(token, part, '?', false);
+        else if (!isSubtitlePracticePartCorrect(part.text, field.value)) update(token, part, '', false);
+        else {
+            const copied = await copySubtitlePracticeField(field);
+            setCopyNotice({ subtitle, message: copied ? '已複製' : '未能複製，已選取文字，可手動複製' });
+        }
+    };
+    const touchBlankTap = (event, token, part) => {
+        if (!['touch', 'pen'].includes(event.pointerType)) return;
+        const now = Date.now(), key = `${token.index}:${part.index}`;
+        const last = lastBlankTapRef.current;
+        if (last?.key === key && now - last.at <= 350 && Math.hypot(event.clientX - last.x, event.clientY - last.y) <= 20) {
+            lastBlankTapRef.current = null;
+            handledTouchDoubleRef.current = { key, at: now };
+            return doubleBlankAction(event, token, part);
+        }
+        lastBlankTapRef.current = { key, at: now, x: event.clientX, y: event.clientY };
+    };
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
         const value = answer?.values?.[part.index] || '';
         const correct = isSubtitlePracticePartCorrect(part.text, value);
         const color = answer?.revealed ? '#dc2626' : correct ? '#2f7d57' : '#6b4c9a';
-        const runs = !answer?.revealed && !correct && !answer?.composing ? getSubtitlePracticeLetterHints(part.text, value) : [];
+        const showGuide = Boolean(value) && !answer?.revealed && !correct && !answer?.composing;
+        const alignment = showGuide ? getSubtitlePracticeLetterAlignment(part.text, value) : null;
+        const runs = alignment?.runs || [];
+        const guide = alignment?.slots.map(slot => slot.matched ? slot.text : '_').join(' ') || '';
         const hasHints = runs.some(run => run.matched);
         return (
-            <span key={key} className="relative inline-block align-baseline max-w-full">
+            <span key={key} className="relative inline-block align-baseline max-w-full" style={{ paddingBottom: showGuide ? '0.95em' : undefined }}>
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
                     data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index])}
                     aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
-                    aria-description={hasHints ? '綠色字母與答案相符，整字正確後才跳格' : undefined}
+                    aria-description={showGuide ? `字母位置提示：${guide}。底線代表尚未答出的字母。` : '雙擊：空白顯示答案，未答對清空，答對選取並複製'}
                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
                     onCompositionStart={event => {
@@ -7559,6 +7602,13 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                         update(token, part, event.currentTarget.value, false);
                     }}
                     onScroll={event => syncSubtitlePracticeLetterOverlay(event.currentTarget)}
+                    onDoubleClick={event => {
+                        const handled = handledTouchDoubleRef.current;
+                        if (handled?.key === `${token.index}:${part.index}` && Date.now() - handled.at < 600) { event.preventDefault(); return; }
+                        return doubleBlankAction(event, token, part);
+                    }}
+                    onPointerUp={event => touchBlankTap(event, token, part)}
+                    onPointerCancel={() => { lastBlankTapRef.current = null; }}
                     onKeyDown={nextBlank}
                     className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
                     style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
@@ -7572,6 +7622,15 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                         <span style={{ display: 'inline-block', width: 'max-content', minWidth: '100%', textAlign: 'center', verticalAlign: 'top' }}>
                             {runs.map((run, index) => <span key={index} style={{ color: run.matched ? '#2f7d57' : '#6b4c9a' }}>{run.text}</span>)}
                         </span>
+                    </span>
+                )}
+                {showGuide && (
+                    <span role="note" aria-label={`字母位置提示：${guide}`} data-subtitle-letter-guide
+                        className="absolute bottom-0 left-0 right-0 text-center whitespace-nowrap overflow-x-auto"
+                        style={{ fontSize: '0.75em', lineHeight: '1.1', height: '1.2em' }}>
+                        {alignment.slots.map((slot, index) => <span key={index} aria-hidden="true"
+                            data-subtitle-letter-slot={index} data-subtitle-letter-matched={slot.matched}
+                            style={{ display: 'inline-block', width: '1ch', marginInline: '0.06ch', textAlign: 'center', color: slot.matched ? '#2f7d57' : '#64748b' }}>{slot.matched ? slot.text : '_'}</span>)}
                     </span>
                 )}
             </span>
@@ -7595,6 +7654,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     className="w-fit max-w-full mx-auto select-text cursor-text outline-none"
                 />
             )}
+            {copyNotice && copyNotice.subtitle === subtitle && <span role="status" aria-live="polite" className="block mt-1 text-xs text-blue-700">{copyNotice.message}</span>}
             {subtitle && progress.done && (
                 <span role="status" aria-live="polite" className="inline-flex items-center gap-1 mt-2 px-2 py-0.5 rounded-full text-xs font-semibold"
                     style={{ color: '#2f7d57', backgroundColor: '#edf5f0' }}>

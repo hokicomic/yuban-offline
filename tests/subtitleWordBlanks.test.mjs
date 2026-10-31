@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay})');
+    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -27,17 +27,39 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const fallback = vm.runInNewContext(code + '\ntokenizeSubtitlePractice', { Intl: {} });
         assert.equal(join(fallback("Don't stop!\n再見。")), "Don't stop!\n再見。");
     });
-    test('letter hints find the longest contiguous fragment without changing what was typed: ' + file, () => {
+    test('letter hints align noncontiguous ordered letters without changing what was typed: ' + file, () => {
         const runs = (answer, typed) => Array.from(api.getSubtitlePracticeLetterHints(answer, typed), run => ({ text: run.text, matched: run.matched }));
         assert.deepEqual(runs('afternoon', 'aftex'), [{ text: 'afte', matched: true }, { text: 'x', matched: false }]);
         assert.deepEqual(runs('afternoon', 'xternooy'), [{ text: 'x', matched: false }, { text: 'ternoo', matched: true }, { text: 'y', matched: false }]);
         assert.deepEqual(runs('attending', 'tten'), [{ text: 'tten', matched: true }]);
         assert.deepEqual(runs('abc', 'xyz'), [{ text: 'xyz', matched: false }]);
-        assert.deepEqual(runs('banana', 'anaxban'), [{ text: 'ana', matched: true }, { text: 'xban', matched: false }], 'leftmost wins equal-length ties');
+        assert.deepEqual(runs('banana', 'anaxban'), [{ text: 'ana', matched: true }, { text: 'xba', matched: false }, { text: 'n', matched: true }], 'repeated letters map once in answer order');
         assert.deepEqual(runs('CAFÉ', 'xCafe\u0301y'), [{ text: 'x', matched: false }, { text: 'Cafe\u0301', matched: true }, { text: 'y', matched: false }]);
         assert.deepEqual(runs('word', ''), []);
         const fallback = vm.runInNewContext(code + '\ngetSubtitlePracticeLetterHints', { Intl: {} });
         assert.equal(fallback('CAFÉ', 'cafe\u0301')[0].matched, true);
+    });
+    test('answer-position slots show every missing letter and do not reuse repeated characters: ' + file, () => {
+        const pattern = alignment => Array.from(alignment.slots, slot => slot.matched ? slot.text : '_').join('');
+        assert.equal(pattern(api.getSubtitlePracticeLetterAlignment('afternoon', 'ftn')), '_ft__n___');
+        assert.equal(pattern(api.getSubtitlePracticeLetterAlignment('afternoon', 'aon')), 'a_____o_n');
+        const repeated = api.getSubtitlePracticeLetterAlignment('noon', 'oooo');
+        assert.equal(pattern(repeated), '_oo_'); assert.equal(repeated.matchedCount, 2);
+        assert.equal(pattern(api.getSubtitlePracticeLetterAlignment('word', 'xyz')), '____');
+        assert.equal(pattern(api.getSubtitlePracticeLetterAlignment('CAFÉ', 'cFe\u0301')), 'C_FÉ');
+    });
+    test('copy selects the field and supports Clipboard API, fallback and explicit failure: ' + file, async () => {
+        const writes = []; let selections = 0, fallbacks = 0;
+        const field = { value: 'Good', focus() {}, select() { selections++; }, ownerDocument: {
+            defaultView: { navigator: { clipboard: { writeText: async value => writes.push(value) } } },
+            execCommand: name => { assert.equal(name, 'copy'); fallbacks++; return true; }
+        } };
+        assert.equal(await api.copySubtitlePracticeField(field), true);
+        assert.deepEqual(writes, ['Good']); assert.equal(selections, 1); assert.equal(fallbacks, 0);
+        field.ownerDocument.defaultView.navigator.clipboard.writeText = async () => { throw Error('denied'); };
+        assert.equal(await api.copySubtitlePracticeField(field), true); assert.equal(fallbacks, 1);
+        field.ownerDocument.execCommand = () => false;
+        assert.equal(await api.copySubtitlePracticeField(field), false);
     });
     test('letter overlays follow the native input horizontal scroll: ' + file, () => {
         const overlay = { scrollLeft: 0 };
@@ -212,6 +234,46 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(input.props.value, 'Afternoon'); assert.equal(input.props.style.color, '#2f7d57');
         assert.ok(nodes.some(node => node.props?.role === 'status'));
         assert.equal(nodes.some(node => node.props?.['data-subtitle-letter-overlay'] !== undefined), false);
+    });
+    test('double-click reveals empty fields, clears incorrect drafts and selects/copies correct or revealed text: ' + file, async () => {
+        const render = setup(), props = base(), copied = [];
+        const event = value => ({ preventDefault() {}, stopPropagation() {}, currentTarget: { value,
+            focus() {}, select() { this.selectionStart = 0; this.selectionEnd = value.length; },
+            ownerDocument: { defaultView: { navigator: { clipboard: { writeText: async text => copied.push(text) } } } } } });
+        let input = fields(render(props))[0];
+        await input.props.onDoubleClick(event('')); let inputs = fields(render(props));
+        assert.equal(inputs[0].props.value, 'Hello'); assert.equal(inputs[0].props.style.color, '#dc2626');
+        await inputs[0].props.onDoubleClick(event('Hello'));
+        assert.deepEqual(copied, ['Hello']);
+        assert.ok(render(props).some(node => node.props?.role === 'status' && node.props.children === '已複製'));
+        inputs = fields(render(props)); type(inputs[1], 'wrong'); inputs = fields(render(props));
+        await inputs[1].props.onDoubleClick(event('wrong')); inputs = fields(render(props));
+        assert.equal(inputs[1].props.value, '');
+        type(inputs[3], 'stop'); inputs = fields(render(props));
+        const copyEvent = event('stop'); await inputs[3].props.onDoubleClick(copyEvent);
+        assert.equal(copyEvent.currentTarget.selectionStart, 0); assert.equal(copyEvent.currentTarget.selectionEnd, 4);
+        assert.deepEqual(copied, ['Hello', 'stop']);
+    });
+    test('touch double-tap reveals once and ignores the following synthesized double-click: ' + file, async () => {
+        const render = setup(), props = base(); let copied = 0;
+        const field = { value: '', focus() {}, select() {}, ownerDocument: { defaultView: { navigator: { clipboard: { writeText: async () => copied++ } } } } };
+        const event = () => ({ pointerType: 'touch', clientX: 10, clientY: 10, currentTarget: field, preventDefault() {}, stopPropagation() {} });
+        let input = fields(render(props))[0];
+        await input.props.onPointerUp(event()); await input.props.onPointerUp(event());
+        input = fields(render(props))[0]; assert.equal(input.props.value, 'Hello');
+        field.value = 'Hello'; await input.props.onDoubleClick(event()); render(props);
+        assert.equal(copied, 0, 'synthetic double-click must not copy the just-revealed answer');
+    });
+    test('position guide preserves editable draft while showing missing slots, and loading has no copy notice: ' + file, () => {
+        const render = setup();
+        assert.equal(fields(render({ ...base(), subtitle: undefined, text: 'Load File...' })).length, 0);
+        const props = { ...base(), text: 'afternoon', subtitle: { text: 'afternoon' } };
+        let input = fields(render(props))[0]; type(input, 'ftn');
+        const nodes = render(props); input = fields(nodes)[0]; assert.equal(input.props.value, 'ftn');
+        const note = nodes.find(node => node.props?.['data-subtitle-letter-guide'] !== undefined);
+        assert.match(note.props['aria-label'], /_ f t _ _ n _ _ _/);
+        assert.equal(nodes.some(node => node.props?.role === 'status'), false);
+        assert.equal(input.props['data-subtitle-part-complete'], false);
     });
     test('each correct blank becomes green before the whole contraction is finished: ' + file, () => {
         const render = setup(), props = base();
