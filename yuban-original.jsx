@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.229 · subtitle-annotations-and-case";
+const APP_VERSION = "v5.230 · mobile-subtitle-focus";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7353,44 +7353,48 @@ const getSubtitlePracticeProgress = (tokens, answers) => {
     const hints = words.filter(word => answers[word.index]?.revealed).length;
     return { total: words.length, completed, hints, done: words.length > 0 && completed === words.length };
 };
-const canAutoFocusSubtitlePractice = (environment) => {
-    const nav = environment?.navigator;
-    if (!nav || nav.userAgentData?.mobile || /Android|iPhone|iPad|iPod|Mobile/i.test(nav.userAgent || '')) return false;
-    // iPadOS can identify itself as a desktop Mac, even with a mouse attached.
-    if (/Mac/i.test(nav.platform || nav.userAgent || '') && Number(nav.maxTouchPoints) > 1) return false;
-    return !environment.matchMedia?.('(pointer: coarse)').matches;
-};
-const findSubtitlePracticeBlank = (fields) => {
-    const pending = Array.from(fields).filter(field => !field.disabled && !field.readOnly && field.dataset.subtitlePartComplete !== 'true');
+const findSubtitlePracticeBlank = (fields, afterField = null) => {
+    const all = Array.from(fields);
+    const index = afterField ? all.indexOf(afterField) : -1;
+    const ordered = index < 0 ? all : [...all.slice(index + 1), ...all.slice(0, index + 1)];
+    const pending = ordered.filter(field => !field.disabled && !field.readOnly && field.dataset.subtitlePartComplete !== 'true');
     return pending.find(field => !field.value) || pending[0] || null;
 };
-const focusSubtitlePracticeBlank = (container) => {
+const focusSubtitlePracticeBlank = (container, afterField = null) => {
     const doc = container?.ownerDocument;
-    if (!doc || !canAutoFocusSubtitlePractice(doc.defaultView) || doc.visibilityState === 'hidden') return;
+    if (!doc?.defaultView || doc.visibilityState === 'hidden') return;
     const active = doc.activeElement;
     // Playback buttons may yield focus, while settings, editors and dialogs keep it.
     if (active && !container.contains(active) && (active.isContentEditable ||
         active.closest?.('input, textarea, select, [role="dialog"], [aria-modal="true"]'))) return;
     if (doc.getSelection?.()?.toString()) return;
-    const field = findSubtitlePracticeBlank(container.querySelectorAll('input'));
+    const field = findSubtitlePracticeBlank(container.querySelectorAll('input'), afterField);
     if (field) {
         if (field !== active) field.focus({ preventScroll: true });
-    } else if (container.contains(active)) active?.blur();
+    }
+    // When the sentence is complete, keep the existing input focus so the
+    // mobile keyboard need not close before the next sentence arrives.
 };
 const installSubtitlePracticeFocus = (container) => {
     const doc = container?.ownerDocument;
     const win = doc?.defaultView;
-    if (!canAutoFocusSubtitlePractice(win)) return () => {};
+    if (!win) return () => {};
     let frame;
     const schedule = () => {
         win.cancelAnimationFrame(frame);
         frame = win.requestAnimationFrame(() => focusSubtitlePracticeBlank(container));
     };
     const afterPlaybackControl = event => {
-        if (event.target?.closest?.('button')?.closest('[data-subtitle-focus-restore]')) schedule();
+        if (event.target?.closest?.('button')?.closest('[data-subtitle-focus-restore]')) {
+            // Focus during the tap as well as after the control finishes updating.
+            // This keeps the mobile keyboard available within the user gesture.
+            focusSubtitlePracticeBlank(container);
+            schedule();
+        }
     };
     doc.addEventListener('click', afterPlaybackControl, true);
     win.addEventListener('focus', schedule);
+    focusSubtitlePracticeBlank(container);
     schedule();
     return () => {
         win.cancelAnimationFrame(frame);
@@ -7430,7 +7434,7 @@ const isSubtitlePracticeTextHit = (event) => {
 
 const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true }) => {
     const answerCache = useRef(new WeakMap());
-    const advanceFocusRef = useRef(false);
+    const advanceFocusRef = useRef(null);
     const [, refreshAnswers] = useState(0);
     const editorRef = useRef(null);
     const containerRef = useRef(null);
@@ -7439,13 +7443,18 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source ? cached.answers : {};
     const progress = getSubtitlePracticeProgress(tokens, answers);
-    useEffect(() => {
+    React.useLayoutEffect(() => {
         if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
     }, [subtitle, source, blankMode, autoFocusEnabled]);
     React.useLayoutEffect(() => {
         if (!advanceFocusRef.current) return;
-        advanceFocusRef.current = false;
-        if (blankMode && autoFocusEnabled) focusSubtitlePracticeBlank(containerRef.current);
+        const answered = advanceFocusRef.current;
+        advanceFocusRef.current = null;
+        if (blankMode && autoFocusEnabled) {
+            const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
+            const field = fields.find(input => input.dataset.subtitleBlank === answered);
+            focusSubtitlePracticeBlank(containerRef.current, field);
+        }
     });
     React.useLayoutEffect(() => {
         if ((!blankMode || !subtitle) && editorRef.current) editorRef.current.textContent = source;
@@ -7456,7 +7465,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const previous = latest?.text === source ? latest.answers : {};
         const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
         answerCache.current.set(subtitle, { text: source, answers: next });
-        advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticeAnswerCorrect(word, next[word.index]));
+        advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticePartCorrect(part.text, next[word.index].values[part.index])) ? `${word.index}:${part.index}` : null;
         refreshAnswers(revision => revision + 1);
     };
     React.useLayoutEffect(() => {
@@ -7477,7 +7486,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const nextBlank = event => {
         if (event.nativeEvent?.isComposing || !['Enter', ' '].includes(event.key)) return;
         event.preventDefault();
-        // A desktop correct answer already advanced focus; a following space
+        // A correct answer already advanced focus; a following space
         // must not skip the newly focused empty word.
         if (!event.currentTarget.value) return;
         const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
@@ -7493,8 +7502,9 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : (
                                 <input key={partIndex} type="text" value={answers[token.index]?.values?.[part.index] || ''}
                                     readOnly={Boolean(answers[token.index]?.revealed)}
+                                    data-subtitle-blank={`${token.index}:${part.index}`}
                                     data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index])}
-                                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '正確' : '填空'}`}
+                                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
                                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
                                     onCompositionEnd={event => update(token, part, event.currentTarget.value, false)}
@@ -7502,7 +7512,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                                     className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
                                     style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
                                         maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit', fontFamily: 'inherit', fontWeight: 'inherit',
-                                        color: answers[token.index]?.revealed ? '#dc2626' : isSubtitlePracticeAnswerCorrect(token, answers[token.index]) ? '#2f7d57' : '#6b4c9a' }}
+                                        color: answers[token.index]?.revealed ? '#dc2626' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '#2f7d57' : '#6b4c9a' }}
                                 />
                             ))}
                         </span>

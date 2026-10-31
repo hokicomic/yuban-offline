@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, canAutoFocusSubtitlePractice, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus})');
+    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -79,16 +79,6 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(progress.done, true); assert.equal(progress.hints, 1); assert.equal(progress.completed, 2);
         assert.equal(api.getSubtitlePracticeProgress(tokens('?!'), {}).done, false);
     });
-    test('desktop autofocus excludes mobile, coarse pointers and iPadOS desktop identity: ' + file, () => {
-        const env = (userAgent, platform, maxTouchPoints = 0, coarse = false) => ({ navigator: { userAgent, platform, maxTouchPoints }, matchMedia: () => ({ matches: coarse }) });
-        assert.equal(api.canAutoFocusSubtitlePractice(env('Chrome', 'MacIntel')), true);
-        assert.equal(api.canAutoFocusSubtitlePractice(env('Chrome', 'Win32', 2)), true);
-        assert.equal(api.canAutoFocusSubtitlePractice(env('iPhone Safari', 'iPhone', 5)), false);
-        assert.equal(api.canAutoFocusSubtitlePractice(env('Android Chrome', 'Linux', 5)), false);
-        assert.equal(api.canAutoFocusSubtitlePractice(env('Macintosh Safari', 'MacIntel', 5)), false);
-        assert.equal(api.canAutoFocusSubtitlePractice(env('Chrome', 'Linux', 5, true)), false);
-        assert.equal(api.canAutoFocusSubtitlePractice({ navigator: { userAgentData: { mobile: true } } }), false);
-    });
     test('focus returns after replay, prefers the first empty word, and respects other editors: ' + file, () => {
         const frames = new Map(), listeners = new Map(), winListeners = new Map(); let id = 0;
         const win = { navigator: { userAgent: 'Chrome', platform: 'MacIntel', maxTouchPoints: 0 }, matchMedia: () => ({ matches: false }),
@@ -111,11 +101,30 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(doc.activeElement, otherEditor, 'settings inputs keep their focus');
         fields[3].value = 'filled'; fields[4].value = 'filled';
         assert.equal(api.findSubtitlePracticeBlank(fields), fields[1], 'when none are empty, return to the earliest unresolved word');
-        doc.activeElement = button; listeners.get('click')({ target: replay }); cleanup(); flush();
+        assert.equal(api.findSubtitlePracticeBlank(fields, fields[3]), fields[4], 'correct answers advance after the current blank before wrapping');
+        doc.activeElement = button; listeners.get('click')({ target: replay });
+        assert.equal(doc.activeElement, fields[1], 'focus is restored synchronously inside the playback gesture');
+        doc.activeElement = button; cleanup(); flush();
         assert.equal(doc.activeElement, button); assert.equal(listeners.size, 0); assert.equal(winListeners.size, 0);
-        win.navigator.maxTouchPoints = 5;
-        api.installSubtitlePracticeFocus(container);
-        assert.equal(frames.size, 0); assert.equal(listeners.size, 0, 'iPad installs no focus-restoring listeners');
+        for (const nav of [
+            { userAgent: 'iPhone Safari', platform: 'iPhone', maxTouchPoints: 5 },
+            { userAgent: 'Macintosh Safari', platform: 'MacIntel', maxTouchPoints: 5 },
+            { userAgent: 'Android Chrome', platform: 'Linux', maxTouchPoints: 5, userAgentData: { mobile: true } }
+        ]) {
+            win.navigator = nav; win.matchMedia = () => ({ matches: true });
+            doc.activeElement = button;
+            const stop = api.installSubtitlePracticeFocus(container);
+            assert.equal(doc.activeElement, fields[1], nav.userAgent + ' focuses its first unresolved input immediately');
+            assert.equal(listeners.size, 1); flush();
+            doc.activeElement = button; listeners.get('click')({ target: replay });
+            assert.equal(doc.activeElement, fields[1], nav.userAgent + ' restores focus during the replay tap');
+            stop(); flush();
+            assert.equal(listeners.size, 0);
+        }
+        fields.forEach(field => { field.dataset.subtitlePartComplete = 'true'; });
+        doc.activeElement = fields[4];
+        api.focusSubtitlePracticeBlank(container);
+        assert.equal(doc.activeElement, fields[4], 'finishing a sentence does not dismiss the mobile keyboard');
     });
     test('mode switching accepts blank space but excludes inputs and actual text glyphs: ' + file, () => {
         const node = { nodeType: 3, length: 4, textContent: 'Text' };
@@ -166,6 +175,20 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.ok(fields(render(next)).every(input => input.props.value === ''));
         inputs = fields(render(props));
         assert.equal(inputs[0].props.value, 'Hello'); assert.equal(inputs[1].props.style.color, '#dc2626');
+    });
+    test('each correct blank becomes green before the whole contraction is finished: ' + file, () => {
+        const render = setup(), props = base();
+        let inputs = fields(render(props));
+        type(inputs[1], 'DON'); inputs = fields(render(props));
+        assert.equal(inputs[1].props.value, 'don');
+        assert.equal(inputs[1].props.style.color, '#2f7d57');
+        assert.match(inputs[1].props['aria-label'], /正確/);
+        assert.equal(inputs[2].props.style.color, '#6b4c9a');
+        assert.equal(inputs[2].props.value, '');
+        assert.equal(render(props).some(node => node.props?.role === 'status'), false);
+        type(inputs[2], 'T'); inputs = fields(render(props));
+        assert.equal(inputs[2].props.style.color, '#2f7d57');
+        assert.equal(inputs[2].props.value, 't');
     });
     test('completion badge remains visible with hinted words and both modes share their font: ' + file, () => {
         const render = setup(), props = base();
