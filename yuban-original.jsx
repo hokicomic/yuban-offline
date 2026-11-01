@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.232 · subtitle-letter-alignment";
+const APP_VERSION = "v5.233 · spacebar-playback";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7481,6 +7481,22 @@ const isSubtitlePracticeTextHit = (event) => {
     return false;
 };
 
+const createPlaybackSpaceHandler = getState => event => {
+    if (![' ', 'Spacebar'].includes(event.key) && event.code !== 'Space') return;
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
+        event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    const state = getState();
+    if (!state?.enabled) return;
+    const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
+    // Caption blanks use Space for listening. Other editors retain normal spaces.
+    if (editor && !editor.hasAttribute('data-subtitle-blank')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat) return;
+    if (state.echoMode) state.replayEcho();
+    else state.toggle();
+};
+
 const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
@@ -7540,10 +7556,9 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         });
     }, [tokens, fontSize, blankMode]);
     const nextBlank = event => {
-        if (event.nativeEvent?.isComposing || !['Enter', ' '].includes(event.key)) return;
+        if (event.nativeEvent?.isComposing || event.key !== 'Enter') return;
         event.preventDefault();
-        // A correct answer already advanced focus; a following space
-        // must not skip the newly focused empty word.
+        // Enter moves through blanks; Space is reserved for listening.
         if (!event.currentTarget.value) return;
         const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
         findSubtitlePracticeBlank(fields)?.focus();
@@ -10388,6 +10403,22 @@ export default function GeminiPlayer() {
     };
 
     // --- WORKER INTEGRATION ---
+    const playbackShortcutRef = useRef(null);
+    React.useLayoutEffect(() => {
+        playbackShortcutRef.current = {
+            enabled: Boolean(mediaSrc && playerRef.current) && !showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode,
+            echoMode: isEchoMode,
+            toggle: togglePlay,
+            replayEcho: () => playEchoRangeOnce()
+        };
+    });
+    useEffect(() => {
+        const handler = createPlaybackSpaceHandler(() => playbackShortcutRef.current);
+        window.addEventListener('keydown', handler, true);
+        return () => window.removeEventListener('keydown', handler, true);
+    }, []);
+
+
     const workerRef = useRef(null);
     const latestStateRef = useRef({}); // Holds fresh state for Worker Callback
 
@@ -20922,7 +20953,7 @@ ${userQ}`;
                                 setIsSubtitleBlankMode(mode => !mode);
                             }}
                             onKeyDown={event => {
-                                if (event.target === event.currentTarget && ['Enter', ' '].includes(event.key)) {
+                                if (event.target === event.currentTarget && event.key === 'Enter') {
                                     event.preventDefault(); setIsSubtitleBlankMode(mode => !mode);
                                 }
                             }}>
@@ -21071,7 +21102,7 @@ ${userQ}`;
                                 </div>
                                 <div className="mt-2 flex items-center justify-center gap-2" data-subtitle-focus-restore>
                                     <button type="button" onClick={() => shiftEchoRange(-1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
-                                    <button type="button" onClick={() => playEchoRangeOnce()} className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
+                                    <button type="button" onClick={() => playEchoRangeOnce()} title="重聽目前片段（空白鍵）" aria-keyshortcuts="Space" className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
                                     <button type="button" onClick={() => shiftEchoRange(1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
                                 </div>
                             </div>
@@ -21080,7 +21111,7 @@ ${userQ}`;
                         {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-x-6 gap-y-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
                             <div className="flex items-center gap-3 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
-                                <button onClick={togglePlay} className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
+                                <button onClick={togglePlay} title="播放／暫停（空白鍵）" aria-keyshortcuts="Space" className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
                                 <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
                             </div>
                             <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習" data-subtitle-focus-restore>
@@ -21224,7 +21255,7 @@ ${userQ}`;
                                 <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipBack size={16} />
                                 </button>
-                                <button onClick={togglePlay} className="flex items-center justify-center p-2 rounded-full bg-gray-100 text-gray-900 hover:scale-105 transition-transform">
+                                <button onClick={togglePlay} title="播放／暫停（空白鍵）" aria-keyshortcuts="Space" className="flex items-center justify-center p-2 rounded-full bg-gray-100 text-gray-900 hover:scale-105 transition-transform">
                                     {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
                                 </button>
                                 <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
