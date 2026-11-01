@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.233 · spacebar-playback";
+const APP_VERSION = "v5.234 · keyboard-navigation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7481,20 +7481,27 @@ const isSubtitlePracticeTextHit = (event) => {
     return false;
 };
 
-const createPlaybackSpaceHandler = getState => event => {
-    if (![' ', 'Spacebar'].includes(event.key) && event.code !== 'Space') return;
+const createPlaybackShortcutHandler = getState => event => {
+    const key = String(event.key || '').toLowerCase();
+    const space = [' ', 'spacebar'].includes(key) || event.code === 'Space';
+    if (!space && !['z', 'x'].includes(key)) return;
     if (event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
         event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
     const state = getState();
     if (!state?.enabled) return;
     const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
-    // Caption blanks use Space for listening. Other editors retain normal spaces.
-    if (editor && !editor.hasAttribute('data-subtitle-blank')) return;
+    // Z/X remain letters while editing, including in caption blanks. Space
+    // retains its listening shortcut inside blanks only.
+    if (editor && (!space || !editor.hasAttribute('data-subtitle-blank'))) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.repeat) return;
-    if (state.echoMode) state.replayEcho();
-    else state.toggle();
+    if (space) {
+        if (state.echoMode) state.replayEcho();
+        else state.toggle();
+    } else if (state.echoMode) state.shiftEcho(key === 'z' ? -1 : 1);
+    else if (key === 'z') state.previous();
+    else state.next();
 };
 
 const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true }) => {
@@ -10409,11 +10416,14 @@ export default function GeminiPlayer() {
             enabled: Boolean(mediaSrc && playerRef.current) && !showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode,
             echoMode: isEchoMode,
             toggle: togglePlay,
-            replayEcho: () => playEchoRangeOnce()
+            replayEcho: () => playEchoRangeOnce(),
+            previous: handlePreviousPlaybackControl,
+            next: handleNextPlaybackControl,
+            shiftEcho: direction => shiftEchoRange(direction)
         };
     });
     useEffect(() => {
-        const handler = createPlaybackSpaceHandler(() => playbackShortcutRef.current);
+        const handler = createPlaybackShortcutHandler(() => playbackShortcutRef.current);
         window.addEventListener('keydown', handler, true);
         return () => window.removeEventListener('keydown', handler, true);
     }, []);
@@ -21101,18 +21111,18 @@ ${userQ}`;
                                     )}
                                 </div>
                                 <div className="mt-2 flex items-center justify-center gap-2" data-subtitle-focus-restore>
-                                    <button type="button" onClick={() => shiftEchoRange(-1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
+                                    <button type="button" onClick={() => shiftEchoRange(-1)} aria-keyshortcuts="Z" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
                                     <button type="button" onClick={() => playEchoRangeOnce()} title="重聽目前片段（空白鍵）" aria-keyshortcuts="Space" className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
-                                    <button type="button" onClick={() => shiftEchoRange(1)} className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
+                                    <button type="button" onClick={() => shiftEchoRange(1)} aria-keyshortcuts="X" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
                                 </div>
                             </div>
                         )}
 
                         {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-x-6 gap-y-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
                             <div className="flex items-center gap-3 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
-                                <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
+                                <button onClick={handlePreviousPlaybackControl} aria-keyshortcuts="Z" title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} title="播放／暫停（空白鍵）" aria-keyshortcuts="Space" className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
-                                <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
+                                <button onClick={handleNextPlaybackControl} aria-keyshortcuts="X" title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
                             </div>
                             <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習" data-subtitle-focus-restore>
                                 <button onClick={() => { const modes = ['single', 'all', 'none']; setLoopMode(modes[(modes.indexOf(loopMode) + 1) % modes.length]); }} className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${loopMode !== 'none' ? 'text-blue-600 bg-blue-50' : 'text-gray-400'}`}>
@@ -21252,13 +21262,13 @@ ${userQ}`;
                         {renderSeekTimeControls()}
                         <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
                             <div className="flex items-center gap-2 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
-                                <button onClick={handlePreviousPlaybackControl} title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
+                                <button onClick={handlePreviousPlaybackControl} aria-keyshortcuts="Z" title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipBack size={16} />
                                 </button>
                                 <button onClick={togglePlay} title="播放／暫停（空白鍵）" aria-keyshortcuts="Space" className="flex items-center justify-center p-2 rounded-full bg-gray-100 text-gray-900 hover:scale-105 transition-transform">
                                     {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
                                 </button>
-                                <button onClick={handleNextPlaybackControl} title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
+                                <button onClick={handleNextPlaybackControl} aria-keyshortcuts="X" title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipForward size={16} />
                                 </button>
                             </div>
