@@ -88,8 +88,9 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         c.echoStartRef.current = 95;
         c.echoEndRef.current = 100;
         api.shiftEchoRange(1);
-        assert.equal(c.echoStartRef.current, 100);
-        assert.equal(c.echoEndRef.current, 105);
+        assert.equal(c.echoStartRef.current, 95);
+        assert.equal(c.echoEndRef.current, 100);
+        assert.equal(c.echoModeRef.current, false, 'forward beyond the original end exits echo');
         assert.equal(seeks.length, validSeeks);
         c.echoStartRef.current = 8;
         c.echoEndRef.current = 15;
@@ -99,6 +100,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         let tick;
         let pauses = 0;
         c.isEchoMode = true;
+        c.echoModeRef.current = true;
+        c.echoPhaseRef.current = 'ready';
         c.mediaSeekRef = { current: { active: false } };
         c.setCurrentTime = noop;
         c.useEffect = fn => fn();
@@ -113,4 +116,39 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(c.echoPhaseRef.current, 'ready');
         assert.equal(seeks.length, validSeeks);
     });
+    test('echo initial timeline click selects B, keeps A fixed, and forward exits only after exceeding the original end: ' + file, () => {
+        const seeks = [], states = [];
+        const c = { subtitles: [{ start: 10, end: 15 }], currentIndex: 0, duration: 100,
+            echoBounds: { start: 7, end: 18 }, getBufferedRange: () => ({ start: 10, end: 15 }),
+            playerRef: { current: { duration: 100, pause() {} } }, cancelWorkerTimer: noop,
+            seekThenMaybePlay: (start, play) => seeks.push({ start, play }),
+            echoTimelineRef: { current: { getBoundingClientRect: () => ({ left: 0, width: 110 }) } }
+        };
+        for (const name of ['echoSessionTokenRef', 'echoModeRef', 'echoPhaseRef', 'echoStartRef', 'echoEndRef', 'echoHasStartRef', 'echoHasEndRef', 'echoOriginalBoundsRef', 'echoWindowRef', 'echoBufferRef', 'isGapPausing']) c[name] = { current: 0 };
+        for (const name of ['setEchoPhase', 'setEchoNotice', 'setEchoBounds', 'setEchoStart', 'setEchoEnd', 'setEchoHasStart', 'setEchoHasEnd', 'setIsPlaying', 'setIsToolbarVisible', 'setEchoBuffers']) c[name] = noop;
+        c.setIsEchoMode = value => states.push(value);
+        const start = source.indexOf('    const clampEchoTime =');
+        const end = source.indexOf('    useEffect(() => {\n        const player = playerRef.current;\n        if (!isEchoMode', start);
+        const api = vm.runInNewContext(source.slice(start, end) + '\n({startEchoMode, hasOriginalEchoSelection, setInitialEchoEndFromTimeline, shiftEchoRange})', c);
+        const click = clientX => ({ detail: 1, clientX, preventDefault() { this.prevented = true; }, stopPropagation() {} });
+        api.startEchoMode(); assert.equal(api.hasOriginalEchoSelection(), true);
+        assert.equal(api.setInitialEchoEndFromTimeline(click(10)), false, 'buffer clicks are not B selection');
+        const middle = click(60); assert.equal(api.setInitialEchoEndFromTimeline(middle), true);
+        assert.equal(middle.prevented, true); assert.equal(c.echoStartRef.current, 10); assert.equal(c.echoEndRef.current, 13);
+        assert.equal(seeks.at(-1).start, 10, 'replay the newly selected A-B segment');
+        const count = seeks.length;
+        assert.equal(api.setInitialEchoEndFromTimeline(click(50)), false, 'ordinary playhead seeking returns after changing B');
+        assert.equal(seeks.length, count);
+        api.startEchoMode();
+        api.setInitialEchoEndFromTimeline({ ...click(0), detail: 0 });
+        assert.equal(c.echoEndRef.current, 12.5, 'keyboard activation selects the midpoint');
+        api.startEchoMode(); api.shiftEchoRange(1);
+        assert.equal(c.echoStartRef.current, 15); assert.equal(c.echoEndRef.current, 20);
+        assert.equal(states.at(-1), true, 'B equal to the original end still permits moving forward once');
+        api.shiftEchoRange(-1); assert.equal(c.echoEndRef.current, 15); assert.equal(states.at(-1), true);
+        api.shiftEchoRange(1); const beforeExit = seeks.length;
+        api.shiftEchoRange(1); assert.equal(states.at(-1), false); assert.equal(c.echoModeRef.current, false);
+        assert.equal(seeks.length, beforeExit, 'exit must not start another fragment');
+    });
+
 }

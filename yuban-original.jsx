@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.235 · dictation-keyboard-controls";
+const APP_VERSION = "v5.236 · echo-timeline-selection";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9136,6 +9136,25 @@ export default function GeminiPlayer() {
         }
     };
 
+    const hasOriginalEchoSelection = () => {
+        const original = echoOriginalBoundsRef.current;
+        return echoHasStartRef.current && echoHasEndRef.current &&
+            Math.abs(echoStartRef.current - original.start) <= 0.001 &&
+            Math.abs(echoEndRef.current - original.end) <= 0.001;
+    };
+    const setInitialEchoEndFromTimeline = event => {
+        if (!hasOriginalEchoSelection()) return false;
+        const original = echoOriginalBoundsRef.current;
+        const rect = echoTimelineRef.current?.getBoundingClientRect();
+        if (!rect || rect.width <= 0) return false;
+        const time = event.detail === 0 ? (original.start + original.end) / 2
+            : echoBounds.start + ((event.clientX - rect.left) / rect.width) * (echoBounds.end - echoBounds.start);
+        if (!Number.isFinite(time) || time <= original.start || time >= original.end) return false;
+        event.preventDefault(); event.stopPropagation();
+        setEchoPoint('B', time, 'confirm');
+        return true;
+    };
+
     const startEchoMarkerDrag = (point, event) => {
         if (!echoTimelineRef.current) return;
         event.preventDefault();
@@ -9167,6 +9186,10 @@ export default function GeminiPlayer() {
     };
 
     const shiftEchoRange = (direction) => {
+        if (direction > 0 && echoEndRef.current > echoOriginalBoundsRef.current.end + 0.001) {
+            stopEchoMode();
+            return;
+        }
         const length = echoEndRef.current - echoStartRef.current;
         if (length <= 0) return;
         const start = direction > 0 ? echoEndRef.current : echoStartRef.current - length;
@@ -21084,6 +21107,14 @@ ${userQ}`;
                                         className="absolute inset-0 z-10 w-full h-full opacity-0 cursor-pointer"
                                         aria-label="回音法片段播放位置"
                                     />
+                                    {hasOriginalEchoSelection() && (
+                                        <button type="button" aria-label="在時間軸設定 B 終點"
+                                            title="點選原起終點之間的位置，將 B 設到該處"
+                                            data-subtitle-focus-restore onClick={setInitialEchoEndFromTimeline}
+                                            className="absolute inset-y-0 z-[12] cursor-crosshair bg-transparent"
+                                            style={{ left: `${((echoOriginalBoundsRef.current.start - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
+                                                width: `${((echoOriginalBoundsRef.current.end - echoOriginalBoundsRef.current.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }} />
+                                    )}
                                     {['before', 'after'].map(side => {
                                         const from = side === 'before' ? echoBounds.start : echoOriginalBoundsRef.current.end;
                                         const to = side === 'before' ? echoOriginalBoundsRef.current.start : echoBounds.end;
@@ -21127,7 +21158,7 @@ ${userQ}`;
                                 <div className="mt-2 flex items-center justify-center gap-2" data-subtitle-focus-restore>
                                     <button type="button" onClick={() => shiftEchoRange(-1)} aria-keyshortcuts="-" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
                                     <button type="button" onClick={() => playEchoRangeOnce()} title="重聽目前片段（空白鍵）" aria-keyshortcuts="Space" className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
-                                    <button type="button" onClick={() => shiftEchoRange(1)} aria-keyshortcuts="/" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B，區段時長不變">向前</button>
+                                    <button type="button" onClick={() => shiftEchoRange(1)} aria-keyshortcuts="/" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B；B 已超過原終點時結束回音法">向前</button>
                                 </div>
                             </div>
                         )}
