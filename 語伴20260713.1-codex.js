@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.241 · resilient-reference-alignment";
+const APP_VERSION = "v5.242 · reference-name-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6295,6 +6295,60 @@ const isSubtitleReferenceSpellingVariant = (a, b) => {
     const distance = previous[b.length];
     return distance <= limit && distance / maxLength <= (Math.min(a.length, b.length) >= 8 ? 0.40 : 0.25);
 };
+const SUBTITLE_REFERENCE_NAME_CONNECTORS = new Set(['of', 'de', 'del', 'da', 'di', 'van', 'von', 'la', 'le', 'd']);
+const SUBTITLE_REFERENCE_NAME_EXCLUSIONS = new Set(['according', 'earlier', 'later', 'meanwhile', 'officials', 'dozens', 'hundreds', 'thousands', 'politics', 'government']);
+const isSubtitleReferenceNameWord = word => Boolean(word && !word.numeric &&
+    !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key) &&
+    !SUBTITLE_REFERENCE_NAME_EXCLUSIONS.has(word.key) && /^\p{Lu}[\p{L}\p{M}'’]+$/u.test(word.text));
+const findSubtitleReferenceNameMatch = (words, i, tokens, j, lineTexts) => {
+    if (!isSubtitleReferenceNameWord(tokens[j]) || words.length < 8) return null;
+    const leftCount = Math.min(2, i);
+    if (leftCount && !Array.from({length:leftCount},(_,offset)=>offset+1).every(offset => words[i-offset]?.key === tokens[j-offset]?.key)) return null;
+    const refLine = tokens[j].sourceLine;
+    // Capitalized source words identify the name; the ASR spelling and its word
+    // count are deliberately not evidence. Exact surrounding words locate it.
+    let maxReference = 1;
+    while (maxReference < 4 && tokens[j+maxReference]?.sourceLine === refLine) {
+        const next = tokens[j+maxReference];
+        const connector = SUBTITLE_REFERENCE_NAME_CONNECTORS.has(next.key) && isSubtitleReferenceNameWord(tokens[j+maxReference+1]);
+        if (!isSubtitleReferenceNameWord(next) && !connector) break;
+        const gap = lineTexts.get(refLine).slice(tokens[j+maxReference-1].end,next.start);
+        if (!/^[\s\-’']*$/u.test(gap)) break;
+        maxReference++;
+    }
+    const matches = [];
+    for (let refCount = 1; refCount <= maxReference; refCount++) {
+        if (!isSubtitleReferenceNameWord(tokens[j+refCount-1])) continue;
+        for (let rawCount = 1; rawCount <= 4 && i+rawCount <= words.length; rawCount++) {
+            const rawWords = words.slice(i,i+rawCount);
+            if (rawWords.some(word=>word.numeric || SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key))) continue;
+            const rightCount = Math.min(leftCount < 2 ? 4 : 2,words.length-i-rawCount);
+            if (rightCount === 0) {
+                const last = tokens[j+refCount-1];
+                if (i < 4 || !Array.from({length:4},(_,offset)=>offset+1).every(offset=>words[i-offset]?.key === tokens[j-offset]?.key) ||
+                    !/^[\s.!?,;:’"')\]]*$/u.test(lineTexts.get(refLine).slice(last.end))) continue;
+            } else if (leftCount < 2 && rightCount < 4) continue;
+            if (!Array.from({length:rightCount},(_,offset)=>offset).every(offset=>words[i+rawCount+offset]?.key === tokens[j+refCount+offset]?.key)) continue;
+            // A short right-hand anchor is allowed only at the actual cue end.
+            if (rightCount === 1 && i+rawCount+1 !== words.length) continue;
+            const refs = tokens.slice(j,j+refCount);
+            const text = lineTexts.get(refLine).slice(refs[0].start,refs[refs.length-1].end);
+            if (rawWords.map(word=>word.key).join(' ') === refs.map(word=>word.key).join(' ')) continue;
+            matches.push({ rawCount, refCount, text, refs });
+        }
+    }
+    return matches.length === 1 ? matches[0] : null;
+};
+const isSubtitleReferenceDuplicateGap = (raw,words,i,tokens,j) => {
+    const gap = raw.slice(words[i-1].end,words[i].start);
+    if (/^\s+$/u.test(gap)) return true;
+    // ASR punctuation can split a duplicated word. Preserve short/repeated
+    // emphasis; only repair a comma repeat inside a strongly anchored long cue.
+    return /^\s*,\s*$/u.test(gap) && words.length >= 10 && i >= 2 &&
+        words[i-2]?.key === tokens[j-2]?.key &&
+        words[i+1]?.key === tokens[j]?.key && words[i+2]?.key === tokens[j+1]?.key;
+};
+
 const createSubtitleReferenceResolver = searchIndex => {
     const tokens = [], postings = new Map(), lineTexts = new Map();
     for (const entry of searchIndex?.entries || []) {
@@ -6346,7 +6400,7 @@ const createSubtitleReferenceResolver = searchIndex => {
         for (const anchor of anchors) {
             const expanded = new Set(starts);
             for (const position of anchor.positions) {
-                for (let dropped = -1; dropped <= 2; dropped++) if (position - anchor.index + dropped >= 0) expanded.add(position - anchor.index + dropped);
+                for (let dropped = -3; dropped <= 4; dropped++) if (position - anchor.index + dropped >= 0) expanded.add(position - anchor.index + dropped);
             }
             // A common secondary anchor must not discard a useful rare one.
             if (expanded.size > 128) { if (starts.size) break; continue; }
@@ -6357,14 +6411,14 @@ const createSubtitleReferenceResolver = searchIndex => {
         if (!starts.size || starts.size > 128) return remember({ reason: 'no_unique_anchor' });
         const candidates = [];
         for (const start of starts) {
-            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0, omissions = 0;
+            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0, omissions = 0, nameCorrections = 0, nameWords = 0;
             const edits = [], consumed = [];
             while (i < words.length && j < tokens.length) {
                 const word = words[i], ref = tokens[j];
                 if (consumed.length && ref.sourceLine - consumed[consumed.length - 1].sourceLine > 4) break;
                 if (word.key === ref.key) { exact++; consumed.push(ref); i++; j++; continue; }
                 if (i > 0 && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key) && !SUBTITLE_REFERENCE_KEEP_REPETITIONS.has(word.key) && !/\d/u.test(word.key) && word.key === words[i - 1].key && consumed.length &&
-                    word.key === consumed[consumed.length - 1].key && /^\s+$/u.test(raw.slice(words[i - 1].end, word.start)) && duplicates < 2) {
+                    word.key === consumed[consumed.length - 1].key && isSubtitleReferenceDuplicateGap(raw, words, i, tokens, j) && duplicates < 2) {
                     edits.push({ start: words[i - 1].end, end: word.end, text: '', from: word.text, to: '', kind: 'duplicate' });
                     duplicates++; i++; continue;
                 }
@@ -6376,6 +6430,13 @@ const createSubtitleReferenceResolver = searchIndex => {
                     ref.sourceLine === tokens[j + 1]?.sourceLine) {
                     edits.push({ start: word.start, end: word.start, text: ref.text + ' ', from: '', to: ref.text, kind: 'omission' });
                     omissions++; consumed.push(ref); j++; continue;
+                }
+                const name = nameCorrections < 2 ? findSubtitleReferenceNameMatch(words, i, tokens, j, lineTexts) : null;
+                if (name) {
+                    edits.push({ start: word.start, end: words[i + name.rawCount - 1].end,
+                        text: name.text, from: raw.slice(word.start, words[i + name.rawCount - 1].end), to: name.text, kind: 'name' });
+                    nameCorrections++; nameWords += name.rawCount;
+                    consumed.push(...name.refs); i += name.rawCount; j += name.refCount; continue;
                 }
                 if (substitutions >= 2 || word.numeric || ref.numeric || !near(word.key, ref.key)) break;
                 edits.push({ start: word.start, end: word.end, text: ref.text, from: word.text, to: ref.text, kind: 'spelling' });
@@ -6390,11 +6451,13 @@ const createSubtitleReferenceResolver = searchIndex => {
             if (i !== words.length || consumed.length < 2) continue;
             const changed = edits.length > 0;
             const contentExact = new Set(words.filter(word => !word.numeric && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
-            if (changed && (words.length < 5 || exact < 4 || exact / words.length < 0.72 || contentExact < 2 || edits.length > Math.max(1, Math.floor(words.length / 4)))) continue;
+            const agreementLength = words.length - nameWords + nameCorrections;
+            if (nameCorrections && (exact < 6 || exact / agreementLength < 0.80 || contentExact < 3)) continue;
+            if (changed && (words.length < 5 || exact < 4 || exact / agreementLength < 0.72 || contentExact < 2 || edits.length > Math.max(1, Math.floor(words.length / 4)))) continue;
             // A spelling change at a cue boundary has less context. Require an
             // exact adjacent pair as well as the whole-window evidence above.
             if (changed && (words[0].key !== consumed[0].key || words[words.length - 1].key !== consumed[consumed.length - 1].key) &&
-                (words.length < 7 || exact < words.length - 2)) continue;
+                (words.length < 7 || exact < words.length - Math.max(2, nameWords))) continue;
             let text = raw;
             for (const edit of [...edits].sort((a, b) => b.start - a.start)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
             const ranges = [];
@@ -6405,7 +6468,7 @@ const createSubtitleReferenceResolver = searchIndex => {
             }
             if (sequential && sourceLine >= 0 && (ranges[0].sourceLine < sourceLine - 1 || ranges[0].sourceLine > sourceLine + 48)) continue;
             ranges.forEach(range => { range.text = lineTexts.get(range.sourceLine).slice(range.start, range.end); });
-            candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2, changed, trusted: true });
+            candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2 + nameCorrections * 3, changed, trusted: true });
         }
         if (!candidates.length) return remember({ reason: 'no_bounded_word_alignment' });
         candidates.sort((a, b) => a.cost - b.cost);

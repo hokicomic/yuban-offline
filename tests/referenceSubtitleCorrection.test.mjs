@@ -133,6 +133,47 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(expanded.text,'Earlier delegates agreed to sign the final regional trade treaty tomorrow');
         assert.equal(expanded.ranges[0].text,expanded.text);
     });
+    test('source names override very different ASR spellings when surrounding words agree: ' + file, () => {
+        for (const [ref,raw] of [
+            ['She made her first campaign speech in Orléans, a city closely associated with Joan of Arc.','She made her first campaign speech in Orgliant, a city closely associated with Joan of Arc.'],
+            ['At its party congress the same weekend, her National Rally re-elected Jordan Bardella as its president.',"At its party congress the same weekend, her national rally re-elected Jean d 'Ambadelle as its president."],
+            ['At its party congress the same weekend, her National Rally re-elected Jordan Bardella as its president.',"At its party congress the same weekend, her national rally re-elected Jean d'Ambadelle as its president."],
+            ['The ceasefire was reportedly extended across the Kherson region.','The ceasefire was reportedly extended across the Haerson region.'],
+            ['Kherson was reportedly the final location selected for the peace talks.','Haerson was reportedly the final location selected for the peace talks.'],
+            ['The delegation held the regional security meeting in Kherson.','The delegation held the regional security meeting in Haerson.'],
+            ['The delegates attended the regional peace talks in Orléans before returning home.','The delegates attended the regional peace talks in Or Glee Ant City before returning home.'],
+            ['The delegates discussed regional security with Aleksandar Vucic before the evening meeting.','The delegates discussed regional security with Alexander Voo Chich before the evening meeting.']
+        ]) {
+            const cue={text:raw,start:10,end:15}; const before=JSON.stringify(cue);
+            const result=resolver(ref).resolve(cue);
+            assert.equal(result.trusted,true,raw); assert.equal(result.changed,true,raw);
+            const names=result.edits.filter(edit=>edit.kind==='name');assert.ok(names.length,raw);
+            assert.equal(JSON.stringify(cue),before);
+            assert.equal(result.ranges[0].text,ref.slice(0,-1));
+            assert.ok(api.findKnowledgePreciseSubtitleRanges(ref,raw).length);
+        }
+    });
+    test('name correction rejects ambiguous references, weak context and numbers or ordinary words: ' + file, () => {
+        const raw='The ceasefire was reportedly extended across the Haerson region.';
+        const first='The ceasefire was reportedly extended across the Kherson region.';
+        const second='The ceasefire was reportedly extended across the Donetsk region.';
+        assert.equal(resolver(first+'\n'+second).resolve({text:raw}).trusted,false);
+        for(const [ref,cue] of [
+            ['We visited Orléans yesterday.','We visited Orgliant yesterday.'],
+            [first,'The ceasefire was reportedly extended across the 300 region.'],
+            [first,'The ceasefire was reportedly extended across the no region.'],
+            ['The delegates discussed regional security with ordinary wording before the evening meeting.','The delegates discussed regional security with nonsense garble before the evening meeting.']
+        ]) assert.equal(resolver(ref).resolve({text:cue}).changed,false,cue);
+    });
+    test('comma-separated ASR repetition is removable with strong context but real emphasis is retained: ' + file, () => {
+        const ref='But 19 of those seats went to Arab parties, a historic high, and most of the Jewish opposition parties have refused to include them in a coalition.';
+        const raw=ref.replace('historic high,','historic high, high,');
+        const result=resolver(ref).resolve({text:raw});
+        assert.equal(result.text,ref);assert.equal(result.trusted,true);assert.equal(result.edits[0].kind,'duplicate');
+        const emphasis='They were very, very pleased with the outcome of the final election.';
+        assert.equal(resolver(emphasis.replace('very, very','very')).resolve({text:emphasis}).changed,false);
+        assert.equal(resolver(ref.replace('historic high,','historic high, high,')).resolve({text:raw}).changed,false);
+    });
     test('a partial cue cannot borrow the rest of a sentence or fill internal missing words: ' + file, () => {
         const text = 'The member states agreed to join the bloc and strengthen their common policy.';
         const result = resolver(text).resolve({ text: 'The member states agreed to join the block' });
