@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.246 · context-first-reference-alignment";
+const APP_VERSION = "v5.247 · reference-panel-status";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6433,6 +6433,20 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
     if(new Set(best.map(item=>item.expectedWords)).size>1)return null;
     if(best.length>1 && sourceLine>=0){const local=best.filter(item=>item.ranges.some(range=>Math.abs(range.sourceLine-sourceLine)<=4));if(local.length===1)best=local;}
     return best.length===1?best[0]:null;
+};
+
+const canCollapseBlankReferencePanel = ({documentMode,blankMode,text,loading,error}) => Boolean(documentMode && blankMode && String(text || '').trim() && !loading && !error);
+const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled,projection}) => {
+    if (loading) return {text:'文本載入中',tone:'text-slate-500'};
+    if (error) return {text:'文本載入失敗',tone:'text-amber-700'};
+    if (!hasText) return {text:'未載入文本',tone:'text-slate-500'};
+    if (!active) return {text:'對照未啟用',tone:'text-slate-500'};
+    if (!hasCue) return {text:'尚無字幕',tone:'text-slate-500'};
+    if (!(projection?.aligned || projection?.trusted)) return {text:'本句未對到文本',tone:'text-amber-700'};
+    if (!enabled) return {text:'已對到文本・校正關閉',tone:'text-slate-500'};
+    if (projection.reviewDifferences?.length) return {text:'已對到文本・有差異待確認',tone:'text-amber-700'};
+    if (projection.boundaryOmissions?.length) return {text:'已對到文本・有漏字待確認',tone:'text-amber-700'};
+    return {text:projection.changed?'已對到文本・已校正':'已對到文本・無需校正',tone:'text-emerald-700'};
 };
 
 const createSubtitleReferenceResolver = searchIndex => {
@@ -18724,7 +18738,7 @@ ${userQ}`;
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
     const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
-    const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText);
+    const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText.trim()) && !embeddedKnowledgeLoading && !embeddedKnowledgeError;
     const currentSubtitleProjection = useMemo(() => {
         if (!referenceSubtitleActive) return null;
         const progress = embeddedKnowledgePlaybackProgressRef.current;
@@ -20513,8 +20527,13 @@ ${userQ}`;
     const canShowEmbeddedKnowledgePanel = true;
     const isTopPanelDocumentMode = topPanelMode === 'document';
     const isTopPanelMediaMode = topPanelMode === 'media';
-    const isBlankReferencePanel = isTopPanelDocumentMode && isSubtitleBlankMode;
-    const effectiveTopPanelHeight = isBlankReferencePanel ? (blankReferencePanelHeight ?? 0) : embeddedKnowledgePanelHeight;
+    const isBlankReferencePanel = canCollapseBlankReferencePanel({documentMode:isTopPanelDocumentMode,blankMode:isSubtitleBlankMode,
+        text:embeddedKnowledgeText,loading:embeddedKnowledgeLoading,error:embeddedKnowledgeError});
+    const effectiveTopPanelHeight = isBlankReferencePanel ? (blankReferencePanelHeight ?? 0)
+        : isTopPanelDocumentMode && isSubtitleBlankMode ? Math.max(28,embeddedKnowledgePanelHeight || 50) : embeddedKnowledgePanelHeight;
+    const subtitleReferenceStatus = getSubtitleReferenceStatus({loading:embeddedKnowledgeLoading,error:embeddedKnowledgeError,
+        hasText:Boolean(embeddedKnowledgeText.trim()),active:referenceSubtitleActive,hasCue:Boolean(subtitles[currentIndex]),
+        enabled:referenceSubtitleCorrectionEnabled,projection:currentSubtitlePresentation});
     React.useLayoutEffect(() => { setBlankReferencePanelHeight(null); }, [isSubtitleBlankMode, topPanelMode, embeddedKnowledgeText]);
     const changeTopPanelHeight = value => {
         const height = Math.max(isTopPanelDocumentMode ? 0 : 28, Math.min(72, Number(value)));
@@ -21606,8 +21625,10 @@ ${userQ}`;
                                 }
                             }}>
                             <div ref={subtitleCardRef} className="w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-auto border bg-white border-gray-200 shadow-sm">
-                                {referenceSubtitleActive && (
+                                {isTopPanelDocumentMode && (
                                     <div className="flex flex-wrap items-center justify-end gap-2 mb-1 text-[10px] text-slate-500">
+                                        <span role="status" aria-label="本句文本對照狀態" aria-live="polite"
+                                            className={`text-[11px] font-medium ${subtitleReferenceStatus.tone}`}>{subtitleReferenceStatus.text}</span>
                                         <label className="inline-flex items-center gap-1 cursor-pointer">
                                             <input type="checkbox" checked={referenceSubtitleCorrectionEnabled} onChange={event => setReferenceSubtitleCorrectionEnabled(event.target.checked)} />參照校正字幕
                                         </label>
