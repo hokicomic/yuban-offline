@@ -171,6 +171,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(spellingVariants.resolve({text:'The delegates discussed the final agreement with Jorden Bardella after the meeting.'}).text,
             'The delegates discussed the final agreement with Jordan Bardella after the meeting.');
     });
+    test('near-total cue agreement permits a bounded first-letter ASR error without expanding the paragraph: ' + file, () => {
+        const ref='All these possibilities and yet our individual lives with their energetic complexities do not even register on the geological timeline as anything but the merest mark.';
+        const raw=ref.replace('merest','nearest');
+        const prefix='On other days, I yearn for a right-brain revolution. ';
+        const suffix=' But from the start, our species has been making marks.';
+        const result=resolver(prefix+ref+suffix).resolve({text:raw});
+        assert.equal(result.trusted,true);assert.equal(result.text,ref);
+        assert.equal(result.edits.length,1);assert.equal(result.edits[0].from,'nearest');assert.equal(result.edits[0].to,'merest');
+        assert.equal(result.ranges[0].text,ref.slice(0,-1));assert.equal(result.ranges[0].start,prefix.length);
+        assert.deepEqual(Array.from(api.findKnowledgePreciseSubtitleRanges(prefix+ref+suffix,raw),range=>(prefix+ref+suffix).slice(range.start,range.end)),[ref.slice(0,-1)]);
+        assert.equal(resolver(ref+'\n'+ref.replace('merest','dearest')).resolve({text:raw}).changed,false,'different plausible wordings remain ambiguous');
+        const weak='The nearest mark was visible.';
+        assert.equal(resolver(weak.replace('nearest','merest')).resolve({text:weak}).changed,false,'short cues do not relax the spelling rule');
+        const protectedRaw='The delegates have now signed the final agreement after the successful meeting yesterday.';
+        assert.equal(resolver(protectedRaw.replace('now','not')).resolve({text:protectedRaw}).changed,false);
+        const wrongContext=raw.replace('anything but the nearest','anything near the nearest');
+        assert.equal(resolver(ref).resolve({text:wrongContext}).changed,false,'local context must be exact');
+    });
     test('name correction rejects ambiguous references, weak context and numbers or ordinary words: ' + file, () => {
         const raw='The ceasefire was reportedly extended across the Haerson region.';
         const first='The ceasefire was reportedly extended across the Kherson region.';

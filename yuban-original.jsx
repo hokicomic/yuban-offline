@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.244 · equivalent-name-candidates";
+const APP_VERSION = "v5.245 · anchored-spelling-correction";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6258,9 +6258,9 @@ const tokenizeSubtitleReferenceWords = value => {
 const SUBTITLE_REFERENCE_PROTECTED_WORDS = new Set(['not', 'no', 'never', 'without', 'with', 'before', 'after', 'more', 'less', 'increase', 'decrease', 'increased', 'decreased', 'increases', 'decreases', 'million', 'billion', 'may', 'must']);
 // Common emphatic/grammatical repetitions cannot be disambiguated by text alone.
 const SUBTITLE_REFERENCE_KEEP_REPETITIONS = new Set(['very', 'really', 'so', 'well', 'yes', 'had', 'that']);
-const isSubtitleReferenceSpellingVariant = (a, b) => {
+const isSubtitleReferenceSpellingVariant = (a, b, anchored = false) => {
     if (a === b) return true;
-    if (Math.min(a.length, b.length) < 4 || a[0] !== b[0] || /[\d']/u.test(a + b) ||
+    if (Math.min(a.length, b.length) < (anchored ? 5 : 4) || (!anchored && a[0] !== b[0]) || /[\d']/u.test(a + b) ||
         SUBTITLE_REFERENCE_PROTECTED_WORDS.has(a) || SUBTITLE_REFERENCE_PROTECTED_WORDS.has(b)) return false;
     const pastStem = value => {
         if (!value.endsWith('ed')) return '';
@@ -6269,7 +6269,7 @@ const isSubtitleReferenceSpellingVariant = (a, b) => {
     };
     if (pastStem(a) === b || pastStem(b) === a) return true;
     const maxLength = Math.max(a.length, b.length);
-    const limit = Math.min(a.length, b.length) >= 8 ? 4 : 2;
+    const limit = anchored ? 2 : Math.min(a.length, b.length) >= 8 ? 4 : 2;
     if (Math.abs(a.length - b.length) > limit) return false;
     let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
     for (let i = 1; i <= a.length; i++) {
@@ -6278,7 +6278,7 @@ const isSubtitleReferenceSpellingVariant = (a, b) => {
         previous = row;
     }
     const distance = previous[b.length];
-    return distance <= limit && distance / maxLength <= (Math.min(a.length, b.length) >= 8 ? 0.40 : 0.25);
+    return distance <= limit && distance / maxLength <= (anchored ? 1 / 3 : Math.min(a.length, b.length) >= 8 ? 0.40 : 0.25);
 };
 const SUBTITLE_REFERENCE_NAME_CONNECTORS = new Set(['of', 'de', 'del', 'da', 'di', 'van', 'von', 'la', 'le', 'd']);
 const SUBTITLE_REFERENCE_NAME_EXCLUSIONS = new Set(['according', 'earlier', 'later', 'meanwhile', 'officials', 'dozens', 'hundreds', 'thousands', 'politics', 'government']);
@@ -6369,11 +6369,11 @@ const createSubtitleReferenceResolver = searchIndex => {
         }
     }
     const cueCache = new WeakMap(), textCache = new Map(), spellingCache = new Map();
-    const near = (a, b) => {
-        const key = a + '\n' + b;
+    const near = (a, b, anchored = false) => {
+        const key = a + '\n' + b + '\n' + anchored;
         if (!spellingCache.has(key)) {
             if (spellingCache.size >= 2048) spellingCache.clear();
-            spellingCache.set(key, isSubtitleReferenceSpellingVariant(a, b));
+            spellingCache.set(key, isSubtitleReferenceSpellingVariant(a, b, anchored));
         }
         return spellingCache.get(key);
     };
@@ -6417,7 +6417,7 @@ const createSubtitleReferenceResolver = searchIndex => {
         if (!starts.size || starts.size > 128) return remember({ reason: 'no_unique_anchor' });
         const candidates = [];
         for (const start of starts) {
-            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0, omissions = 0, nameCorrections = 0, nameWords = 0;
+            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0, omissions = 0, nameCorrections = 0, nameWords = 0, anchoredCorrections = 0;
             const edits = [], consumed = [];
             while (i < words.length && j < tokens.length) {
                 const word = words[i], ref = tokens[j];
@@ -6444,7 +6444,18 @@ const createSubtitleReferenceResolver = searchIndex => {
                     nameCorrections++; nameWords += name.rawCount;
                     consumed.push(...name.refs); i += name.rawCount; j += name.refCount; continue;
                 }
-                if (substitutions >= 2 || word.numeric || ref.numeric || !near(word.key, ref.key)) break;
+                if (substitutions >= 2 || word.numeric || ref.numeric) break;
+                if (!near(word.key, ref.key)) {
+                    // A single ASR error can change the first letter (nearest /
+                    // merest). Require exact local anchors and verify near-total
+                    // whole-cue agreement below before accepting that wider edit.
+                    const after = Math.min(2, words.length-i-1);
+                    const anchored = !anchoredCorrections && words.length >= 12 && i >= 4 && after >= 1 &&
+                        [1,2,3,4].every(offset => words[i-offset]?.key === tokens[j-offset]?.key) &&
+                        Array.from({length:after},(_,offset)=>offset+1).every(offset => words[i+offset]?.key === tokens[j+offset]?.key);
+                    if (!anchored || !near(word.key, ref.key, true)) break;
+                    anchoredCorrections++;
+                }
                 edits.push({ start: word.start, end: word.end, text: ref.text, from: word.text, to: ref.text, kind: 'spelling' });
                 substitutions++; consumed.push(ref); i++; j++;
             }
@@ -6458,6 +6469,7 @@ const createSubtitleReferenceResolver = searchIndex => {
             const changed = edits.length > 0;
             const contentExact = new Set(words.filter(word => !word.numeric && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
             const agreementLength = words.length - nameWords + nameCorrections;
+            if (anchoredCorrections && (exact / agreementLength < 0.90 || contentExact < 4)) continue;
             if (nameCorrections && (exact < 6 || exact / agreementLength < 0.80 || contentExact < 3)) continue;
             if (changed && (words.length < 5 || exact < 4 || exact / agreementLength < 0.72 || contentExact < 2 || edits.length > Math.max(1, Math.floor(words.length / 4)))) continue;
             // A spelling change at a cue boundary has less context. Require an
