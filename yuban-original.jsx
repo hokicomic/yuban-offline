@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.239 · reference-context-recovery";
+const APP_VERSION = "v5.240 · clearer-correction-blue";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7468,7 +7468,7 @@ const paintSubtitleReferenceCorrections = (editor, text, projection) => {
         if (range.start > cursor) fragment.appendChild(doc.createTextNode(text.slice(cursor, range.start)));
         const span = doc.createElement('span');
         span.setAttribute('data-subtitle-reference-corrected', 'true');
-        span.style.color = '#1e3a8a';
+        span.style.color = '#2563eb';
         span.textContent = text.slice(range.start, range.end);
         fragment.appendChild(span);
         cursor = range.end;
