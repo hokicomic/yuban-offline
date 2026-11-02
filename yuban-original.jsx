@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.238 · dictation-reference-controls";
+const APP_VERSION = "v5.239 · reference-context-recovery";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6229,12 +6229,19 @@ const createSubtitleReferenceResolver = searchIndex => {
     const resolve = (cue, { sourceLine = -1, sequential = false } = {}) => {
         const raw = typeof cue === 'string' ? cue : String(cue?.text || '');
         const objectCue = cue && typeof cue === 'object';
+        // A result depends on the trusted location as well as the cue. A failed
+        // speculative lookup must not poison a later lookup after a document
+        // switch or a newly established anchor. Bound each cue to four contexts.
+        const contextKey = JSON.stringify([sourceLine, sequential]);
         const cached = objectCue ? cueCache.get(cue) : textCache.get(raw);
-        if (cached?.raw === raw) return cached;
+        if (cached?.raw === raw && cached.results.has(contextKey)) return cached.results.get(contextKey);
         const remember = result => {
             const record = { raw, text: raw, changed: false, trusted: false, edits: [], ranges: [], ...result };
-            if (objectCue) cueCache.set(cue, record);
-            else { if (textCache.size >= 64) textCache.delete(textCache.keys().next().value); textCache.set(raw, record); }
+            const cache = cached?.raw === raw ? cached : { raw, results: new Map() };
+            if (cache.results.size >= 4) cache.results.delete(cache.results.keys().next().value);
+            cache.results.set(contextKey, record);
+            if (objectCue) cueCache.set(cue, cache);
+            else { if (textCache.size >= 64) textCache.delete(textCache.keys().next().value); textCache.set(raw, cache); }
             return record;
         };
         const words = tokenizeSubtitleReferenceWords(raw);
@@ -18349,10 +18356,17 @@ ${userQ}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
     const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
     const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText);
-    const currentSubtitleProjection = useMemo(() => referenceSubtitleActive
-        ? subtitleReferenceResolver.resolve(subtitles[currentIndex], { sourceLine: embeddedKnowledgePlaybackProgressRef.current.maxSourceLine,
-            sequential: embeddedKnowledgePlaybackProgressRef.current.anchorState === 'anchored' && currentIndex >= embeddedKnowledgePlaybackProgressRef.current.subtitleIndex && currentIndex - embeddedKnowledgePlaybackProgressRef.current.subtitleIndex <= 2 }) : null,
-    [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex]);
+    const currentSubtitleProjection = useMemo(() => {
+        if (!referenceSubtitleActive) return null;
+        const progress = embeddedKnowledgePlaybackProgressRef.current;
+        // Text changes before the deferred document follower resets its cursor.
+        // Its old line numbers have no meaning in the new reference document.
+        const sameDocument = progress.documentText === embeddedKnowledgeText;
+        return subtitleReferenceResolver.resolve(subtitles[currentIndex], {
+            sourceLine: sameDocument ? progress.maxSourceLine : -1,
+            sequential: sameDocument && progress.anchorState === 'anchored' && currentIndex >= progress.subtitleIndex && currentIndex - progress.subtitleIndex <= 2
+        });
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText]);
     useEffect(() => {
         if (!referenceSubtitleActive) return;
         let cancelled = false, handle;
@@ -18370,9 +18384,13 @@ ${userQ}`;
     // Paint the already-known subtitle first; defer document alignment and its
     // memoized view together, so the media clock never waits for a TXT scan.
     const embeddedKnowledgeRenderIndex = React.useDeferredValue(currentIndex);
-    const referenceDocumentProjection = useMemo(() => referenceSubtitleActive
-        ? subtitleReferenceResolver.resolve(subtitles[embeddedKnowledgeRenderIndex], { sourceLine: embeddedKnowledgePlaybackProgressRef.current.maxSourceLine }) : null,
-    [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex]);
+    const referenceDocumentProjection = useMemo(() => {
+        if (!referenceSubtitleActive) return null;
+        const progress = embeddedKnowledgePlaybackProgressRef.current;
+        return subtitleReferenceResolver.resolve(subtitles[embeddedKnowledgeRenderIndex], {
+            sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
+        });
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
         const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;

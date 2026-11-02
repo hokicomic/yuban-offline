@@ -26,6 +26,53 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(JSON.stringify(cue), original);
         for (let i = 0; i < 100; i++) assert.equal(engine.resolve(cue), result, 'media ticks and replay reuse the same projection');
     });
+    test('word alignment corrects populace to populist across unreliable punctuation: ' + file, () => {
+        const ref = "Marine Le Pen, the populist-right front-runner in next year’s presidential election, officially launched her campaign. Another unspoken sentence.";
+        const text = "Marine Le Pen, the populace right front runner in next year's presidential election, officially launched her campaign.";
+        const result = resolver(ref).resolve({ text });
+        assert.equal(result.text, text.replace('populace', 'populist'));
+        assert.equal(result.trusted, true); assert.equal(result.edits.length, 1);
+        assert.equal(result.ranges[0].text, ref.slice(0, ref.indexOf('.')));
+        for (const punctuation of [',', ';', '—', '…', '']) {
+            const cue = text.replace(', the', punctuation + ' the').replace('right front runner', 'right—front-runner');
+            assert.equal(resolver(ref).resolve({text:cue}).text, cue.replace('populace','populist'));
+        }
+        const partial = "Marine Le Pen, the populace right front runner in next year's presidential election";
+        assert.equal(resolver(ref).resolve({text:partial}).text,partial.replace('populace','populist'));
+        assert.ok(!resolver(ref).resolve({text:partial}).ranges[0].text.includes('officially'));
+    });
+    test('a speculative miss cannot poison the cue after its anchor or document context changes: ' + file, () => {
+        const text = "Marine Le Pen, the populace right front runner in next year's presidential election, officially launched her campaign.";
+        const ref = text.replace('populace','populist');
+        for (const cue of [{text},text]) {
+            const engine = resolver(ref);
+            const speculative = engine.resolve(cue,{sourceLine:120,sequential:true});
+            assert.equal(speculative.changed,false); assert.equal(speculative.trusted,false);
+            const corrected = engine.resolve(cue,{sourceLine:1,sequential:true});
+            assert.equal(corrected.text,ref); assert.equal(corrected.changed,true);
+            assert.equal(engine.resolve(cue,{sourceLine:1,sequential:true}),corrected);
+            assert.equal(engine.resolve(cue,{sourceLine:120,sequential:true}),speculative);
+            assert.equal(engine.resolve(cue,{sourceLine:120,sequential:false}).text,ref);
+            assert.equal(engine.resolve(cue).text,ref);
+        }
+        const repeated = resolver(ref+'\n'+ref);
+        const cue = {text};
+        assert.equal(repeated.resolve(cue).trusted,false);
+        assert.equal(repeated.resolve(cue,{sourceLine:1}).trusted,false,'two equally local occurrences remain ambiguous');
+        const separated = resolver(ref+'\n'+Array.from({length:10},()=> 'Unrelated text.').join('\n')+'\n'+ref);
+        assert.equal(separated.resolve(cue).trusted,false);
+        assert.equal(separated.resolve(cue,{sourceLine:1}).text,ref,'a later trusted anchor can resolve a cached ambiguity');
+    });
+    test('a new document rejects stale cursor coordinates before the deferred follower resets: ' + file, () => {
+        const start = source.indexOf('    const currentSubtitleProjection = useMemo');
+        const end = source.indexOf('    useEffect(() => {',start);
+        const cue = {text:"Marine Le Pen, the populace right front runner in next year's presidential election, officially launched her campaign."};
+        const ref = cue.text.replace('populace','populist');
+        const context = {useMemo:fn=>fn(), referenceSubtitleActive:true, subtitleReferenceResolver:resolver(ref), subtitles:[cue],currentIndex:0,
+            embeddedKnowledgeText:ref,embeddedKnowledgePlaybackProgressRef:{current:{documentText:'previous document',maxSourceLine:120,anchorState:'anchored',subtitleIndex:0}}};
+        const result = vm.runInNewContext(source.slice(start,end)+'\ncurrentSubtitleProjection',context);
+        assert.equal(result.text,ref);assert.equal(result.changed,true);
+    });
     test('a partial cue cannot borrow the rest of a sentence or fill internal missing words: ' + file, () => {
         const text = 'The member states agreed to join the bloc and strengthen their common policy.';
         const result = resolver(text).resolve({ text: 'The member states agreed to join the block' });
