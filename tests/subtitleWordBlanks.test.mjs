@@ -77,6 +77,23 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const fallback = vm.runInNewContext(code + '\ntokenizeSubtitlePractice', { Intl: {} });
         assert.equal(fallback(source).filter(part => part.kind === 'word').length, 2);
     });
+    test('names are visible literals and excluded from dictation progress while sentence capitals remain blanks: ' + file, () => {
+        const text="Luiz Inácio Lula da Silva was re-elected as Brazil’s president.";
+        const parts=api.tokenizeSubtitlePractice(text,'en-US');
+        assert.equal(join(parts),text);
+        assert.deepEqual(Array.from(parts.filter(part=>part.name),part=>part.text),['Luiz','Inácio','Lula','da','Silva','Brazil’s']);
+        assert.equal(parts.filter(part=>part.kind==='word').some(word=>word.parts.some(part=>/Luiz|Inácio|Lula|Silva|Brazil/u.test(part.text))),false);
+        const ordinary=tokens('Hello, she made her first campaign speech.');
+        assert.equal(ordinary[0].kind,'word');
+        const sentence=tokens('She made her speech in Orléans with Joan of Arc.');
+        assert.deepEqual(Array.from(sentence.filter(part=>part.name),part=>part.text),['Orléans','Joan','of','Arc']);
+        const hinted=api.tokenizeSubtitlePractice('Kherson was the location.','en-US',['Kherson']);
+        assert.equal(hinted[0].name,true);
+        assert.equal(api.getSubtitlePracticeProgress(hinted,{}).total,3);
+        assert.equal(tokens('Maria Ana de la Cruz spoke.').filter(part=>part.kind==='word').length,1);
+        const fallback=vm.runInNewContext(code+'\ntokenizeSubtitlePractice',{Intl:{}});
+        assert.equal(fallback(text,'en-US').filter(part=>part.name).length,6);
+    });
     test('case differences are accepted and replaced by the original subtitle casing: ' + file, () => {
         for (const [target, typed] of [['Good', 'good'], ['afternoon', 'AFTERNOON'], ['iPhone', 'IPHONE'], ['CAFÉ', 'cafe\u0301']]) {
             const word = tokens(target)[0];
@@ -328,6 +345,19 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         type(inputs[1], 'bloc'); inputs = fields(render(props));
         assert.equal(inputs[1].props['data-subtitle-part-complete'], true);
         assert.equal(inputs[1].props.style.color, '#2f7d57'); assert.equal(subtitle.text, 'The block agreed.');
+    });
+    test('name fields never become inputs and newly identified names invalidate old answer indices: ' + file, () => {
+        const render=setup(); const text='Kherson was a city.';
+        const props={...base(),subtitle:{text},text};
+        let nodes=render(props),inputs=fields(nodes);
+        assert.equal(inputs.length,4); type(inputs[0],'wrong');
+        const correction={edits:[{kind:'name',to:'Kherson'}]};
+        nodes=render({...props,correction});inputs=fields(nodes);
+        assert.equal(inputs.length,3);assert.equal(inputs[0].props.value,'');
+        assert.equal(nodes.find(node=>node.props?.['data-subtitle-visible-name']).props.children,'Kherson');
+        type(inputs[0],'was');nodes=render({...props,correction});
+        assert.equal(fields(nodes)[0].props.value,'was');
+        assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true);
     });
     test('full subtitle editing is preserved and edited text becomes the next exercise: ' + file, () => {
         const render = setup(), props = base();

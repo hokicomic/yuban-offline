@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.242 · reference-name-alignment";
+const APP_VERSION = "v5.243 · names-visible-in-dictation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6287,15 +6287,23 @@ const isSubtitleReferenceNameWord = word => Boolean(word && !word.numeric &&
     !SUBTITLE_REFERENCE_NAME_EXCLUSIONS.has(word.key) && /^\p{Lu}[\p{L}\p{M}'’]+$/u.test(word.text));
 const findSubtitleReferenceNameMatch = (words, i, tokens, j, lineTexts) => {
     if (!isSubtitleReferenceNameWord(tokens[j]) || words.length < 8) return null;
+    // At cue start, a fuzzy name match must begin at the source name's
+    // beginning. Otherwise each suffix of a long name looks equally plausible.
+    const previous = tokens[j-1];
+    if (i === 0 && previous?.sourceLine === tokens[j].sourceLine &&
+        (isSubtitleReferenceNameWord(previous) || SUBTITLE_REFERENCE_NAME_CONNECTORS.has(previous.key)) &&
+        /^[\s\-’']*$/u.test(lineTexts.get(previous.sourceLine).slice(previous.end,tokens[j].start))) return null;
     const leftCount = Math.min(2, i);
     if (leftCount && !Array.from({length:leftCount},(_,offset)=>offset+1).every(offset => words[i-offset]?.key === tokens[j-offset]?.key)) return null;
     const refLine = tokens[j].sourceLine;
     // Capitalized source words identify the name; the ASR spelling and its word
     // count are deliberately not evidence. Exact surrounding words locate it.
     let maxReference = 1;
-    while (maxReference < 4 && tokens[j+maxReference]?.sourceLine === refLine) {
+    while (maxReference < 12 && tokens[j+maxReference]?.sourceLine === refLine) {
         const next = tokens[j+maxReference];
-        const connector = SUBTITLE_REFERENCE_NAME_CONNECTORS.has(next.key) && isSubtitleReferenceNameWord(tokens[j+maxReference+1]);
+        const connector = SUBTITLE_REFERENCE_NAME_CONNECTORS.has(next.key) && [1,2,3].some(offset =>
+            isSubtitleReferenceNameWord(tokens[j+maxReference+offset]) && Array.from({length:offset},(_,step)=>step).every(step =>
+                SUBTITLE_REFERENCE_NAME_CONNECTORS.has(tokens[j+maxReference+step]?.key)));
         if (!isSubtitleReferenceNameWord(next) && !connector) break;
         const gap = lineTexts.get(refLine).slice(tokens[j+maxReference-1].end,next.start);
         if (!/^[\s\-’']*$/u.test(gap)) break;
@@ -6304,7 +6312,7 @@ const findSubtitleReferenceNameMatch = (words, i, tokens, j, lineTexts) => {
     const matches = [];
     for (let refCount = 1; refCount <= maxReference; refCount++) {
         if (!isSubtitleReferenceNameWord(tokens[j+refCount-1])) continue;
-        for (let rawCount = 1; rawCount <= 4 && i+rawCount <= words.length; rawCount++) {
+        for (let rawCount = 1; rawCount <= 12 && i+rawCount <= words.length; rawCount++) {
             const rawWords = words.slice(i,i+rawCount);
             if (rawWords.some(word=>word.numeric || SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key))) continue;
             const rightCount = Math.min(leftCount < 2 ? 4 : 2,words.length-i-rawCount);
@@ -6335,12 +6343,13 @@ const isSubtitleReferenceDuplicateGap = (raw,words,i,tokens,j) => {
 };
 
 const createSubtitleReferenceResolver = searchIndex => {
-    const tokens = [], postings = new Map(), lineTexts = new Map();
+    const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map();
     for (const entry of searchIndex?.entries || []) {
         if (/[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)) continue;
         lineTexts.set(entry.sourceLine, entry.raw);
         for (const word of tokenizeSubtitleReferenceWords(entry.raw)) {
             const position = tokens.length;
+            if (!lineStarts.has(entry.sourceLine)) lineStarts.set(entry.sourceLine, position);
             tokens.push({ ...word, sourceLine: entry.sourceLine });
             if (word.key.length < 3 || KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key)) continue;
             const positions = postings.get(word.key) || [];
@@ -6386,6 +6395,8 @@ const createSubtitleReferenceResolver = searchIndex => {
             const expanded = new Set(starts);
             for (const position of anchor.positions) {
                 for (let dropped = -3; dropped <= 4; dropped++) if (position - anchor.index + dropped >= 0) expanded.add(position - anchor.index + dropped);
+                const lineStart = lineStarts.get(tokens[position].sourceLine);
+                if (isSubtitleReferenceNameWord(tokens[lineStart])) expanded.add(lineStart);
             }
             // A common secondary anchor must not discard a useful rare one.
             if (expanded.size > 128) { if (starts.size) break; continue; }
@@ -7681,7 +7692,7 @@ const paintSubtitleReferenceCorrections = (editor, text, projection) => {
     editor.replaceChildren(fragment);
 };
 
-const tokenizeSubtitlePractice = (text, language = 'en') => {
+const tokenizeSubtitlePractice = (text, language = 'en', nameHints = []) => {
     const source = String(text || '');
     let segmenter;
     try { segmenter = new Intl.Segmenter(language, { granularity: 'word' }); } catch (_) {}
@@ -7693,9 +7704,12 @@ const tokenizeSubtitlePractice = (text, language = 'en') => {
         return (chunk.match(/[\p{L}\p{M}\p{N}]+(?:['’ʼ][\p{L}\p{M}\p{N}]+)*|[^\p{L}\p{M}\p{N}]+/gu) || [])
             .map(text => ({ text, word: /[\p{L}\p{N}]/u.test(text) }));
     });
-    let wordIndex = 0;
+    const nameRanges = findSubtitlePracticeNameRanges(source, nameHints);
+    let wordIndex = 0, sourceOffset = 0;
     return pieces.map(piece => {
-        if (!piece.word) return { kind: 'literal', text: piece.text };
+        const start = sourceOffset; sourceOffset += piece.text.length;
+        const name = piece.word && nameRanges.some(range => start >= range.start && sourceOffset <= range.end);
+        if (!piece.word || name) return { kind: 'literal', text: piece.text, ...(name ? {name:true} : {}) };
         let partIndex = 0;
         const parts = (piece.text.match(/[\p{L}\p{M}\p{N}]+|[^\p{L}\p{M}\p{N}]+/gu) || [])
             .map(text => /[\p{L}\p{N}]/u.test(text)
@@ -7703,6 +7717,40 @@ const tokenizeSubtitlePractice = (text, language = 'en') => {
         return { kind: 'word', index: wordIndex++, parts };
     });
 };
+const findSubtitlePracticeNameRanges = (text, hints = []) => {
+    const source = String(text || '');
+    const words = Array.from(source.matchAll(/[\p{L}\p{M}]+(?:['’ʼ][\p{L}\p{M}]+)*/gu), match => ({ text:match[0], start:match.index, end:match.index+match[0].length,
+        key:match[0].normalize('NFKD').replace(/\p{M}/gu,'').replace(/[’ʼ]/g,"'").toLowerCase() }));
+    const connectors = new Set(['of','de','del','da','di','van','von','la','le','d']);
+    const ordinary = new Set(['a','an','the','i','we','you','he','she','it','they','this','that','these','those','but','and','or','at','in','on','to','as','with','after','before','once','according','earlier','later','meanwhile','officials','dozens','hundreds','thousands','politics','government','good','hello','hi','please','thanks','thank','yes','no','okay','well','now']);
+    const capitalized = word => word && !ordinary.has(word.key) && /^\p{Lu}[\p{L}\p{M}'’ʼ]+$/u.test(word.text);
+    const ranges = [];
+    for (let i=0;i<words.length;i++) {
+        if (!capitalized(words[i])) continue;
+        let end=i+1, capitals=1;
+        while (end<words.length && /^[\s\-’']*$/u.test(source.slice(words[end-1].end,words[end].start))) {
+            if (capitalized(words[end])) { capitals++; end++; }
+            else if (connectors.has(words[end].key) && [1,2,3].some(offset=>capitalized(words[end+offset]) &&
+                Array.from({length:offset},(_,step)=>step).every(step=>connectors.has(words[end+step]?.key))) &&
+                /^\s*$/u.test(source.slice(words[end].end,words[end+1]?.start))) end++;
+            else break;
+        }
+        const before=source.slice(0,words[i].start).replace(/\[[^\]]*\]|［[^］]*］/gu,'').trim();
+        const sentenceInitial=!before || /[.!?。！？][”’"')\]]*$/u.test(before);
+        // A lone capital at sentence start may just be normal capitalization.
+        // A multi-part name, a mid-sentence name, or a verified correction is
+        // stronger evidence. Ordinary sentence starters remain exercise words.
+        if (capitals>=2 || !sentenceInitial) ranges.push({start:words[i].start,end:words[end-1].end});
+        i=end-1;
+    }
+    for (const hint of hints || []) {
+        const keys=Array.from(String(hint).matchAll(/[\p{L}\p{M}]+(?:['’ʼ][\p{L}\p{M}]+)*/gu),m=>m[0].normalize('NFKD').replace(/\p{M}/gu,'').replace(/[’ʼ]/g,"'").toLowerCase());
+        if (!keys.length) continue;
+        for (let i=0;i+keys.length<=words.length;i++) if (keys.every((key,offset)=>words[i+offset].key===key)) ranges.push({start:words[i].start,end:words[i+keys.length-1].end});
+    }
+    return ranges.sort((a,b)=>a.start-b.start || b.end-a.end);
+};
+
 const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
 const splitSubtitlePracticeGraphemes = value => {
     const text = String(value || '');
@@ -7899,14 +7947,16 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const editorRef = useRef(null);
     const containerRef = useRef(null);
     const source = subtitle && editsRef.current.has(subtitle) ? editsRef.current.get(subtitle) : text;
-    const tokens = useMemo(() => tokenizeSubtitlePractice(source, language), [source, language]);
+    const nameHints = useMemo(() => correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to) || [], [correction]);
+    const tokens = useMemo(() => tokenizeSubtitlePractice(source, language, nameHints), [source, language, nameHints]);
+    const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => part.text).join('') : null)), [tokens]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
-    const answers = cached?.text === source ? cached.answers : {};
+    const answers = cached?.text === source && cached.signature === answerSignature ? cached.answers : {};
     const progress = getSubtitlePracticeProgress(tokens, answers);
-    React.useLayoutEffect(() => { composingBlankRef.current = null; lastBlankTapRef.current = null; handledTouchDoubleRef.current = null; }, [subtitle, source]);
+    React.useLayoutEffect(() => { composingBlankRef.current = null; lastBlankTapRef.current = null; handledTouchDoubleRef.current = null; }, [subtitle, source, answerSignature]);
     React.useLayoutEffect(() => {
         if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
-    }, [subtitle, source, blankMode, autoFocusEnabled]);
+    }, [subtitle, source, blankMode, autoFocusEnabled, answerSignature]);
     React.useLayoutEffect(() => {
         if (!advanceFocusRef.current) return;
         const answered = advanceFocusRef.current;
@@ -7925,9 +7975,9 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         setCopyNotice(null);
         composing = Boolean(composing || composingBlankRef.current === `${word.index}:${part.index}`);
         const latest = answerCache.current.get(subtitle);
-        const previous = latest?.text === source ? latest.answers : {};
+        const previous = latest?.text === source && latest.signature === answerSignature ? latest.answers : {};
         const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
-        answerCache.current.set(subtitle, { text: source, answers: next });
+        answerCache.current.set(subtitle, { text: source, signature: answerSignature, answers: next });
         advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticePartCorrect(part.text, next[word.index].values[part.index])) ? `${word.index}:${part.index}` : null;
         refreshAnswers(revision => revision + 1);
     };
@@ -8047,7 +8097,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             style={{ fontSize: `${blankMode ? Math.max(16, fontSize) : fontSize}px` }}>
             {blankMode && subtitle ? (
                 <div ref={containerRef}>
-                    {tokens.map((token, index) => token.kind === 'literal' ? <span key={index}>{token.text}</span> : (
+                    {tokens.map((token, index) => token.kind === 'literal' ? <span key={index} data-subtitle-visible-name={token.name || undefined}>{token.text}</span> : (
                         <span key={index} className="inline-block whitespace-nowrap align-baseline max-w-full">
                             {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : renderBlank(token, part, partIndex))}
                         </span>

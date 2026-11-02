@@ -135,6 +135,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     });
     test('source names override very different ASR spellings when surrounding words agree: ' + file, () => {
         for (const [ref,raw] of [
+            ['Luiz Inácio Lula da Silva was re-elected as Brazil’s president in a run-off election, winning 52% of the vote.',"Luis Inasio Luleva Silva was re-elected as Brazil's president in a run-off election, winning 52% of the vote."],
+            ['Maria Ana Julia Isabel Sofia de la Cruz Silva spoke to the delegates about regional security and future negotiations.','Mary Sivah spoke to the delegates about regional security and future negotiations.'],
             ['She made her first campaign speech in Orléans, a city closely associated with Joan of Arc.','She made her first campaign speech in Orgliant, a city closely associated with Joan of Arc.'],
             ['At its party congress the same weekend, her National Rally re-elected Jordan Bardella as its president.',"At its party congress the same weekend, her national rally re-elected Jean d 'Ambadelle as its president."],
             ['At its party congress the same weekend, her National Rally re-elected Jordan Bardella as its president.',"At its party congress the same weekend, her national rally re-elected Jean d'Ambadelle as its president."],
