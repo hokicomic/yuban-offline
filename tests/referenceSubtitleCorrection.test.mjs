@@ -155,6 +155,22 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.ok(api.findKnowledgePreciseSubtitleRanges(ref,raw).length);
         }
     });
+    test('equivalent first-name and full-name candidates do not reject a long paragraph cue: ' + file, () => {
+        const ref='Our heads spin from distraction politics, the body count increases, and our brains break, as contributor and previous guest editor Jia Tolentino puts it, from absorbing the unbelievable acts of cruelty that come across our transoms with no hope of abating.';
+        const raw='Our heads spin from distraction politics, the body count increases, and our brains break, as contributor and previous guest editor, Gia Tolentino, puts it, from absorbing the unbelievable acts of cruelty that come across our transoms, with no hope of abating.';
+        const prefix='No one can keep track of what happened in the previous month. ';
+        const suffix=' The essays collected in this volume appeared in print or online.';
+        const result=resolver(prefix+ref+suffix).resolve({text:raw});
+        assert.equal(result.trusted,true);assert.equal(result.text,raw.replace('Gia Tolentino','Jia Tolentino'));
+        assert.equal(result.edits.length,1);assert.equal(result.edits[0].to,'Jia Tolentino');
+        assert.equal(result.ranges[0].start,prefix.length);assert.equal(result.ranges[0].text,ref.slice(0,-1));
+        assert.ok(!result.ranges[0].text.includes('previous month'));assert.ok(!result.ranges[0].text.includes('essays collected'));
+        const precise=api.findKnowledgePreciseSubtitleRanges(prefix+ref+suffix,raw);
+        assert.deepEqual(Array.from(precise,range=>(prefix+ref+suffix).slice(range.start,range.end)),[ref.slice(0,-1)]);
+        const spellingVariants=resolver('The delegates discussed the final agreement with Jordan Bardella after the meeting.');
+        assert.equal(spellingVariants.resolve({text:'The delegates discussed the final agreement with Jorden Bardella after the meeting.'}).text,
+            'The delegates discussed the final agreement with Jordan Bardella after the meeting.');
+    });
     test('name correction rejects ambiguous references, weak context and numbers or ordinary words: ' + file, () => {
         const raw='The ceasefire was reportedly extended across the Haerson region.';
         const first='The ceasefire was reportedly extended across the Kherson region.';

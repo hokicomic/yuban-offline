@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.243 · names-visible-in-dictation";
+const APP_VERSION = "v5.244 · equivalent-name-candidates";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6345,7 +6345,17 @@ const findSubtitleReferenceNameMatch = (words, i, tokens, j, lineTexts) => {
             matches.push({ rawCount, refCount, text, refs });
         }
     }
-    return matches.length === 1 ? matches[0] : null;
+    if (!matches.length) return null;
+    // Matching only a wrong first name or matching the full name can produce
+    // the same correction when the surname is already right. These are one
+    // interpretation, not conflicting answers. Keep the full source name for
+    // display/dictation hints; different corrected word sequences stay unsafe.
+    const interpretations = new Set(matches.map(match => JSON.stringify([
+        ...words.slice(0,i).map(word=>word.key), ...match.refs.map(word=>word.key),
+        ...words.slice(i+match.rawCount).map(word=>word.key)
+    ])));
+    if (interpretations.size !== 1) return null;
+    return matches.sort((a,b)=>b.refCount-a.refCount || b.rawCount-a.rawCount)[0];
 };
 const isSubtitleReferenceDuplicateGap = (raw,words,i,tokens,j) => {
     const gap = raw.slice(words[i-1].end,words[i].start);
