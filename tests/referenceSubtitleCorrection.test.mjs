@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
     test('context corrects ASR spelling without changing timing, punctuation or the original subtitle: ' + file, () => {
         const cue = { id: 7, start: 10, end: 15, text: 'All the sinatures agreed to join the block tomorrow.' };
@@ -65,13 +65,73 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     });
     test('a new document rejects stale cursor coordinates before the deferred follower resets: ' + file, () => {
         const start = source.indexOf('    const currentSubtitleProjection = useMemo');
-        const end = source.indexOf('    useEffect(() => {',start);
+        const end = source.indexOf('    const currentSubtitlePresentation =',start);
         const cue = {text:"Marine Le Pen, the populace right front runner in next year's presidential election, officially launched her campaign."};
         const ref = cue.text.replace('populace','populist');
         const context = {useMemo:fn=>fn(), referenceSubtitleActive:true, subtitleReferenceResolver:resolver(ref), subtitles:[cue],currentIndex:0,
             embeddedKnowledgeText:ref,embeddedKnowledgePlaybackProgressRef:{current:{documentText:'previous document',maxSourceLine:120,anchorState:'anchored',subtitleIndex:0}}};
         const result = vm.runInNewContext(source.slice(start,end)+'\ncurrentSubtitleProjection',context);
         assert.equal(result.text,ref);assert.equal(result.changed,true);
+    });
+    test('internal missing articles and regular past tense align the supplied train and delegation examples: ' + file, () => {
+        for (const [ref,raw,expected] of [
+            ['One train was stationary, reportedly because of a computer-system failure.', 'One train was stationary, reportedly because of computer system failure.', 'One train was stationary, reportedly because of a computer system failure.'],
+            ['Dozens of African delegations travelled to Moscow for a summit with Vladimir Putin.', 'Dozens of African delegations travel to Moscow for a summit with Vladimir Putin.', 'Dozens of African delegations travelled to Moscow for a summit with Vladimir Putin.']
+        ]) {
+            const result=resolver(ref).resolve({text:raw});
+            assert.equal(result.text,expected);assert.equal(result.trusted,true);
+            assert.equal(result.ranges[0].text,ref.slice(0,-1));
+            assert.ok(api.findKnowledgePreciseSubtitleRanges(ref,raw).length);
+        }
+    });
+    test('numeric words and digits align by exact value without forcing digits into dictation: ' + file, () => {
+        const ref='According to the UN drone strikes killed over 300 people and injured hundreds more in the first three weeks of October.';
+        const raw='According to the UN, drone strikes killed over three hundred people and injured hundreds more in the first three weeks of October.';
+        const result=resolver(ref).resolve({text:raw});
+        assert.equal(result.trusted,true);assert.equal(result.text,raw);assert.equal(result.changed,false);
+        assert.equal(result.ranges[0].text,ref.slice(0,-1));assert.ok(api.findKnowledgePreciseSubtitleRanges(ref,raw).length);
+        const ref2="At least 100 people were killed and dozens more injured in an army drone strike on a market in Nyala, in Sudan’s Darfur region, which is controlled by the rebel Rapid Support Forces.";
+        const raw2="At least one hundred people were killed and dozens more injured in an army drone strike on a market in Niala in Sudan's Darfur region, which is controlled by the rebel rapid support forces.";
+        const mapped=resolver(ref2).resolve({text:raw2});
+        assert.equal(mapped.trusted,true);assert.equal(mapped.text,raw2.replace('Niala','Nyala'));
+        for(const [digits,words] of [['1,400','one thousand four hundred'],['120','one hundred and twenty'],['53','fifty-three'],['90%','ninety percent'],['1000000','one million']]) {
+            const a='The delegation counted '+digits+' confirmed votes in the latest election.';
+            const b='The delegation counted '+words+' confirmed votes in the latest election.';
+            assert.equal(resolver(a).resolve({text:b}).trusted,true,b);
+            assert.equal(resolver(b).resolve({text:a}).trusted,true,a);
+        }
+    });
+    test('common secondary anchors do not discard a rare numeric anchor: ' + file, () => {
+        const ref=Array.from({length:40},(_,i)=>`The signatories from district ${i} agreed to join the bloc tomorrow.`).join('\n');
+        const raw='The sinatures from district 0 agreed to join the block tomorrow.';
+        assert.equal(resolver(ref).resolve({text:raw}).text,'The signatories from district 0 agreed to join the bloc tomorrow.');
+    });
+    test('different number values, percent units and signs never receive a numeric match: ' + file, () => {
+        for(const [ref,raw] of [['300','one hundred'],['100','one two'],['90%','ninety'],['100','minus one hundred'],['100','-100'],['100','200']]) {
+            const a='The delegation counted '+ref+' confirmed votes in the latest election.';
+            const b='The delegation counted '+raw+' confirmed votes in the latest election.';
+            assert.equal(resolver(a).resolve({text:b}).trusted,false,b);
+            assert.equal(api.findKnowledgePreciseSubtitleRanges(a,b).length,0,b);
+        }
+    });
+    test('boundary omissions are reviewable suggestions until explicitly confirmed: ' + file, () => {
+        const ref="Officials from Pakistan, Saudi Arabia and Turkey, the three signatories to the new Mecca pact, travelled to Tehran to meet Iran’s security chief and president.";
+        const raw="from Pakistan, Saudi Arabia and Turkey, the three signatures to the new Mecca pact, travelled to Tehran to meet Iran's security chief and president.";
+        const result=resolver(ref).resolve({text:raw});
+        assert.equal(result.text,raw.replace('signatures','signatories'));
+        assert.equal(result.ranges[0].start,ref.indexOf('from'));
+        const suggestion=result.boundaryOmissions.find(item=>item.side==='leading');
+        assert.equal(suggestion.text,'Officials');
+        const accepted=api.applySubtitleReferenceBoundaryAcceptance(result,new Set([suggestion.signature]));
+        assert.equal(accepted.text,'Officials '+raw.replace('signatures','signatories'));
+        assert.equal(accepted.ranges[0].start,0);assert.equal(accepted.ranges[0].text,ref.slice(0,-1));
+        assert.equal(accepted.boundaryOmissions.length,0);assert.equal(accepted.acceptedBoundaryCount,1);
+        assert.equal(api.applySubtitleReferenceBoundaryAcceptance(result,new Set()),result,'undo restores the unextended cue');
+        const both=resolver('Earlier delegates agreed to sign the final regional trade treaty tomorrow.').resolve({text:'delegates agreed to sign the final regional trade treaty'});
+        assert.equal(both.boundaryOmissions.length,2);
+        const expanded=api.applySubtitleReferenceBoundaryAcceptance(both,new Set(both.boundaryOmissions.map(item=>item.signature)));
+        assert.equal(expanded.text,'Earlier delegates agreed to sign the final regional trade treaty tomorrow');
+        assert.equal(expanded.ranges[0].text,expanded.text);
     });
     test('a partial cue cannot borrow the rest of a sentence or fill internal missing words: ' + file, () => {
         const text = 'The member states agreed to join the bloc and strengthen their common policy.';

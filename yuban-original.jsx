@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.240 · clearer-correction-blue";
+const APP_VERSION = "v5.241 · resilient-reference-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6174,14 +6174,86 @@ const findKnowledgeExactSubtitleRanges = (text, subtitleText) => {
 };
 
 // A reference is evidence for spelling, not evidence that extra words were
-// spoken. Each accepted reference token must consume an existing subtitle token.
+// spoken. Map exact numeric values and narrowly bounded internal omissions;
+// boundary words require explicit review before extending the spoken cue.
+const SUBTITLE_NUMBER_SMALL = new Map('zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen'.split(' ').map((word, value) => [word, value]));
+const SUBTITLE_NUMBER_TENS = new Map(['twenty','thirty','forty','fifty','sixty','seventy','eighty','ninety'].map((word, i) => [word, 20 + i * 10]));
+const SUBTITLE_NUMBER_SCALES = new Map([['thousand',1000],['million',1000000],['billion',1000000000],['trillion',1000000000000]]);
+// Only parse grammatical cardinal numbers. "one two" is two separate values;
+// "100" and "three hundred" must never become interchangeable.
+const readSubtitleReferenceNumber = (words, start, text) => {
+    let index = start, total = 0, previousScale = Infinity, scaled = false;
+    const key = at => at > start && words[at] && !/^[\s\-‑–]*$/u.test(text.slice(words[at - 1].end, words[at].start)) ? undefined : words[at]?.key;
+    const underHundred = () => {
+        const word = key(index);
+        if (SUBTITLE_NUMBER_SMALL.has(word)) { index++; return SUBTITLE_NUMBER_SMALL.get(word); }
+        if (!SUBTITLE_NUMBER_TENS.has(word)) return null;
+        let value = SUBTITLE_NUMBER_TENS.get(word); index++;
+        if (SUBTITLE_NUMBER_SMALL.get(key(index)) >= 1 && SUBTITLE_NUMBER_SMALL.get(key(index)) <= 9) value += SUBTITLE_NUMBER_SMALL.get(key(index++));
+        return value;
+    };
+    const sign = ['minus','negative'].includes(key(index)) ? (index++, -1) : 1;
+    while (index < words.length) {
+        const groupStart = index;
+        let value = underHundred();
+        if (value === null && key(index) === 'a' && key(index + 1) === 'hundred') { value = 1; index++; }
+        if (value === null) break;
+        if (key(index) === 'hundred' && value >= 1 && value <= 9) {
+            value *= 100; index++;
+            const andIndex = index;
+            if (key(index) === 'and') index++;
+            const remainder = underHundred();
+            if (remainder !== null) value += remainder;
+            else index = andIndex;
+        }
+        const scale = SUBTITLE_NUMBER_SCALES.get(key(index));
+        if (scale && scale < previousScale && value > 0) {
+            total += value * scale; previousScale = scale; scaled = true; index++;
+            if (key(index) === 'and' && (SUBTITLE_NUMBER_SMALL.has(key(index + 1)) || SUBTITLE_NUMBER_TENS.has(key(index + 1)))) index++;
+            continue;
+        }
+        if (scale) { index = groupStart; break; }
+        total += value; break;
+    }
+    if (index === start || (index === start + 1 && sign === -1) || !Number.isSafeInteger(total)) return null;
+    // Do not swallow a trailing conjunction or turn malformed scales into a
+    // different number. Remaining words still have to align with the reference.
+    if (key(index - 1) === 'and') index--;
+    return { end: index, value: String(sign * total), scaled };
+};
+const normalizeSubtitleReferenceNumbers = (words, text) => {
+    const result = [];
+    for (let i = 0; i < words.length;) {
+        const word = words[i];
+        let numeric = /^\d+(?:,\d{3})*(?:\.\d+)?$/u.test(word.key) ? { end: i + 1, value: String(Number(word.key.replace(/,/g, ''))) } : readSubtitleReferenceNumber(words, i, text);
+        if (numeric && (!Number.isFinite(Number(numeric.value)) || Math.abs(Number(numeric.value)) > Number.MAX_SAFE_INTEGER)) numeric = null;
+        if (!numeric) { result.push(word); i++; continue; }
+        let end = numeric.end, unit = '';
+        if (words[end]?.key === 'percent') { end++; unit = '%'; }
+        else if (words[end]?.key === 'per' && words[end + 1]?.key === 'cent') { end += 2; unit = '%'; }
+        const last = words[end - 1];
+        const suffix = text.slice(last.end).match(/^\s*%/u);
+        const charEnd = suffix ? last.end + suffix[0].length : last.end;
+        const signed = /^\d/u.test(word.key) ? text.slice(0, word.start).match(/(?:^|[\s(=:])([−-])\s*$/u) : null;
+        if (signed) numeric.value = '-' + numeric.value;
+        if (suffix) unit = '%';
+        // A word such as "one" and a digit such as "1" share a key; keep
+        // original text/offsets for display and dictation, including "100" vs
+        // "one hundred". Values and percent units must match exactly.
+        result.push({ text: text.slice(word.start, charEnd), key: `#number:${numeric.value}${unit}`, start: signed ? word.start - signed[0].length + (/[\s(=:]/u.test(signed[0][0]) ? 1 : 0) : word.start, end: charEnd, numeric: true });
+        i = end;
+    }
+    return result;
+};
+
 const tokenizeSubtitleReferenceWords = value => {
     const text = String(value || '');
     const masked = text.replace(/\[[^\]]*\]|［[^］]*］|<[^>]*>|\*+|\{\{|\}\}/gu, match => ' '.repeat(match.length));
-    return Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,]\d+)*/gu), match => ({
+    const words = Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,]\d+)*/gu), match => ({
         text: match[0], key: match[0].normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/’/g, "'"),
         start: match.index, end: match.index + match[0].length
     }));
+    return normalizeSubtitleReferenceNumbers(words, text);
 };
 const SUBTITLE_REFERENCE_PROTECTED_WORDS = new Set(['not', 'no', 'never', 'without', 'with', 'before', 'after', 'more', 'less', 'increase', 'decrease', 'increased', 'decreased', 'increases', 'decreases', 'million', 'billion', 'may', 'must']);
 // Common emphatic/grammatical repetitions cannot be disambiguated by text alone.
@@ -6190,6 +6262,12 @@ const isSubtitleReferenceSpellingVariant = (a, b) => {
     if (a === b) return true;
     if (Math.min(a.length, b.length) < 4 || a[0] !== b[0] || /[\d']/u.test(a + b) ||
         SUBTITLE_REFERENCE_PROTECTED_WORDS.has(a) || SUBTITLE_REFERENCE_PROTECTED_WORDS.has(b)) return false;
+    const pastStem = value => {
+        if (!value.endsWith('ed')) return '';
+        const stem = value.slice(0, -2);
+        return /([b-df-hj-np-tv-z])\1$/u.test(stem) ? stem.slice(0, -1) : stem;
+    };
+    if (pastStem(a) === b || pastStem(b) === a) return true;
     const maxLength = Math.max(a.length, b.length);
     const limit = Math.min(a.length, b.length) >= 8 ? 4 : 2;
     if (Math.abs(a.length - b.length) > limit) return false;
@@ -6249,16 +6327,22 @@ const createSubtitleReferenceResolver = searchIndex => {
         const anchors = words.map((word, index) => ({ index, positions: postings.get(word.key) || [] }))
             .filter(anchor => anchor.positions.length > 0 && anchor.positions.length <= 96)
             .sort((a, b) => a.positions.length - b.positions.length).slice(0, 3);
-        const starts = new Set();
-        for (const anchor of anchors) for (const position of anchor.positions) {
-            for (let dropped = 0; dropped <= 2; dropped++) if (position - anchor.index + dropped >= 0) starts.add(position - anchor.index + dropped);
+        let starts = new Set();
+        for (const anchor of anchors) {
+            const expanded = new Set(starts);
+            for (const position of anchor.positions) {
+                for (let dropped = -1; dropped <= 2; dropped++) if (position - anchor.index + dropped >= 0) expanded.add(position - anchor.index + dropped);
+            }
+            // A common secondary anchor must not discard a useful rare one.
+            if (expanded.size > 128) { if (starts.size) break; continue; }
+            starts = expanded;
         }
         // A common short exact cue is still useful for highlighting, but never
         // scan the whole book to find it, nor guess which duplicate was spoken.
         if (!starts.size || starts.size > 128) return remember({ reason: 'no_unique_anchor' });
         const candidates = [];
         for (const start of starts) {
-            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0;
+            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0, omissions = 0;
             const edits = [], consumed = [];
             while (i < words.length && j < tokens.length) {
                 const word = words[i], ref = tokens[j];
@@ -6269,7 +6353,16 @@ const createSubtitleReferenceResolver = searchIndex => {
                     edits.push({ start: words[i - 1].end, end: word.end, text: '', from: word.text, to: '', kind: 'duplicate' });
                     duplicates++; i++; continue;
                 }
-                if (substitutions >= 2 || !near(word.key, ref.key)) break;
+                // Permit one missing internal article, with exact context on both
+                // sides. Never complete a cue by borrowing its first/last word.
+                if (!omissions && ['a', 'an', 'the'].includes(ref.key) && words.length >= 8 && i >= 2 && i + 1 < words.length &&
+                    words[i - 1].key === tokens[j - 1]?.key && words[i - 2].key === tokens[j - 2]?.key &&
+                    word.key === tokens[j + 1]?.key && words[i + 1].key === tokens[j + 2]?.key &&
+                    ref.sourceLine === tokens[j + 1]?.sourceLine) {
+                    edits.push({ start: word.start, end: word.start, text: ref.text + ' ', from: '', to: ref.text, kind: 'omission' });
+                    omissions++; consumed.push(ref); j++; continue;
+                }
+                if (substitutions >= 2 || word.numeric || ref.numeric || !near(word.key, ref.key)) break;
                 edits.push({ start: word.start, end: word.end, text: ref.text, from: word.text, to: ref.text, kind: 'spelling' });
                 substitutions++; consumed.push(ref); i++; j++;
             }
@@ -6281,7 +6374,7 @@ const createSubtitleReferenceResolver = searchIndex => {
             }
             if (i !== words.length || consumed.length < 2) continue;
             const changed = edits.length > 0;
-            const contentExact = new Set(words.filter(word => !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
+            const contentExact = new Set(words.filter(word => !word.numeric && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
             if (changed && (words.length < 5 || exact < 4 || exact / words.length < 0.72 || contentExact < 2 || edits.length > Math.max(1, Math.floor(words.length / 4)))) continue;
             // A spelling change at a cue boundary has less context. Require an
             // exact adjacent pair as well as the whole-window evidence above.
@@ -6297,7 +6390,7 @@ const createSubtitleReferenceResolver = searchIndex => {
             }
             if (sequential && sourceLine >= 0 && (ranges[0].sourceLine < sourceLine - 1 || ranges[0].sourceLine > sourceLine + 48)) continue;
             ranges.forEach(range => { range.text = lineTexts.get(range.sourceLine).slice(range.start, range.end); });
-            candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates, changed, trusted: true });
+            candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2, changed, trusted: true });
         }
         if (!candidates.length) return remember({ reason: 'no_bounded_word_alignment' });
         candidates.sort((a, b) => a.cost - b.cost);
@@ -6308,14 +6401,62 @@ const createSubtitleReferenceResolver = searchIndex => {
             if (local.length === 1) best = local;
         }
         if (best.length !== 1) return remember({ reason: 'ambiguous' });
-        return remember(best[0]);
+        const selected = best[0];
+        // A boundary omission is indistinguishable from a deliberately partial
+        // cue. Offer a review action; never silently extend the spoken range.
+        const boundaryOmissions = [];
+        if (words.length >= 8) {
+            for (const side of ['leading', 'trailing']) {
+                const range = side === 'leading' ? selected.ranges[0] : selected.ranges[selected.ranges.length - 1];
+                const line = lineTexts.get(range.sourceLine);
+                const fragment = side === 'leading' ? line.slice(0, range.start) : line.slice(range.end);
+                const missing = tokenizeSubtitleReferenceWords(fragment);
+                const cleanFragment = fragment.replace(/[.!?。！？]+[”’"')\]]*\s*$/u, '');
+                if (!missing.length || missing.length > 2 || /[.!?。！？]/u.test(cleanFragment)) continue;
+                const missingText = fragment.slice(missing[0].start, missing[missing.length - 1].end);
+                const expandedRange = { ...range,
+                    start: side === 'leading' ? missing[0].start : range.start,
+                    end: side === 'trailing' ? range.end + missing[missing.length - 1].end : range.end };
+                expandedRange.text = line.slice(expandedRange.start, expandedRange.end);
+                const at = side === 'leading' ? words[0].start : words[words.length - 1].end;
+                boundaryOmissions.push({ side, text: missingText, signature: JSON.stringify([side, expandedRange]),
+                    range: expandedRange, edit: { start: at, end: at, text: side === 'leading' ? missingText + ' ' : ' ' + missingText,
+                        from: '', to: missingText, kind: 'omission' } });
+            }
+        }
+        return remember({ ...selected, boundaryOmissions });
     };
     return { resolve, tokenCount: tokens.length };
+};
+const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
+    if (!projection?.trusted || !accepted?.size) return projection;
+    const additions = (projection.boundaryOmissions || []).filter(item => accepted.has(item.signature));
+    if (!additions.length) return projection;
+    const edits = [...projection.edits, ...additions.map(item => item.edit)];
+    let text = projection.raw;
+    for (const edit of [...edits].sort((a, b) => b.start - a.start || b.end - a.end)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
+    const ranges = projection.ranges.map(range => ({ ...range }));
+    for (const addition of additions) {
+        const index = addition.side === 'leading' ? 0 : ranges.length - 1;
+        const current = ranges[index];
+        const expanded = addition.range;
+        const start = Math.min(current.start, expanded.start), end = Math.max(current.end, expanded.end);
+        // Leading and trailing confirmations may touch the same source line.
+        const prefix = expanded.start < current.start ? expanded.text.slice(0, current.start - expanded.start) : '';
+        const suffix = expanded.end > current.end ? expanded.text.slice(current.end - expanded.start) : '';
+        ranges[index] = { ...current, start, end, text: prefix + current.text + suffix };
+    }
+    return { ...projection, text, changed: true, edits, ranges, acceptedBoundaryCount: additions.length,
+        boundaryOmissions: projection.boundaryOmissions.filter(item => !accepted.has(item.signature)) };
 };
 const findKnowledgePreciseSubtitleRanges = (source, subtitleText) => {
     // Exact short fragments need no correction inference. For transcription
     // errors require the same conservative word mapping as the caption path.
-    const exact = findKnowledgeExactSubtitleRanges(source, subtitleText);
+    const cueNumbers = tokenizeSubtitleReferenceWords(subtitleText).filter(word => word.numeric).map(word => word.key);
+    const exact = findKnowledgeExactSubtitleRanges(source, subtitleText).filter(range => {
+        const sourceNumbers = tokenizeSubtitleReferenceWords(String(source).slice(range.start, range.end)).filter(word => word.numeric).map(word => word.key);
+        return !sourceNumbers.length || cueNumbers.some((_, index) => sourceNumbers.every((key, offset) => cueNumbers[index + offset] === key));
+    });
     const local = createSubtitleReferenceResolver({ entries: [{ sourceLine: 0, raw: source }] }).resolve(subtitleText);
     if (local.reason === 'ambiguous' || local.reason === 'ambiguous_wording') return [];
     const mapped = local.trusted ? local.ranges.map(({ start, end }) => ({ start, end })) : [];
@@ -7447,7 +7588,7 @@ const getSubtitleCorrectionDisplayRanges = projection => {
     if (!projection?.changed) return [];
     const ranges = [];
     let offset = 0;
-    for (const edit of [...projection.edits].sort((a, b) => a.start - b.start)) {
+    for (const edit of [...projection.edits].sort((a, b) => a.start - b.start || a.end - b.end)) {
         if (edit.text) ranges.push({ start: edit.start + offset, end: edit.start + offset + edit.text.length });
         else if (edit.kind === 'duplicate') {
             const previous = projection.raw.slice(0, edit.start).match(/[\p{L}\p{M}\p{N}'’]+$/u);
@@ -7962,6 +8103,8 @@ export default function GeminiPlayer() {
     const [topPanelMode, setTopPanelMode] = useState('media'); // 'media' | 'document'
     const [embeddedKnowledgeText, setEmbeddedKnowledgeText] = useState("");
     const [referenceSubtitleCorrectionEnabled, setReferenceSubtitleCorrectionEnabled] = useState(true);
+    const referenceBoundaryAcceptancesRef = useRef(new WeakMap());
+    const [referenceBoundaryRevision, setReferenceBoundaryRevision] = useState(0);
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
@@ -18367,6 +18510,17 @@ ${userQ}`;
             sequential: sameDocument && progress.anchorState === 'anchored' && currentIndex >= progress.subtitleIndex && currentIndex - progress.subtitleIndex <= 2
         });
     }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText]);
+    const currentSubtitlePresentation = useMemo(() => applySubtitleReferenceBoundaryAcceptance(currentSubtitleProjection,
+        subtitles[currentIndex] && referenceBoundaryAcceptancesRef.current.get(subtitles[currentIndex])),
+    [currentSubtitleProjection, subtitles, currentIndex, referenceBoundaryRevision]);
+    const confirmReferenceBoundary = suggestion => {
+        const cue = subtitles[currentIndex];
+        if (!cue) return;
+        const accepted = referenceBoundaryAcceptancesRef.current.get(cue) || new Set();
+        accepted.add(suggestion.signature);
+        referenceBoundaryAcceptancesRef.current.set(cue, accepted);
+        setReferenceBoundaryRevision(revision => revision + 1);
+    };
     useEffect(() => {
         if (!referenceSubtitleActive) return;
         let cancelled = false, handle;
@@ -18387,10 +18541,12 @@ ${userQ}`;
     const referenceDocumentProjection = useMemo(() => {
         if (!referenceSubtitleActive) return null;
         const progress = embeddedKnowledgePlaybackProgressRef.current;
-        return subtitleReferenceResolver.resolve(subtitles[embeddedKnowledgeRenderIndex], {
+        const cue = subtitles[embeddedKnowledgeRenderIndex];
+        const projection = subtitleReferenceResolver.resolve(cue, {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
-    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText]);
+        return applySubtitleReferenceBoundaryAcceptance(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue));
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceBoundaryRevision]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
         const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;
@@ -20141,7 +20297,7 @@ ${userQ}`;
         else setEmbeddedKnowledgePanelHeight(height);
     };
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
-    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && currentSubtitleProjection?.trusted ? currentSubtitleProjection.text : subtitles[currentIndex]?.text) || "Load File...";
+    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.trusted ? currentSubtitlePresentation.text : subtitles[currentIndex]?.text) || "Load File...";
     // The divider keeps the top reference/media panel and the subtitle panel as
     // one adjustable reading surface.  The subtitle card itself flexes into all
     // remaining vertical space, so no empty strip is left below it.
@@ -21229,11 +21385,25 @@ ${userQ}`;
                                         <label className="inline-flex items-center gap-1 cursor-pointer">
                                             <input type="checkbox" checked={referenceSubtitleCorrectionEnabled} onChange={event => setReferenceSubtitleCorrectionEnabled(event.target.checked)} />參照校正字幕
                                         </label>
-                                        {referenceSubtitleCorrectionEnabled && currentSubtitleProjection?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitleProjection.raw}\n${currentSubtitleProjection.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : `${edit.from} → ${edit.to}`).join('；')}`}>已校正 {currentSubtitleProjection.edits.length} 處</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>已校正 {currentSubtitlePresentation.edits.length} 處</span>}
+                                    </div>
+                                )}
+                                {referenceSubtitleActive && referenceSubtitleCorrectionEnabled && !isSubtitleBlankMode && (
+                                    <div className="flex flex-wrap justify-center gap-2 text-[11px] text-slate-600">
+                                        {(currentSubtitlePresentation?.boundaryOmissions || []).map(suggestion => (
+                                            <button key={suggestion.signature} type="button" onClick={() => confirmReferenceBoundary(suggestion)}
+                                                title="請先確認音檔有說這些字，再補入目前字幕與聽寫答案"
+                                                className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-blue-700">
+                                                {suggestion.side === 'leading' ? '句首' : '句尾'}可能漏字：{suggestion.text} · 補回
+                                            </button>
+                                        ))}
+                                        {currentSubtitlePresentation?.acceptedBoundaryCount > 0 && <button type="button"
+                                            onClick={() => { referenceBoundaryAcceptancesRef.current.delete(subtitles[currentIndex]); setReferenceBoundaryRevision(revision => revision + 1); }}
+                                            className="rounded-full border border-slate-200 px-2 py-0.5">撤銷補字</button>}
                                     </div>
                                 )}
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
-                                    correction={referenceSubtitleCorrectionEnabled ? currentSubtitleProjection : null}
+                                    correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
                                     textRef={subtitleTextRef} editsRef={subtitleTextEditsRef}
                                     autoFocusEnabled={!showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode} />
