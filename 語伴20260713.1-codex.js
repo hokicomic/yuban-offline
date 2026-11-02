@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.245 · anchored-spelling-correction";
+const APP_VERSION = "v5.246 · context-first-reference-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6367,6 +6367,89 @@ const isSubtitleReferenceDuplicateGap = (raw,words,i,tokens,j) => {
         words[i+1]?.key === tokens[j]?.key && words[i+2]?.key === tokens[j+1]?.key;
 };
 
+// A second stage locates a cue from its ordered context even when an error
+// cannot pass a spelling test. Alignment confidence and permission to rewrite
+// a word are deliberately separate. Work is bounded by rare anchors and a band.
+const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {sourceLine=-1,sequential=false}={}) => {
+    const n=words.length, maxCost=3, band=3;
+    if (n<8) return null;
+    const plausible=[];
+    for (const start of starts) {
+        let evidence=0;
+        for (let i=0;i<n;i++) {
+            for (let delta=-band;delta<=band;delta++) if (start+i+delta>=start && tokens[start+i+delta]?.key===words[i].key) {evidence++;break;}
+        }
+        if (evidence>=Math.ceil(n*0.70)) plausible.push(start);
+    }
+    if (!plausible.length || plausible.length>24) return null;
+    const candidates=[];
+    for (const start of plausible) {
+        const m=Math.min(n+band,tokens.length-start), width=m+1;
+        const costs=new Uint8Array((n+1)*width);costs.fill(255);
+        const paths=new Uint8Array(costs.length);costs[0]=0;
+        const relax=(i,j,value,path)=>{const at=i*width+j;if(value<costs[at]){costs[at]=value;paths[at]=path;}};
+        for(let i=0;i<=n;i++) for(let j=Math.max(0,i-band);j<=Math.min(m,i+band);j++) {
+            const value=costs[i*width+j];if(value>maxCost)continue;
+            if(i<n && j<m) relax(i+1,j+1,value+(words[i].key===tokens[start+j].key?0:1),1);
+            if(i>0 && i<n && j<m) relax(i,j+1,value+1,2);
+            if(i>0 && i<n-1) relax(i+1,j,value+1,3);
+        }
+        let end=-1,best=255;
+        for(let j=Math.max(1,n-band);j<=m;j++) if(costs[n*width+j]<best){best=costs[n*width+j];end=j;}
+        if(best>maxCost || end<0)continue;
+        const operations=[];let i=n,j=end;
+        while(i||j){const path=paths[i*width+j];if(path===1){operations.push({kind:words[i-1].key===tokens[start+j-1].key?'equal':'replace',i:i-1,j:start+j-1});i--;j--;}
+            else if(path===2){operations.push({kind:'missing',i,j:start+j-1});j--;}
+            else if(path===3){operations.push({kind:'extra',i:i-1,j:start+j});i--;}else break;}
+        if(i||j)continue;
+        operations.reverse();
+        const exact=operations.filter(op=>op.kind==='equal').length;
+        const coverage=exact/Math.max(n,end);
+        const content=new Set(operations.filter(op=>op.kind==='equal' && !words[op.i].numeric && words[op.i].key.length>=3 && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(words[op.i].key)).map(op=>words[op.i].key)).size;
+        if(exact<6 || coverage<0.78 || content<3)continue;
+        const consumed=tokens.slice(start,start+end), ranges=[];
+        if(consumed.some((word,index)=>index>0 && word.sourceLine-consumed[index-1].sourceLine>4))continue;
+        for(const word of consumed){const last=ranges[ranges.length-1];if(last?.sourceLine===word.sourceLine)last.end=word.end;else ranges.push({sourceLine:word.sourceLine,start:word.start,end:word.end});}
+        if(sequential && sourceLine>=0 && (ranges[0].sourceLine<sourceLine-1 || ranges[0].sourceLine>sourceLine+48))continue;
+        ranges.forEach(range=>{range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end);});
+        const edits=[],reviewDifferences=[];
+        for(let pos=0;pos<operations.length;pos++){
+            const op=operations[pos];if(op.kind==='equal')continue;
+            const word=words[op.i],ref=tokens[op.j];
+            let left=0,right=0;
+            for(let k=pos-1;k>=0 && operations[k].kind==='equal';k--)left++;
+            for(let k=pos+1;k<operations.length && operations[k].kind==='equal';k++)right++;
+            const anchored=(left>=2 && right>=2)||(pos===0 && right>=6)||(pos===operations.length-1 && left>=6)||(left>=4 && right>=1 && pos+right===operations.length-1)||(right>=4 && left>=1 && pos-left===0);
+            let edit,automatic=false;
+            if(op.kind==='replace'){
+                edit={start:word.start,end:word.end,text:ref.text,from:word.text,to:ref.text,kind:isSubtitleReferenceNameWord(ref)?'name':'spelling'};
+                automatic=n>=10 && coverage>=0.90 && content>=4 && anchored && !word.numeric && !ref.numeric &&
+                    !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key) && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(ref.key);
+            } else if(op.kind==='missing'){
+                edit={start:word.start,end:word.start,text:ref.text+' ',from:'',to:ref.text,kind:'omission'};
+                automatic=coverage>=0.90 && left>=2 && right>=2 && ['a','an','the'].includes(ref.key);
+            } else {
+                const previous=words[op.i-1];
+                edit={start:previous.end,end:word.end,text:'',from:word.text,to:'',kind:'extra'};
+                // Other omitted/repeated content is a review decision, including
+                // genuine emphasis and changes to numeric/negative meanings.
+            }
+            if(automatic)edits.push(edit);
+            else reviewDifferences.push({side:'difference',text:op.kind==='missing'?`缺少 ${ref.text}`:op.kind==='extra'?`多出 ${word.text}`:`${word.text} → ${ref.text}`,
+                signature:JSON.stringify(['context',ranges,edit]),edit});
+        }
+        let text=raw;for(const edit of [...edits].sort((a,b)=>b.start-a.start || b.end-a.end))text=text.slice(0,edit.start)+edit.text+text.slice(edit.end);
+        candidates.push({start,text,edits,ranges,cost:best,coverage,changed:edits.length>0,aligned:true,trusted:reviewDifferences.length===0,
+            reviewDifferences,boundaryOmissions:[],alignmentMethod:'ordered_context',expectedWords:consumed.map(word=>word.key).join(' ')});
+    }
+    if(!candidates.length)return null;
+    candidates.sort((a,b)=>a.cost-b.cost || b.coverage-a.coverage);
+    let best=candidates.filter(item=>item.cost===candidates[0].cost && Math.abs(item.coverage-candidates[0].coverage)<0.0001);
+    if(new Set(best.map(item=>item.expectedWords)).size>1)return null;
+    if(best.length>1 && sourceLine>=0){const local=best.filter(item=>item.ranges.some(range=>Math.abs(range.sourceLine-sourceLine)<=4));if(local.length===1)best=local;}
+    return best.length===1?best[0]:null;
+};
+
 const createSubtitleReferenceResolver = searchIndex => {
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map();
     for (const entry of searchIndex?.entries || []) {
@@ -6503,7 +6586,11 @@ const createSubtitleReferenceResolver = searchIndex => {
             ranges.forEach(range => { range.text = lineTexts.get(range.sourceLine).slice(range.start, range.end); });
             candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2 + nameCorrections * 3, changed, trusted: true });
         }
-        if (!candidates.length) return remember({ reason: 'no_bounded_word_alignment' });
+        if (!candidates.length) {
+            const contextual=locateSubtitleReferenceContext(words,tokens,lineTexts,starts,raw,{sourceLine,sequential});
+            if (contextual) candidates.push(contextual);
+            else return remember({ reason: 'no_bounded_word_alignment' });
+        }
         candidates.sort((a, b) => a.cost - b.cost);
         let best = candidates.filter(candidate => candidate.cost === candidates[0].cost);
         if (new Set(best.map(candidate => candidate.text)).size > 1) return remember({ reason: 'ambiguous_wording' });
@@ -6522,7 +6609,7 @@ const createSubtitleReferenceResolver = searchIndex => {
                 const line = lineTexts.get(range.sourceLine);
                 const fragment = side === 'leading' ? line.slice(0, range.start) : line.slice(range.end);
                 const missing = tokenizeSubtitleReferenceWords(fragment);
-                const cleanFragment = fragment.replace(/[.!?。！？]+[”’"')\]]*\s*$/u, '');
+                const cleanFragment = side === 'trailing' ? fragment.replace(/[.!?。！？]+[”’"')\]]*\s*$/u, '') : fragment;
                 if (!missing.length || missing.length > 2 || /[.!?。！？]/u.test(cleanFragment)) continue;
                 const missingText = fragment.slice(missing[0].start, missing[missing.length - 1].end);
                 const expandedRange = { ...range,
@@ -6535,19 +6622,20 @@ const createSubtitleReferenceResolver = searchIndex => {
                         from: '', to: missingText, kind: 'omission' } });
             }
         }
-        return remember({ ...selected, boundaryOmissions });
+        return remember({ ...selected, aligned: true, alignmentMethod: selected.alignmentMethod || 'word_mapping', boundaryOmissions });
     };
     return { resolve, tokenCount: tokens.length };
 };
 const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
-    if (!projection?.trusted || !accepted?.size) return projection;
-    const additions = (projection.boundaryOmissions || []).filter(item => accepted.has(item.signature));
+    if (!(projection?.trusted || projection?.aligned) || !accepted?.size) return projection;
+    const additions = [...(projection.boundaryOmissions || []), ...(projection.reviewDifferences || [])].filter(item => accepted.has(item.signature));
     if (!additions.length) return projection;
     const edits = [...projection.edits, ...additions.map(item => item.edit)];
     let text = projection.raw;
-    for (const edit of [...edits].sort((a, b) => b.start - a.start || b.end - a.end)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
+    for (const {edit} of edits.map((edit,order)=>({edit,order})).sort((a,b)=>b.edit.start-a.edit.start || b.edit.end-a.edit.end || b.order-a.order)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
     const ranges = projection.ranges.map(range => ({ ...range }));
     for (const addition of additions) {
+        if (addition.side === 'difference') continue;
         const index = addition.side === 'leading' ? 0 : ranges.length - 1;
         const current = ranges[index];
         const expanded = addition.range;
@@ -6557,8 +6645,11 @@ const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
         const suffix = expanded.end > current.end ? expanded.text.slice(current.end - expanded.start) : '';
         ranges[index] = { ...current, start, end, text: prefix + current.text + suffix };
     }
-    return { ...projection, text, changed: true, edits, ranges, acceptedBoundaryCount: additions.length,
-        boundaryOmissions: projection.boundaryOmissions.filter(item => !accepted.has(item.signature)) };
+    const reviewDifferences=(projection.reviewDifferences || []).filter(item=>!accepted.has(item.signature));
+    return { ...projection, text, changed: true, edits, ranges, trusted: reviewDifferences.length===0,
+        acceptedBoundaryCount: additions.filter(item=>item.side!=='difference').length,
+        acceptedReviewCount: additions.filter(item=>item.side==='difference').length, reviewDifferences,
+        boundaryOmissions: (projection.boundaryOmissions || []).filter(item => !accepted.has(item.signature)) };
 };
 const findKnowledgePreciseSubtitleRanges = (source, subtitleText) => {
     // Exact short fragments need no correction inference. For transcription
@@ -6570,7 +6661,7 @@ const findKnowledgePreciseSubtitleRanges = (source, subtitleText) => {
     });
     const local = createSubtitleReferenceResolver({ entries: [{ sourceLine: 0, raw: source }] }).resolve(subtitleText);
     if (local.reason === 'ambiguous' || local.reason === 'ambiguous_wording') return [];
-    const mapped = local.trusted ? local.ranges.map(({ start, end }) => ({ start, end })) : [];
+    const mapped = (local.aligned || local.trusted) ? local.ranges.map(({ start, end }) => ({ start, end })) : [];
     const ranges = mapped.length ? mapped : exact;
     return ranges.sort((a, b) => a.start - b.start).filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
 };
@@ -18764,7 +18855,7 @@ ${userQ}`;
                 : (isAnchored ? Infinity : INITIAL_ANCHOR_MAX_LINES));
         const allRawMatches = Number.isInteger(manualSourceLine) && manualSourceLine >= 0
             ? [{ sourceLine: manualSourceLine, score: 1, manual: true }]
-            : referenceDocumentProjection?.trusted ? referenceDocumentProjection.ranges.map(range => ({ sourceLine: range.sourceLine, score: 1, verifiedWords: true }))
+            : (referenceDocumentProjection?.aligned || referenceDocumentProjection?.trusted) ? referenceDocumentProjection.ranges.map(range => ({ sourceLine: range.sourceLine, score: 1, verifiedWords: Boolean(referenceDocumentProjection.trusted), contextAligned: Boolean(referenceDocumentProjection.aligned) }))
             : locatedCue ? [{ sourceLine: locatedCue.sourceLine, score: locatedCue.score }]
             : findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics, {
                 index: embeddedKnowledgeAlignmentIndex,
@@ -18909,8 +19000,8 @@ ${userQ}`;
     useEffect(() => {
         setEmbeddedKnowledgeMatchCandidates(embeddedKnowledgeMatchCandidatesRef.current || []);
     }, [embeddedKnowledgeDocumentKey, embeddedKnowledgeRenderIndex, embeddedKnowledgeSubtitleMatches]);
-    const embeddedKnowledgeLineTexts = useMemo(() => referenceDocumentProjection?.trusted ? referenceDocumentProjection.ranges : [], [referenceDocumentProjection]);
-    const embeddedKnowledgeSourceLines = useMemo(() => referenceDocumentProjection?.trusted
+    const embeddedKnowledgeLineTexts = useMemo(() => (referenceDocumentProjection?.aligned || referenceDocumentProjection?.trusted) ? referenceDocumentProjection.ranges : [], [referenceDocumentProjection]);
+    const embeddedKnowledgeSourceLines = useMemo(() => (referenceDocumentProjection?.aligned || referenceDocumentProjection?.trusted)
         ? [...new Set(referenceDocumentProjection.ranges.map(range => range.sourceLine))] : embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine),
     [referenceDocumentProjection, embeddedKnowledgeSubtitleMatches]);
     const copyEmbeddedKnowledgeAlignmentLog = useCallback(async () => {
@@ -19353,7 +19444,7 @@ ${userQ}`;
         onActiveKnowledgeTermsChange: syncOpenKnowledgePreviewToActiveTerm,
         activeKnowledgeSourceLines: embeddedKnowledgeSourceLines,
         activeKnowledgeLineTexts: embeddedKnowledgeLineTexts,
-        activeKnowledgeSubtitleText: referenceDocumentProjection?.trusted ? referenceDocumentProjection.text : subtitles[embeddedKnowledgeRenderIndex]?.text || "",
+        activeKnowledgeSubtitleText: (referenceDocumentProjection?.aligned || referenceDocumentProjection?.trusted) ? referenceDocumentProjection.text : subtitles[embeddedKnowledgeRenderIndex]?.text || "",
         treatWholeDocumentAsOriginal: embeddedKnowledgeAlignmentIndex.useWholeDocument,
         manualKnowledgeAnchorMode: embeddedKnowledgeManualAnchorMode,
         onKnowledgeSourceLineConfirm: handleEmbeddedKnowledgeSourceLineConfirm
@@ -20438,7 +20529,7 @@ ${userQ}`;
         else setEmbeddedKnowledgePanelHeight(height);
     };
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
-    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.trusted ? currentSubtitlePresentation.text : subtitles[currentIndex]?.text) || "Load File...";
+    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && (currentSubtitlePresentation?.aligned || currentSubtitlePresentation?.trusted) ? currentSubtitlePresentation.text : subtitles[currentIndex]?.text) || "Load File...";
     // The divider keeps the top reference/media panel and the subtitle panel as
     // one adjustable reading surface.  The subtitle card itself flexes into all
     // remaining vertical space, so no empty strip is left below it.
@@ -21523,21 +21614,23 @@ ${userQ}`;
                                         <label className="inline-flex items-center gap-1 cursor-pointer">
                                             <input type="checkbox" checked={referenceSubtitleCorrectionEnabled} onChange={event => setReferenceSubtitleCorrectionEnabled(event.target.checked)} />參照校正字幕
                                         </label>
-                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>已校正 {currentSubtitlePresentation.edits.length} 處</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
+                                            <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'extra' ? `刪除多字：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>已校正 {currentSubtitlePresentation.edits.length} 處</span>}
                                     </div>
                                 )}
                                 {referenceSubtitleActive && referenceSubtitleCorrectionEnabled && !isSubtitleBlankMode && (
                                     <div className="flex flex-wrap justify-center gap-2 text-[11px] text-slate-600">
-                                        {(currentSubtitlePresentation?.boundaryOmissions || []).map(suggestion => (
+                                        {[...(currentSubtitlePresentation?.boundaryOmissions || []), ...(currentSubtitlePresentation?.reviewDifferences || [])].map(suggestion => (
                                             <button key={suggestion.signature} type="button" onClick={() => confirmReferenceBoundary(suggestion)}
                                                 title="請先確認音檔有說這些字，再補入目前字幕與聽寫答案"
                                                 className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-blue-700">
-                                                {suggestion.side === 'leading' ? '句首' : '句尾'}可能漏字：{suggestion.text} · 補回
+                                                {suggestion.side === 'difference' ? '文字差異：' : suggestion.side === 'leading' ? '句首可能漏字：' : '句尾可能漏字：'}{suggestion.text} · {suggestion.side === 'difference' ? '採用文本' : '補回'}
                                             </button>
                                         ))}
-                                        {currentSubtitlePresentation?.acceptedBoundaryCount > 0 && <button type="button"
+                                        {(currentSubtitlePresentation?.acceptedBoundaryCount > 0 || currentSubtitlePresentation?.acceptedReviewCount > 0) && <button type="button"
                                             onClick={() => { referenceBoundaryAcceptancesRef.current.delete(subtitles[currentIndex]); setReferenceBoundaryRevision(revision => revision + 1); }}
-                                            className="rounded-full border border-slate-200 px-2 py-0.5">撤銷補字</button>}
+                                            className="rounded-full border border-slate-200 px-2 py-0.5">{currentSubtitlePresentation?.acceptedReviewCount > 0 ? '撤銷確認' : '撤銷補字'}</button>}
                                     </div>
                                 )}
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}

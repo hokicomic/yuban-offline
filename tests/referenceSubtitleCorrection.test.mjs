@@ -106,12 +106,14 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const raw='The sinatures from district 0 agreed to join the block tomorrow.';
         assert.equal(resolver(ref).resolve({text:raw}).text,'The signatories from district 0 agreed to join the bloc tomorrow.');
     });
-    test('different number values, percent units and signs never receive a numeric match: ' + file, () => {
+    test('different number values, percent units and signs can align but require explicit correction review: ' + file, () => {
         for(const [ref,raw] of [['300','one hundred'],['100','one two'],['90%','ninety'],['100','minus one hundred'],['100','-100'],['100','200']]) {
             const a='The delegation counted '+ref+' confirmed votes in the latest election.';
             const b='The delegation counted '+raw+' confirmed votes in the latest election.';
             assert.equal(resolver(a).resolve({text:b}).trusted,false,b);
-            assert.equal(api.findKnowledgePreciseSubtitleRanges(a,b).length,0,b);
+            const located=resolver(a).resolve({text:b});
+            assert.equal(located.changed,false,b);assert.equal(located.aligned,true,b);assert.ok(located.reviewDifferences.length,b);
+            assert.ok(api.findKnowledgePreciseSubtitleRanges(a,b).length,b);
         }
     });
     test('boundary omissions are reviewable suggestions until explicitly confirmed: ' + file, () => {
@@ -188,6 +190,51 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(resolver(protectedRaw.replace('now','not')).resolve({text:protectedRaw}).changed,false);
         const wrongContext=raw.replace('anything but the nearest','anything near the nearest');
         assert.equal(resolver(ref).resolve({text:wrongContext}).changed,false,'local context must be exact');
+    });
+    test('context locates and corrects a cue-final ASR error despite punctuation and hyphen differences: ' + file, () => {
+        const ref='Sometimes it feels less dire—or, at least, more philosophical—to cling to other-than-living-in-hell notions.';
+        const raw='Sometimes it feels less dire, or at least more philosophical, to cling to other -than-living-in-hell motions.';
+        const prefix='Prior sentence. '; const suffix=' For example, perhaps we are a projection from consciousness.';
+        const result=resolver(prefix+ref+suffix).resolve({text:raw});
+        assert.equal(result.aligned,true);assert.equal(result.text,raw.replace('motions','notions'));assert.equal(result.trusted,true);
+        assert.equal(result.alignmentMethod,'ordered_context');assert.equal(result.ranges[0].text,ref.slice(0,-1));
+        assert.equal(result.boundaryOmissions.length,0,'a preceding complete sentence is not a missing boundary word');
+        assert.equal(resolver(prefix+ref+suffix).resolve({text:raw.replace('motions','notions')}).trusted,true);
+        assert.deepEqual(Array.from(api.findKnowledgePreciseSubtitleRanges(prefix+ref+suffix,raw),range=>(prefix+ref+suffix).slice(range.start,range.end)),[ref.slice(0,-1)]);
+    });
+    test('whole-cue context can correct a local word without a spelling-distance gate: ' + file, () => {
+        const ref='The researchers carefully reviewed all the evidence before describing the event as an unprecedented catastrophe.';
+        const raw=ref.replace('catastrophe','banana');
+        const result=resolver(ref).resolve({text:raw});
+        assert.equal(result.aligned,true);assert.equal(result.text,ref);assert.equal(result.trusted,true);
+        const competing=ref+'\n'+ref.replace('catastrophe','maelstrom');
+        assert.equal(resolver(competing).resolve({text:raw}).changed,false,'two equally supported reference wordings are not guessed');
+        assert.equal(resolver(ref).resolve({text:'The people described a surprising banana.'}).aligned,undefined);
+    });
+    test('locating a numeric or internal omission difference does not silently rewrite it: ' + file, () => {
+        const ref='The researchers reviewed all the evidence and counted 300 confirmed reports in the final study.';
+        const raw=ref.replace('300','200');const engine=resolver(ref);const cue={text:raw,start:5,end:10};
+        const result=engine.resolve(cue);
+        assert.equal(result.aligned,true);assert.equal(result.trusted,false);assert.equal(result.changed,false);assert.equal(result.text,raw);
+        const accepted=api.applySubtitleReferenceBoundaryAcceptance(result,new Set(result.reviewDifferences.map(item=>item.signature)));
+        assert.equal(accepted.text,ref);assert.equal(accepted.trusted,true);assert.equal(accepted.acceptedReviewCount,1);
+        assert.equal(api.applySubtitleReferenceBoundaryAcceptance(result,new Set()),result);assert.equal(cue.text,raw);
+        const original='The delegates reviewed all the evidence and finally agreed to sign the regional treaty yesterday.';
+        const missing=original.replace('finally ','');const omission=resolver(original).resolve({text:missing});
+        assert.equal(omission.aligned,true);assert.equal(omission.changed,false);assert.ok(omission.reviewDifferences.length);
+        const restored=api.applySubtitleReferenceBoundaryAcceptance(omission,new Set(omission.reviewDifferences.map(item=>item.signature)));
+        assert.equal(restored.text,original);
+    });
+    test('reviewed multi-word omissions retain reference order and extra words are never auto-deleted: ' + file, () => {
+        const ref='The delegates examined all the available evidence and then carefully reviewed the final document before signing the regional treaty yesterday.';
+        const raw=ref.replace('carefully reviewed ','');
+        const result=resolver(ref).resolve({text:raw});
+        assert.equal(result.aligned,true);assert.equal(result.changed,false);
+        assert.equal(api.applySubtitleReferenceBoundaryAcceptance(result,new Set(result.reviewDifferences.map(item=>item.signature))).text,ref);
+        const extra=ref.replace('evidence and','evidence strangely maybe and');
+        const withExtra=resolver(ref).resolve({text:extra});
+        assert.equal(withExtra.aligned,true);assert.equal(withExtra.changed,false);
+        assert.equal(api.applySubtitleReferenceBoundaryAcceptance(withExtra,new Set(withExtra.reviewDifferences.map(item=>item.signature))).text,ref);
     });
     test('name correction rejects ambiguous references, weak context and numbers or ordinary words: ' + file, () => {
         const raw='The ceasefire was reportedly extended across the Haerson region.';
