@@ -359,6 +359,16 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(fields(nodes)[0].props.value,'was');
         assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true);
     });
+    test('provisional text and original text selections change the actual blank answer and reset its draft: ' + file, () => {
+        const render=setup();const raw='They counted 200 votes.';
+        const props={...base(),subtitle:{text:raw},text:'They counted 300 votes.'};
+        let inputs=fields(render(props));type(inputs[2],'300');inputs=fields(render(props));
+        assert.equal(inputs[2].props['data-subtitle-part-complete'],true);
+        const original={...props,text:raw};inputs=fields(render(original));assert.equal(inputs[2].props.value,'');
+        type(inputs[2],'300');inputs=fields(render(original));assert.equal(inputs[2].props['data-subtitle-part-complete'],false);
+        type(inputs[2],'200');inputs=fields(render(original));assert.equal(inputs[2].props['data-subtitle-part-complete'],true);
+        assert.equal(props.subtitle.text,raw);
+    });
     test('full subtitle editing is preserved and edited text becomes the next exercise: ' + file, () => {
         const render = setup(), props = base();
         const editor = render({ ...props, blankMode: false }).find(node => node.props?.role === 'textbox');

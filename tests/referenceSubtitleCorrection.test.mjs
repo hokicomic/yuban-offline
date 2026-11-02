@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, getSubtitleReferenceStatus})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
     test('context corrects ASR spelling without changing timing, punctuation or the original subtitle: ' + file, () => {
         const cue = { id: 7, start: 10, end: 15, text: 'All the sinatures agreed to join the block tomorrow.' };
@@ -263,6 +263,27 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const engine=resolver(book);const cue={text:raw};
         assert.equal(engine.resolve(cue).trusted,false);
         assert.equal(engine.resolve(cue,{sourceLine:1}).text,ref);
+    });
+    test('located review differences provisionally prefer reference text without confirming them: ' + file, () => {
+        const ref='The researchers reviewed all the evidence and counted 300 confirmed reports in the final study.';
+        const raw=ref.replace('300','200');const cue={text:raw};
+        const base=resolver(ref).resolve(cue);const signature=base.reviewDifferences[0].signature;
+        const preferred=api.applySubtitleReferencePreference(base);
+        assert.equal(preferred.text,ref);assert.equal(preferred.provisionalReviewCount,1);
+        assert.equal(preferred.reviewDifferences.length,1);assert.equal(preferred.trusted,false);
+        assert.match(api.getSubtitleReferenceStatus({active:true,hasText:true,hasCue:true,enabled:true,projection:preferred}).text,/待確認/);
+        const originals=new Set([signature]);
+        const reverted=api.applySubtitleReferencePreference(base,null,originals);
+        assert.equal(reverted.text,raw);assert.equal(reverted.provisionalReviewCount,0);assert.equal(reverted.originalReviewCount,1);
+        assert.equal(api.applySubtitleReferencePreference(base,null,originals).text,raw,'the original choice survives another render/replay');
+        const confirmed=api.applySubtitleReferencePreference(base,new Set([signature]),originals);
+        assert.equal(confirmed.text,ref);assert.equal(confirmed.reviewDifferences.length,0);assert.equal(confirmed.trusted,true);
+        assert.equal(cue.text,raw);assert.equal(base.text,raw,'provisional preference never mutates raw cues or cached alignment');
+        const original='The delegates examined all the evidence and then carefully reviewed the final document before signing the regional treaty yesterday.';
+        const missing=original.replace('carefully reviewed ','');
+        assert.equal(api.applySubtitleReferencePreference(resolver(original).resolve({text:missing})).text,original);
+        const boundary=resolver('Officials from Pakistan and Turkey agreed to sign the regional treaty today.').resolve({text:'from Pakistan and Turkey agreed to sign the regional treaty today.'});
+        assert.equal(api.applySubtitleReferencePreference(boundary).text,'from Pakistan and Turkey agreed to sign the regional treaty today.','possible boundary words are not silently added');
     });
     test('name correction rejects ambiguous references, weak context and numbers or ordinary words: ' + file, () => {
         const raw='The ceasefire was reportedly extended across the Haerson region.';

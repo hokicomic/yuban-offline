@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.248 · consistent-reference-evidence";
+const APP_VERSION = "v5.249 · reference-first-dictation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6685,6 +6685,20 @@ const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
         acceptedReviewCount: additions.filter(item=>item.side==='difference').length, reviewDifferences,
         boundaryOmissions: (projection.boundaryOmissions || []).filter(item => !accepted.has(item.signature)) };
 };
+const applySubtitleReferencePreference = (projection, accepted, originals) => {
+    const confirmed=applySubtitleReferenceBoundaryAcceptance(projection,accepted);
+    if (!(confirmed?.aligned || confirmed?.trusted) || !confirmed.reviewDifferences?.length) return confirmed;
+    // Text is the default answer for located review differences, but this is a
+    // provisional preference, never an implicit confirmation. Boundary omissions
+    // still need the explicit action above. Original choices persist per cue.
+    const pending=confirmed.reviewDifferences;
+    const preferred=pending.filter(item=>!originals?.has(item.signature));
+    const provisional=applySubtitleReferenceBoundaryAcceptance(confirmed,new Set(preferred.map(item=>item.signature)));
+    return {...provisional,trusted:confirmed.trusted,reviewDifferences:pending,
+        acceptedBoundaryCount:confirmed.acceptedBoundaryCount || 0,acceptedReviewCount:confirmed.acceptedReviewCount || 0,
+        provisionalReviewCount:preferred.length,provisionalReviewSignatures:preferred.map(item=>item.signature),
+        originalReviewCount:pending.length-preferred.length};
+};
 const findKnowledgePreciseSubtitleRanges = (source, subtitleText) => {
     // Exact short fragments need no correction inference. For transcription
     // errors require the same conservative word mapping as the caption path.
@@ -8379,6 +8393,7 @@ export default function App() {
     const [embeddedKnowledgeText, setEmbeddedKnowledgeText] = useState("");
     const [referenceSubtitleCorrectionEnabled, setReferenceSubtitleCorrectionEnabled] = useState(true);
     const referenceBoundaryAcceptancesRef = useRef(new WeakMap());
+    const referenceOriginalDifferencesRef = useRef(new WeakMap());
     const [referenceBoundaryRevision, setReferenceBoundaryRevision] = useState(0);
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
@@ -18781,16 +18796,34 @@ ${userQ}`;
         });
     }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText,
         embeddedKnowledgePlaybackProgressRef.current.maxSourceLine, embeddedKnowledgePlaybackProgressRef.current.anchorState, embeddedKnowledgePlaybackProgressRef.current.subtitleIndex]);
-    const currentSubtitlePresentation = useMemo(() => applySubtitleReferenceBoundaryAcceptance(currentSubtitleProjection,
-        subtitles[currentIndex] && referenceBoundaryAcceptancesRef.current.get(subtitles[currentIndex])),
+    const currentSubtitlePresentation = useMemo(() => applySubtitleReferencePreference(currentSubtitleProjection,
+        subtitles[currentIndex] && referenceBoundaryAcceptancesRef.current.get(subtitles[currentIndex]),
+        subtitles[currentIndex] && referenceOriginalDifferencesRef.current.get(subtitles[currentIndex])),
     [currentSubtitleProjection, subtitles, currentIndex, referenceBoundaryRevision]);
     const confirmReferenceBoundary = suggestion => {
         const cue = subtitles[currentIndex];
         if (!cue) return;
         const accepted = referenceBoundaryAcceptancesRef.current.get(cue) || new Set();
         accepted.add(suggestion.signature);
+        referenceOriginalDifferencesRef.current.get(cue)?.delete(suggestion.signature);
         referenceBoundaryAcceptancesRef.current.set(cue, accepted);
         setReferenceBoundaryRevision(revision => revision + 1);
+    };
+    const useOriginalReferenceDifference = suggestion => {
+        const cue=subtitles[currentIndex];if (!cue) return;
+        const originals=referenceOriginalDifferencesRef.current.get(cue) || new Set();
+        originals.add(suggestion.signature);referenceOriginalDifferencesRef.current.set(cue,originals);
+        referenceBoundaryAcceptancesRef.current.get(cue)?.delete(suggestion.signature);
+        setReferenceBoundaryRevision(revision=>revision+1);
+    };
+    const undoReferenceConfirmations = () => {
+        const cue=subtitles[currentIndex];if (!cue) return;
+        const accepted=referenceBoundaryAcceptancesRef.current.get(cue);
+        const originals=referenceOriginalDifferencesRef.current.get(cue) || new Set();
+        for (const difference of currentSubtitleProjection?.reviewDifferences || []) if (accepted?.has(difference.signature)) originals.add(difference.signature);
+        referenceOriginalDifferencesRef.current.set(cue,originals);
+        referenceBoundaryAcceptancesRef.current.delete(cue);
+        setReferenceBoundaryRevision(revision=>revision+1);
     };
     useEffect(() => {
         if (!referenceSubtitleActive) return;
@@ -18817,7 +18850,7 @@ ${userQ}`;
         const projection = subtitleReferenceResolver.resolve(cue, {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
-        return applySubtitleReferenceBoundaryAcceptance(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue));
+        return applySubtitleReferencePreference(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue), cue && referenceOriginalDifferencesRef.current.get(cue));
     }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceBoundaryRevision, currentIndex, currentSubtitlePresentation]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
@@ -21664,20 +21697,31 @@ ${userQ}`;
                                         </label>
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
                                             <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
-                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'extra' ? `刪除多字：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>已校正 {currentSubtitlePresentation.edits.length} 處</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.originalReviewCount > 0 &&
+                                            <span>依原字幕 {currentSubtitlePresentation.originalReviewCount} 處</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'extra' ? `刪除多字：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>{currentSubtitlePresentation.provisionalReviewCount > 0 ? `暫依文本 ${currentSubtitlePresentation.provisionalReviewCount} 處` : `已校正 ${currentSubtitlePresentation.edits.length} 處`}</span>}
                                     </div>
                                 )}
                                 {referenceSubtitleActive && referenceSubtitleCorrectionEnabled && !isSubtitleBlankMode && (
                                     <div className="flex flex-wrap justify-center gap-2 text-[11px] text-slate-600">
                                         {[...(currentSubtitlePresentation?.boundaryOmissions || []), ...(currentSubtitlePresentation?.reviewDifferences || [])].map(suggestion => (
-                                            <button key={suggestion.signature} type="button" onClick={() => confirmReferenceBoundary(suggestion)}
-                                                title="請先確認音檔有說這些字，再補入目前字幕與聽寫答案"
-                                                className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-blue-700">
-                                                {suggestion.side === 'difference' ? '文字差異：' : suggestion.side === 'leading' ? '句首可能漏字：' : '句尾可能漏字：'}{suggestion.text} · {suggestion.side === 'difference' ? '採用文本' : '補回'}
-                                            </button>
+                                            <span key={suggestion.signature} className="inline-flex flex-wrap items-center justify-center gap-1">
+                                                <button type="button" onClick={() => confirmReferenceBoundary(suggestion)}
+                                                    title={suggestion.side === 'difference' ? '確認使用對照文本作為字幕與聽寫答案' : '確認音檔有說這些字後再補回'}
+                                                    className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-blue-700">
+                                                    {suggestion.side === 'difference' ? '文字差異：' : suggestion.side === 'leading' ? '句首可能漏字：' : '句尾可能漏字：'}{suggestion.text} · {suggestion.side === 'difference' ? '確認採用文本' : '補回'}
+                                                </button>
+                                                {suggestion.side === 'difference' && <button type="button"
+                                                    onClick={() => useOriginalReferenceDifference(suggestion)}
+                                                    disabled={!currentSubtitlePresentation?.provisionalReviewSignatures?.includes(suggestion.signature)}
+                                                    title="這一處改回原聽寫內容，並記住本句的選擇"
+                                                    className="rounded-full border border-slate-300 px-2 py-0.5 disabled:text-slate-400">
+                                                    {currentSubtitlePresentation?.provisionalReviewSignatures?.includes(suggestion.signature) ? '照原字幕' : '已照原字幕'}
+                                                </button>}
+                                            </span>
                                         ))}
                                         {(currentSubtitlePresentation?.acceptedBoundaryCount > 0 || currentSubtitlePresentation?.acceptedReviewCount > 0) && <button type="button"
-                                            onClick={() => { referenceBoundaryAcceptancesRef.current.delete(subtitles[currentIndex]); setReferenceBoundaryRevision(revision => revision + 1); }}
+                                            onClick={undoReferenceConfirmations}
                                             className="rounded-full border border-slate-200 px-2 py-0.5">{currentSubtitlePresentation?.acceptedReviewCount > 0 ? '撤銷確認' : '撤銷補字'}</button>}
                                     </div>
                                 )}
