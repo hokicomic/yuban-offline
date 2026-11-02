@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.237 · conservative-reference-correction";
+const APP_VERSION = "v5.238 · dictation-reference-controls";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7450,6 +7450,41 @@ const MarkdownView = ({
 
 // Keep exercise state inside a memoized caption component: typing must not
 // rerender the media engine or rescan the reference document.
+// Display-only spans: never rewrite source files or the editable caption text.
+const getSubtitleCorrectionDisplayRanges = projection => {
+    if (!projection?.changed) return [];
+    const ranges = [];
+    let offset = 0;
+    for (const edit of [...projection.edits].sort((a, b) => a.start - b.start)) {
+        if (edit.text) ranges.push({ start: edit.start + offset, end: edit.start + offset + edit.text.length });
+        else if (edit.kind === 'duplicate') {
+            const previous = projection.raw.slice(0, edit.start).match(/[\p{L}\p{M}\p{N}'’]+$/u);
+            if (previous) ranges.push({ start: edit.start + offset - previous[0].length, end: edit.start + offset });
+        }
+        offset += edit.text.length - (edit.end - edit.start);
+    }
+    return ranges.sort((a, b) => a.start - b.start).filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
+};
+const paintSubtitleReferenceCorrections = (editor, text, projection) => {
+    if (!editor) return;
+    const ranges = projection?.text === text ? getSubtitleCorrectionDisplayRanges(projection) : [];
+    const doc = editor.ownerDocument;
+    if (!ranges.length) { editor.textContent = text; return; }
+    const fragment = doc.createDocumentFragment();
+    let cursor = 0;
+    for (const range of ranges) {
+        if (range.start > cursor) fragment.appendChild(doc.createTextNode(text.slice(cursor, range.start)));
+        const span = doc.createElement('span');
+        span.setAttribute('data-subtitle-reference-corrected', 'true');
+        span.style.color = '#1e3a8a';
+        span.textContent = text.slice(range.start, range.end);
+        fragment.appendChild(span);
+        cursor = range.end;
+    }
+    if (cursor < text.length) fragment.appendChild(doc.createTextNode(text.slice(cursor)));
+    editor.replaceChildren(fragment);
+};
+
 const tokenizeSubtitlePractice = (text, language = 'en') => {
     const source = String(text || '');
     let segmenter;
@@ -7627,11 +7662,11 @@ const createPlaybackShortcutHandler = getState => {
         if (beforeInput && event.inputType !== 'insertText') return;
         const key = String((beforeInput ? event.data : event.key) || '').toLowerCase();
         const space = [' ', 'spacebar'].includes(key) || (!beforeInput && event.code === 'Space');
-        if (!space && !['-', '/'].includes(key)) return;
+        if (!space && !['-', '/', '.'].includes(key)) return;
         if (event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
             event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
         const state = getState();
-        if (!state?.enabled) return;
+        if (!state?.enabled || (key === '.' && !state.blankMode)) return;
         const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
         // Punctuation is already printed around dictation blanks. Reserve these
         // keys there, while ordinary editors keep their normal characters.
@@ -7646,7 +7681,8 @@ const createPlaybackShortcutHandler = getState => {
             handledKey = null; return;
         }
         if (!beforeInput) handledKey = { key, at: Date.now() };
-        if (space) {
+        if (key === '.') state.toggleEcho();
+        else if (space) {
             if (state.echoMode) state.replayEcho();
             else state.toggle();
         } else if (state.echoMode) state.shiftEcho(key === '-' ? -1 : 1);
@@ -7656,7 +7692,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true, correction = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -7686,8 +7722,8 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         }
     });
     React.useLayoutEffect(() => {
-        if ((!blankMode || !subtitle) && editorRef.current) editorRef.current.textContent = source;
-    }, [subtitle, text, blankMode, editsRef]);
+        if (!blankMode || !subtitle) paintSubtitleReferenceCorrections(editorRef.current, source, subtitle && editsRef.current.has(subtitle) ? null : correction);
+    }, [subtitle, text, blankMode, editsRef, correction]);
     const update = (word, part, value, composing) => {
         if (!subtitle) return;
         setCopyNotice(null);
@@ -7950,6 +7986,7 @@ export default function App() {
     const [pCloudDebugLogNotice, setPCloudDebugLogNotice] = useState("");
     const [pCloudDebugLogText, setPCloudDebugLogText] = useState("");
     const [embeddedKnowledgePanelHeight, setEmbeddedKnowledgePanelHeight] = useState(50);
+    const [blankReferencePanelHeight, setBlankReferencePanelHeight] = useState(null);
     const [embeddedKnowledgeFontSize, setEmbeddedKnowledgeFontSize] = useState(20);
     const [embeddedKnowledgeAlignmentLogNotice, setEmbeddedKnowledgeAlignmentLogNotice] = useState("");
     const [embeddedKnowledgeMatchCandidates, setEmbeddedKnowledgeMatchCandidates] = useState([]);
@@ -10588,6 +10625,8 @@ export default function App() {
         playbackShortcutRef.current = {
             enabled: Boolean(mediaSrc && playerRef.current) && !showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode,
             echoMode: isEchoMode,
+            blankMode: isSubtitleBlankMode,
+            toggleEcho: () => { if (isEchoMode) stopEchoMode(); else startEchoMode(); },
             toggle: togglePlay,
             replayEcho: () => playEchoRangeOnce(),
             previous: handlePreviousPlaybackControl,
@@ -20080,6 +20119,15 @@ ${userQ}`;
     const canShowEmbeddedKnowledgePanel = true;
     const isTopPanelDocumentMode = topPanelMode === 'document';
     const isTopPanelMediaMode = topPanelMode === 'media';
+    const isBlankReferencePanel = isTopPanelDocumentMode && isSubtitleBlankMode;
+    const effectiveTopPanelHeight = isBlankReferencePanel ? (blankReferencePanelHeight ?? 0) : embeddedKnowledgePanelHeight;
+    React.useLayoutEffect(() => { setBlankReferencePanelHeight(null); }, [isSubtitleBlankMode, topPanelMode, embeddedKnowledgeText]);
+    const changeTopPanelHeight = value => {
+        const height = Math.max(isTopPanelDocumentMode ? 0 : 28, Math.min(72, Number(value)));
+        if (!Number.isFinite(height)) return;
+        if (isBlankReferencePanel) setBlankReferencePanelHeight(height);
+        else setEmbeddedKnowledgePanelHeight(height);
+    };
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
     const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && currentSubtitleProjection?.trusted ? currentSubtitleProjection.text : subtitles[currentIndex]?.text) || "Load File...";
     // The divider keeps the top reference/media panel and the subtitle panel as
@@ -20092,13 +20140,12 @@ ${userQ}`;
         event.preventDefault();
         event.stopPropagation();
 
-        const initialHeight = Number(embeddedKnowledgePanelHeight) || 50;
+        const initialHeight = effectiveTopPanelHeight;
         const updateHeight = (moveEvent) => {
             const nextY = Number(moveEvent?.clientY);
             if (!Number.isFinite(nextY)) return;
             const deltaVh = ((nextY - startY) / Math.max(window.innerHeight || 1, 1)) * 100;
-            const nextHeight = Math.max(28, Math.min(72, Math.round(initialHeight + deltaVh)));
-            setEmbeddedKnowledgePanelHeight(nextHeight);
+            changeTopPanelHeight(Math.round(initialHeight + deltaVh));
         };
         const stopDragging = () => {
             window.removeEventListener('pointermove', updateHeight);
@@ -20112,7 +20159,7 @@ ${userQ}`;
         window.addEventListener('pointermove', updateHeight);
         window.addEventListener('pointerup', stopDragging);
         window.addEventListener('pointercancel', stopDragging);
-    }, [embeddedKnowledgePanelHeight, isVideoMasked]);
+    }, [effectiveTopPanelHeight, isVideoMasked, isBlankReferencePanel, isTopPanelDocumentMode]);
 
     useEffect(() => () => {
         panelSplitDragCleanupRef.current?.();
@@ -20929,8 +20976,9 @@ ${userQ}`;
                 >
                     {/* VIDEO AREA */}
                     <div
-                        className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 transition-all duration-300 ease-in-out shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
-                        style={!isVideoMasked ? { height: `${embeddedKnowledgePanelHeight}vh` } : undefined}
+                        className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 ${isBlankReferencePanel ? '' : 'transition-all duration-300 ease-in-out'} shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
+                        aria-hidden={!isVideoMasked && effectiveTopPanelHeight === 0 ? true : undefined}
+                        style={!isVideoMasked ? { height: `${effectiveTopPanelHeight}vh` } : undefined}
                     >
                         {/* [FIX] Removed manual onTimeUpdate, relying on Worker tick */}
                         <video ref={playerRef} src={mediaSrc} preload="auto"
@@ -21033,13 +21081,13 @@ ${userQ}`;
                                         <span className="text-[11px] text-gray-500">高度</span>
                                         <input
                                             type="range"
-                                            min="28"
+                                            min="0"
                                             max="72"
-                                            value={embeddedKnowledgePanelHeight}
-                                            onChange={(e) => setEmbeddedKnowledgePanelHeight(Math.max(28, Math.min(72, parseInt(e.target.value, 10) || 50)))}
+                                            value={effectiveTopPanelHeight}
+                                            onChange={(e) => changeTopPanelHeight(e.target.value)}
                                             className="w-24 h-1 bg-gray-300 rounded-lg accent-blue-600"
                                         />
-                                        <span className="text-[11px] text-gray-500 w-10 text-right">{embeddedKnowledgePanelHeight}vh</span>
+                                        <span className="text-[11px] text-gray-500 w-10 text-right">{effectiveTopPanelHeight}vh</span>
                                     </div>
                                     <div className="flex items-center gap-1 shrink-0" title="知識文件字體大小">
                                         <span className="text-[11px] text-gray-500">字體</span>
@@ -21148,7 +21196,7 @@ ${userQ}`;
                         {/* LARGE SUBTITLE CARD */}
                         <div className="relative group flex-1 min-h-0 outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
                             role="group" aria-label={isSubtitleBlankMode ? '字幕區：填空模式' : '字幕區：全文模式'} tabIndex={0}
-                            title={isSubtitleBlankMode ? '輸入 ? 以紅字揭示單字；點字幕空白處顯示全文' : '點字幕空白處切換填空'}
+                            title={isSubtitleBlankMode ? '輸入 ? 以紅字揭示單字；. 切換回音法；點字幕空白處顯示全文' : '點字幕空白處切換填空'}
                             onClick={event => {
                                 if (isSubtitlePracticeTextHit(event)) return;
                                 const active = event.currentTarget.ownerDocument.activeElement;
@@ -21170,6 +21218,7 @@ ${userQ}`;
                                     </div>
                                 )}
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                    correction={referenceSubtitleCorrectionEnabled ? currentSubtitleProjection : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
                                     textRef={subtitleTextRef} editsRef={subtitleTextEditsRef}
                                     autoFocusEnabled={!showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode} />

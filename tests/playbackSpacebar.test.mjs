@@ -68,6 +68,25 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         handler(event(blank, { type: 'beforeinput', inputType: 'insertText', data: '-', code: '' }));
         assert.equal(calls.at(-1), -1);
     });
+    test('period toggles echo only during dictation and deduplicates software keyboard input: ' + file, () => {
+        let toggles = 0;
+        const state = { enabled: true, blankMode: true, toggleEcho() { toggles++; } };
+        const handler = create(() => state);
+        handler(event(blank, { type: 'keydown', key: '.', code: 'Period' }));
+        const duplicate = event(blank, { type: 'beforeinput', inputType: 'insertText', data: '.', code: '' });
+        handler(duplicate); assert.equal(toggles, 1); assert.equal(duplicate.prevented, true);
+        handler(event(blank, { type: 'keyup' }));
+        handler(event(blank, { type: 'beforeinput', inputType: 'insertText', data: '.', code: '' }));
+        assert.equal(toggles, 2);
+        for (const extra of [{repeat:true}, {isComposing:true}, {ctrlKey:true}]) handler(event(blank, {key:'.',code:'Period',...extra}));
+        assert.equal(toggles, 2);
+        state.blankMode = false;
+        const full = event(null, {key:'.',code:'Period'}); handler(full);
+        assert.equal(full.prevented, undefined); assert.equal(toggles, 2);
+        state.blankMode = true;
+        const ordinaryEditor = event(editor, {key:'.',code:'Period'}); handler(ordinaryEditor);
+        assert.equal(ordinaryEditor.prevented, undefined); assert.equal(toggles, 2);
+    });
     test('typing spaces, composition, modified shortcuts and open overlays are left alone: ' + file, () => {
         let calls = 0; const state = { enabled: true, toggle: () => calls++ };
         const handler = create(() => state);
