@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.236 · echo-timeline-selection";
+const APP_VERSION = "v5.237 · conservative-reference-correction";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6188,6 +6188,149 @@ const findKnowledgeExactSubtitleRanges = (text, subtitleText) => {
         .filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
 };
 
+// A reference is evidence for spelling, not evidence that extra words were
+// spoken. Each accepted reference token must consume an existing subtitle token.
+const tokenizeSubtitleReferenceWords = value => {
+    const text = String(value || '');
+    const masked = text.replace(/\[[^\]]*\]|［[^］]*］|<[^>]*>|\*+|\{\{|\}\}/gu, match => ' '.repeat(match.length));
+    return Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,]\d+)*/gu), match => ({
+        text: match[0], key: match[0].normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/’/g, "'"),
+        start: match.index, end: match.index + match[0].length
+    }));
+};
+const SUBTITLE_REFERENCE_PROTECTED_WORDS = new Set(['not', 'no', 'never', 'without', 'with', 'before', 'after', 'more', 'less', 'increase', 'decrease', 'increased', 'decreased', 'increases', 'decreases', 'million', 'billion', 'may', 'must']);
+// Common emphatic/grammatical repetitions cannot be disambiguated by text alone.
+const SUBTITLE_REFERENCE_KEEP_REPETITIONS = new Set(['very', 'really', 'so', 'well', 'yes', 'had', 'that']);
+const isSubtitleReferenceSpellingVariant = (a, b) => {
+    if (a === b) return true;
+    if (Math.min(a.length, b.length) < 4 || a[0] !== b[0] || /[\d']/u.test(a + b) ||
+        SUBTITLE_REFERENCE_PROTECTED_WORDS.has(a) || SUBTITLE_REFERENCE_PROTECTED_WORDS.has(b)) return false;
+    const maxLength = Math.max(a.length, b.length);
+    const limit = Math.min(a.length, b.length) >= 8 ? 4 : 2;
+    if (Math.abs(a.length - b.length) > limit) return false;
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= a.length; i++) {
+        const row = [i];
+        for (let j = 1; j <= b.length; j++) row[j] = Math.min(row[j - 1] + 1, previous[j] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        previous = row;
+    }
+    const distance = previous[b.length];
+    return distance <= limit && distance / maxLength <= (Math.min(a.length, b.length) >= 8 ? 0.40 : 0.25);
+};
+const createSubtitleReferenceResolver = searchIndex => {
+    const tokens = [], postings = new Map(), lineTexts = new Map();
+    for (const entry of searchIndex?.entries || []) {
+        if (/[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)) continue;
+        lineTexts.set(entry.sourceLine, entry.raw);
+        for (const word of tokenizeSubtitleReferenceWords(entry.raw)) {
+            const position = tokens.length;
+            tokens.push({ ...word, sourceLine: entry.sourceLine });
+            if (word.key.length < 3 || KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key)) continue;
+            const positions = postings.get(word.key) || [];
+            // Repeated common words are poor anchors; cap both memory and work.
+            if (positions.length <= 96) positions.push(position);
+            postings.set(word.key, positions);
+        }
+    }
+    const cueCache = new WeakMap(), textCache = new Map(), spellingCache = new Map();
+    const near = (a, b) => {
+        const key = a + '\n' + b;
+        if (!spellingCache.has(key)) {
+            if (spellingCache.size >= 2048) spellingCache.clear();
+            spellingCache.set(key, isSubtitleReferenceSpellingVariant(a, b));
+        }
+        return spellingCache.get(key);
+    };
+    const resolve = (cue, { sourceLine = -1, sequential = false } = {}) => {
+        const raw = typeof cue === 'string' ? cue : String(cue?.text || '');
+        const objectCue = cue && typeof cue === 'object';
+        const cached = objectCue ? cueCache.get(cue) : textCache.get(raw);
+        if (cached?.raw === raw) return cached;
+        const remember = result => {
+            const record = { raw, text: raw, changed: false, trusted: false, edits: [], ranges: [], ...result };
+            if (objectCue) cueCache.set(cue, record);
+            else { if (textCache.size >= 64) textCache.delete(textCache.keys().next().value); textCache.set(raw, record); }
+            return record;
+        };
+        const words = tokenizeSubtitleReferenceWords(raw);
+        if (!tokens.length || words.length < 2 || words.length > 120 || /[぀-ヿ㐀-鿿가-힯]/u.test(raw)) return remember({ reason: 'unsupported_or_short' });
+        const anchors = words.map((word, index) => ({ index, positions: postings.get(word.key) || [] }))
+            .filter(anchor => anchor.positions.length > 0 && anchor.positions.length <= 96)
+            .sort((a, b) => a.positions.length - b.positions.length).slice(0, 3);
+        const starts = new Set();
+        for (const anchor of anchors) for (const position of anchor.positions) {
+            for (let dropped = 0; dropped <= 2; dropped++) if (position - anchor.index + dropped >= 0) starts.add(position - anchor.index + dropped);
+        }
+        // A common short exact cue is still useful for highlighting, but never
+        // scan the whole book to find it, nor guess which duplicate was spoken.
+        if (!starts.size || starts.size > 128) return remember({ reason: 'no_unique_anchor' });
+        const candidates = [];
+        for (const start of starts) {
+            let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0;
+            const edits = [], consumed = [];
+            while (i < words.length && j < tokens.length) {
+                const word = words[i], ref = tokens[j];
+                if (consumed.length && ref.sourceLine - consumed[consumed.length - 1].sourceLine > 4) break;
+                if (word.key === ref.key) { exact++; consumed.push(ref); i++; j++; continue; }
+                if (i > 0 && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key) && !SUBTITLE_REFERENCE_KEEP_REPETITIONS.has(word.key) && !/\d/u.test(word.key) && word.key === words[i - 1].key && consumed.length &&
+                    word.key === consumed[consumed.length - 1].key && /^\s+$/u.test(raw.slice(words[i - 1].end, word.start)) && duplicates < 2) {
+                    edits.push({ start: words[i - 1].end, end: word.end, text: '', from: word.text, to: '', kind: 'duplicate' });
+                    duplicates++; i++; continue;
+                }
+                if (substitutions >= 2 || !near(word.key, ref.key)) break;
+                edits.push({ start: word.start, end: word.end, text: ref.text, from: word.text, to: ref.text, kind: 'spelling' });
+                substitutions++; consumed.push(ref); i++; j++;
+            }
+            // The final repeated word can be dropped without consuming the
+            // following reference word (including at the end of a document).
+            while (i < words.length && i > 0 && consumed.length && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(words[i].key) && !SUBTITLE_REFERENCE_KEEP_REPETITIONS.has(words[i].key) && !/\d/u.test(words[i].key) && words[i].key === words[i - 1].key &&
+                words[i].key === consumed[consumed.length - 1].key && /^\s+$/u.test(raw.slice(words[i - 1].end, words[i].start)) && duplicates < 2) {
+                edits.push({ start: words[i - 1].end, end: words[i].end, text: '', from: words[i].text, to: '', kind: 'duplicate' }); duplicates++; i++;
+            }
+            if (i !== words.length || consumed.length < 2) continue;
+            const changed = edits.length > 0;
+            const contentExact = new Set(words.filter(word => !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
+            if (changed && (words.length < 5 || exact < 4 || exact / words.length < 0.72 || contentExact < 2 || edits.length > Math.max(1, Math.floor(words.length / 4)))) continue;
+            // A spelling change at a cue boundary has less context. Require an
+            // exact adjacent pair as well as the whole-window evidence above.
+            if (changed && (words[0].key !== consumed[0].key || words[words.length - 1].key !== consumed[consumed.length - 1].key) &&
+                (words.length < 7 || exact < words.length - 2)) continue;
+            let text = raw;
+            for (const edit of [...edits].sort((a, b) => b.start - a.start)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
+            const ranges = [];
+            for (const ref of consumed) {
+                const last = ranges[ranges.length - 1];
+                if (last?.sourceLine === ref.sourceLine) last.end = ref.end;
+                else ranges.push({ sourceLine: ref.sourceLine, start: ref.start, end: ref.end });
+            }
+            if (sequential && sourceLine >= 0 && (ranges[0].sourceLine < sourceLine - 1 || ranges[0].sourceLine > sourceLine + 48)) continue;
+            ranges.forEach(range => { range.text = lineTexts.get(range.sourceLine).slice(range.start, range.end); });
+            candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates, changed, trusted: true });
+        }
+        if (!candidates.length) return remember({ reason: 'no_bounded_word_alignment' });
+        candidates.sort((a, b) => a.cost - b.cost);
+        let best = candidates.filter(candidate => candidate.cost === candidates[0].cost);
+        if (new Set(best.map(candidate => candidate.text)).size > 1) return remember({ reason: 'ambiguous_wording' });
+        if (best.length > 1 && sourceLine >= 0) {
+            const local = best.filter(candidate => candidate.ranges.some(range => Math.abs(range.sourceLine - sourceLine) <= 4));
+            if (local.length === 1) best = local;
+        }
+        if (best.length !== 1) return remember({ reason: 'ambiguous' });
+        return remember(best[0]);
+    };
+    return { resolve, tokenCount: tokens.length };
+};
+const findKnowledgePreciseSubtitleRanges = (source, subtitleText) => {
+    // Exact short fragments need no correction inference. For transcription
+    // errors require the same conservative word mapping as the caption path.
+    const exact = findKnowledgeExactSubtitleRanges(source, subtitleText);
+    const local = createSubtitleReferenceResolver({ entries: [{ sourceLine: 0, raw: source }] }).resolve(subtitleText);
+    if (local.reason === 'ambiguous' || local.reason === 'ambiguous_wording') return [];
+    const mapped = local.trusted ? local.ranges.map(({ start, end }) => ({ start, end })) : [];
+    const ranges = mapped.length ? mapped : exact;
+    return ranges.sort((a, b) => a.start - b.start).filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
+};
+
 // 同一句字幕可能在全文中得到幾個相似候選。只保留分數最高且行號連續的一組，
 // 避免遠處的模糊候選把播放游標推得過後，導致後面的真實句子被防回跳機制排除。
 const selectKnowledgeSubtitleMatchCluster = (matches = [], expectedSourceLine = -1) => {
@@ -6413,11 +6556,13 @@ const MarkdownView = ({
     activeKnowledgeSourceLine = -1,
     activeKnowledgeSourceLines = [],
     activeKnowledgeSubtitleText = "",
+    activeKnowledgeLineTexts = [],
     treatWholeDocumentAsOriginal = false,
     manualKnowledgeAnchorMode = false,
     onKnowledgeSourceLineConfirm = null,
     onActiveKnowledgeTermsChange = null
 }) => {
+    const subtitleForSourceLine = line => activeKnowledgeLineTexts.find(range => range.sourceLine === line)?.text || activeKnowledgeSubtitleText;
     const sourceContent = typeof content === 'string' ? content : '';
     const isCjkTrack = /^(ja|ko|zh)/i.test(trackLanguage);
     const preferredSpeakerLanguage = String(speakerLanguage || "").trim();
@@ -6761,6 +6906,7 @@ const MarkdownView = ({
     const matchedMultiUsageItemKeysForPreview = useMemo(() => enableKnowledgeTermLinks
         ? findMatchedMultiUsageItemKeys(extractOriginalPreviewText(sourceContent)) : new Set(),
     [sourceContent, knowledgeTermEntries, enableKnowledgeTermLinks]);
+    const knowledgeCueRangesCache = useMemo(() => new Map(), [sourceContent]);
     const knowledgeLinkedNodesCache = useMemo(() => new Map(),
         [sourceContent, knowledgeTermEntries, enableKnowledgeTermLinks, matchedMultiUsageItemKeysForPreview]);
     const knowledgeTermClickRef = useRef(onKnowledgeTermClick);
@@ -6880,27 +7026,12 @@ const MarkdownView = ({
         // LRC often ends a cue at a semicolon/comma even though the ebook keeps
         // the surrounding prose as one grammatical sentence. Prefer an exact
         // word-range so only the spoken cue is marked (including Mr./Ms.).
-        const highlightRanges = findKnowledgeExactSubtitleRanges(source, subtitleText);
-        // An active multi-sentence subtitle may contain both verbatim text and
-        // a small transcription difference (for example `not too weak` vs
-        // ebook `not to weak`). The old early return after one exact hit meant
-        // those near-identical middle sentences were never tested at all.
-        // Keep exact word ranges, then fill only their unmatched source
-        // sentences with the existing tolerant, order-aware comparison.
-        let sourceCursor = 0;
-        for (const sentence of splitKnowledgeLineIntoSentences(source)) {
-            const sentenceStart = source.indexOf(sentence, sourceCursor);
-            if (sentenceStart < 0) continue;
-            const sentenceEnd = sentenceStart + sentence.length;
-            sourceCursor = sentenceEnd;
-            const overlapsExactRange = highlightRanges.some(range => sentenceStart < range.end && sentenceEnd > range.start);
-            const hasExactBefore = highlightRanges.some(range => range.end <= sentenceStart);
-            const hasExactAfter = highlightRanges.some(range => range.start >= sentenceEnd);
-            const covered = isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText);
-            const sandwichedNearMatch = hasExactBefore && hasExactAfter && isKnowledgeSentenceSandwichedNearMatch(sentence, subtitleText);
-            if (!overlapsExactRange && (covered || sandwichedNearMatch)) {
-                highlightRanges.push({ start: sentenceStart, end: sentenceEnd });
-            }
+        const cacheKey = JSON.stringify([source, subtitleText]);
+        let highlightRanges = knowledgeCueRangesCache.get(cacheKey);
+        if (!highlightRanges) {
+            highlightRanges = findKnowledgePreciseSubtitleRanges(source, subtitleText);
+            if (knowledgeCueRangesCache.size >= 256) knowledgeCueRangesCache.delete(knowledgeCueRangesCache.keys().next().value);
+            knowledgeCueRangesCache.set(cacheKey, highlightRanges);
         }
         const ranges = highlightRanges
             .sort((a, b) => a.start - b.start)
@@ -6916,15 +7047,7 @@ const MarkdownView = ({
             if (cursor < source.length) nodes.push(<React.Fragment key={`${keyPrefix}-after`}>{buildKnowledgeLinkedNodes(source.slice(cursor), `${keyPrefix}-after`)}</React.Fragment>);
             return nodes;
         }
-        const sentences = splitKnowledgeLineIntoSentences(source);
-        if (!sentences.length) return buildKnowledgeLinkedNodes(source, keyPrefix);
-        return sentences.map((sentence, index) => {
-            const children = buildKnowledgeLinkedNodes(sentence, `${keyPrefix}-${index}`);
-            if (!isKnowledgeSentenceCoveredBySubtitle(sentence, subtitleText)) {
-                return <React.Fragment key={`${keyPrefix}-${index}`}>{children}</React.Fragment>;
-            }
-            return <mark key={`${keyPrefix}-${index}`} className="rounded-md bg-amber-100 ring-1 ring-amber-300 px-1">{children}</mark>;
-        });
+        return buildKnowledgeLinkedNodes(source, keyPrefix);
     };
 
     const getSpeakMode = (text) => {
@@ -7034,10 +7157,10 @@ const MarkdownView = ({
             // the exact yellow range(s), never an earlier link in the same
             // paragraph.  For example, this prevents `accountability` from
             // winning when the current highlighted cue contains `misconduct`.
-            const exactRanges = findKnowledgeExactSubtitleRanges(source, activeKnowledgeSubtitleText);
+            const exactRanges = findKnowledgePreciseSubtitleRanges(source, subtitleForSourceLine(segment.sourceLine));
             const highlightedFragments = exactRanges.length > 0
                 ? exactRanges.map((range) => source.slice(range.start, range.end))
-                : splitKnowledgeLineIntoSentences(source).filter((sentence) => isKnowledgeSentenceCoveredBySubtitle(sentence, activeKnowledgeSubtitleText));
+                : [];
             for (const fragment of highlightedFragments) {
                 for (let pos = 0; pos < fragment.length; pos += 1) {
                     const matches = [];
@@ -7092,7 +7215,7 @@ const MarkdownView = ({
                 groups: linkedGroups
             });
         }
-    }, [activeKnowledgeSourceLines, activeKnowledgeSubtitleText, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
+    }, [activeKnowledgeSourceLines, activeKnowledgeSubtitleText, activeKnowledgeLineTexts, enableKnowledgeTermLinks, knowledgeTermEntries, matchedMultiUsageItemKeysForPreview, onActiveKnowledgeTermsChange, segments]);
 
     if (!sourceContent) return null;
 
@@ -7208,7 +7331,7 @@ const MarkdownView = ({
                                 {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
                                         {useSentenceLevelHighlight
-                                            ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, activeKnowledgeSubtitleText, `mdk-active-${i}`)
+                                            ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, subtitleForSourceLine(seg.sourceLine), `mdk-active-${i}`)
                                             : buildKnowledgeLinkedNodes(plainTextForLink, `mdk-${i}`)}
                                     </div>
                                 ) : (
@@ -7810,6 +7933,7 @@ export default function App() {
     const [isVideoMasked, setIsVideoMasked] = useState(true);
     const [topPanelMode, setTopPanelMode] = useState('media'); // 'media' | 'document'
     const [embeddedKnowledgeText, setEmbeddedKnowledgeText] = useState("");
+    const [referenceSubtitleCorrectionEnabled, setReferenceSubtitleCorrectionEnabled] = useState(true);
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
@@ -18194,9 +18318,32 @@ ${userQ}`;
     const embeddedKnowledgeDocumentKey = useMemo(() => {
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
+    const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
+    const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText);
+    const currentSubtitleProjection = useMemo(() => referenceSubtitleActive
+        ? subtitleReferenceResolver.resolve(subtitles[currentIndex], { sourceLine: embeddedKnowledgePlaybackProgressRef.current.maxSourceLine,
+            sequential: embeddedKnowledgePlaybackProgressRef.current.anchorState === 'anchored' && currentIndex >= embeddedKnowledgePlaybackProgressRef.current.subtitleIndex && currentIndex - embeddedKnowledgePlaybackProgressRef.current.subtitleIndex <= 2 }) : null,
+    [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex]);
+    useEffect(() => {
+        if (!referenceSubtitleActive) return;
+        let cancelled = false, handle;
+        const neighbours = [currentIndex + 1, currentIndex + 2, currentIndex - 1].filter(index => index >= 0 && index < subtitles.length);
+        const run = () => {
+            if (cancelled || !neighbours.length) return;
+            const index = neighbours.shift();
+            subtitleReferenceResolver.resolve(subtitles[index], { sourceLine: currentSubtitleProjection?.ranges[0]?.sourceLine ?? -1, sequential: index > currentIndex });
+            if (neighbours.length) schedule();
+        };
+        const schedule = () => { handle = window.requestIdleCallback ? window.requestIdleCallback(run, { timeout: 400 }) : window.setTimeout(run, 0); };
+        schedule();
+        return () => { cancelled = true; if (window.requestIdleCallback) window.cancelIdleCallback(handle); else window.clearTimeout(handle); };
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, currentSubtitleProjection]);
     // Paint the already-known subtitle first; defer document alignment and its
     // memoized view together, so the media clock never waits for a TXT scan.
     const embeddedKnowledgeRenderIndex = React.useDeferredValue(currentIndex);
+    const referenceDocumentProjection = useMemo(() => referenceSubtitleActive
+        ? subtitleReferenceResolver.resolve(subtitles[embeddedKnowledgeRenderIndex], { sourceLine: embeddedKnowledgePlaybackProgressRef.current.maxSourceLine }) : null,
+    [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
         const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;
@@ -18269,6 +18416,7 @@ ${userQ}`;
                 : (isAnchored ? Infinity : INITIAL_ANCHOR_MAX_LINES));
         const allRawMatches = Number.isInteger(manualSourceLine) && manualSourceLine >= 0
             ? [{ sourceLine: manualSourceLine, score: 1, manual: true }]
+            : referenceDocumentProjection?.trusted ? referenceDocumentProjection.ranges.map(range => ({ sourceLine: range.sourceLine, score: 1, verifiedWords: true }))
             : locatedCue ? [{ sourceLine: locatedCue.sourceLine, score: locatedCue.score }]
             : findKnowledgeSubtitleMatches(embeddedKnowledgeText, subtitleText, diagnostics, {
                 index: embeddedKnowledgeAlignmentIndex,
@@ -18379,6 +18527,7 @@ ${userQ}`;
                     at: new Date().toISOString(),
                     subtitleIndex: embeddedKnowledgeRenderIndex,
                     subtitleText: String(subtitleText || ""),
+                    referenceProjection: referenceDocumentProjection,
                     documentReset,
                     progressBefore,
                     isForwardPlayback,
@@ -18408,11 +18557,14 @@ ${userQ}`;
             }
         }
         return visibleMatches;
-    }, [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeLocatedCue, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, embeddedKnowledgeRenderIndex]);
+    }, [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeLocatedCue, embeddedKnowledgeAlignmentIndex, embeddedKnowledgeDocumentKey, embeddedKnowledgeManualAnchors, subtitles, embeddedKnowledgeRenderIndex, referenceDocumentProjection]);
     useEffect(() => {
         setEmbeddedKnowledgeMatchCandidates(embeddedKnowledgeMatchCandidatesRef.current || []);
     }, [embeddedKnowledgeDocumentKey, embeddedKnowledgeRenderIndex, embeddedKnowledgeSubtitleMatches]);
-    const embeddedKnowledgeSourceLines = useMemo(() => embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine), [embeddedKnowledgeSubtitleMatches]);
+    const embeddedKnowledgeLineTexts = useMemo(() => referenceDocumentProjection?.trusted ? referenceDocumentProjection.ranges : [], [referenceDocumentProjection]);
+    const embeddedKnowledgeSourceLines = useMemo(() => referenceDocumentProjection?.trusted
+        ? [...new Set(referenceDocumentProjection.ranges.map(range => range.sourceLine))] : embeddedKnowledgeSubtitleMatches.map(match => match.sourceLine),
+    [referenceDocumentProjection, embeddedKnowledgeSubtitleMatches]);
     const copyEmbeddedKnowledgeAlignmentLog = useCallback(async () => {
         const entries = embeddedKnowledgeAlignmentLogRef.current || [];
         const text = JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
@@ -18440,12 +18592,12 @@ ${userQ}`;
         // often stayed outside the viewport.  Use an immediate, deterministic
         // scroll rather than smooth scrolling: LRC cues can change before a
         // previous smooth animation ends, leaving the new highlight offscreen.
-        if (topPanelMode !== 'document' || embeddedKnowledgeSubtitleMatches.length === 0 || !embeddedKnowledgeContentRef.current) return;
+        if (topPanelMode !== 'document' || embeddedKnowledgeSourceLines.length === 0 || !embeddedKnowledgeContentRef.current) return;
         let outerFrame = 0;
         let revealFrame = 0;
         const revealActiveLine = () => {
             const container = embeddedKnowledgeContentRef.current;
-            const firstLine = embeddedKnowledgeSubtitleMatches[0]?.sourceLine;
+            const firstLine = embeddedKnowledgeSourceLines[0];
             const target = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
             if (!container || !target) return;
             const containerRect = container.getBoundingClientRect();
@@ -18465,7 +18617,7 @@ ${userQ}`;
             cancelAnimationFrame(outerFrame);
             cancelAnimationFrame(revealFrame);
         };
-    }, [topPanelMode, embeddedKnowledgeRenderIndex, embeddedKnowledgeSubtitleMatches]);
+    }, [topPanelMode, embeddedKnowledgeRenderIndex, embeddedKnowledgeSourceLines]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
         const source = String(text || "");
@@ -18852,14 +19004,15 @@ ${userQ}`;
         onKnowledgeTermClick: handleKnowledgePreviewTermClick,
         onActiveKnowledgeTermsChange: syncOpenKnowledgePreviewToActiveTerm,
         activeKnowledgeSourceLines: embeddedKnowledgeSourceLines,
-        activeKnowledgeSubtitleText: subtitles[embeddedKnowledgeRenderIndex]?.text || "",
+        activeKnowledgeLineTexts: embeddedKnowledgeLineTexts,
+        activeKnowledgeSubtitleText: referenceDocumentProjection?.trusted ? referenceDocumentProjection.text : subtitles[embeddedKnowledgeRenderIndex]?.text || "",
         treatWholeDocumentAsOriginal: embeddedKnowledgeAlignmentIndex.useWholeDocument,
         manualKnowledgeAnchorMode: embeddedKnowledgeManualAnchorMode,
         onKnowledgeSourceLineConfirm: handleEmbeddedKnowledgeSourceLineConfirm
     }), [embeddedKnowledgeText, embeddedKnowledgeFontSize, trackLanguage, embeddedKnowledgeFileInfo?.targetLanguage,
         embeddedKnowledgeIsDirectBookText, embeddedKnowledgeTermEntries, handleKnowledgePreviewTermClick,
         syncOpenKnowledgePreviewToActiveTerm, embeddedKnowledgeSourceLines, subtitles, embeddedKnowledgeRenderIndex,
-        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm]);
+        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm, referenceDocumentProjection, embeddedKnowledgeLineTexts]);
 
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
@@ -19928,7 +20081,7 @@ ${userQ}`;
     const isTopPanelDocumentMode = topPanelMode === 'document';
     const isTopPanelMediaMode = topPanelMode === 'media';
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
-    const subtitleDisplayText = subtitles[currentIndex]?.text || "Load File...";
+    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && currentSubtitleProjection?.trusted ? currentSubtitleProjection.text : subtitles[currentIndex]?.text) || "Load File...";
     // The divider keeps the top reference/media panel and the subtitle panel as
     // one adjustable reading surface.  The subtitle card itself flexes into all
     // remaining vertical space, so no empty strip is left below it.
@@ -21008,6 +21161,14 @@ ${userQ}`;
                                 }
                             }}>
                             <div ref={subtitleCardRef} className="w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-auto border bg-white border-gray-200 shadow-sm">
+                                {referenceSubtitleActive && (
+                                    <div className="flex flex-wrap items-center justify-end gap-2 mb-1 text-[10px] text-slate-500">
+                                        <label className="inline-flex items-center gap-1 cursor-pointer">
+                                            <input type="checkbox" checked={referenceSubtitleCorrectionEnabled} onChange={event => setReferenceSubtitleCorrectionEnabled(event.target.checked)} />參照校正字幕
+                                        </label>
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitleProjection?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitleProjection.raw}\n${currentSubtitleProjection.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : `${edit.from} → ${edit.to}`).join('；')}`}>已校正 {currentSubtitleProjection.edits.length} 處</span>}
+                                    </div>
+                                )}
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
                                     textRef={subtitleTextRef} editsRef={subtitleTextEditsRef}

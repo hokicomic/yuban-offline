@@ -320,6 +320,15 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const badge = nodes.find(node => node.props?.role === 'status');
         assert.ok(badge); assert.doesNotMatch(JSON.stringify(badge.props.children), /字提示/);
     });
+    test('reference-corrected display text is also the dictation answer without mutating the cue: ' + file, () => {
+        const render = setup(); const subtitle = { text: 'The block agreed.' };
+        const props = { ...base(), subtitle, text: 'The bloc agreed.' };
+        let inputs = fields(render(props)); type(inputs[1], 'block'); inputs = fields(render(props));
+        assert.equal(inputs[1].props['data-subtitle-part-complete'], false);
+        type(inputs[1], 'bloc'); inputs = fields(render(props));
+        assert.equal(inputs[1].props['data-subtitle-part-complete'], true);
+        assert.equal(inputs[1].props.style.color, '#2f7d57'); assert.equal(subtitle.text, 'The block agreed.');
+    });
     test('full subtitle editing is preserved and edited text becomes the next exercise: ' + file, () => {
         const render = setup(), props = base();
         const editor = render({ ...props, blankMode: false }).find(node => node.props?.role === 'textbox');
