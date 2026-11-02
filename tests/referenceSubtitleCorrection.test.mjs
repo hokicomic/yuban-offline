@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
     test('context corrects ASR spelling without changing timing, punctuation or the original subtitle: ' + file, () => {
         const cue = { id: 7, start: 10, end: 15, text: 'All the sinatures agreed to join the block tomorrow.' };
@@ -235,6 +235,34 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const withExtra=resolver(ref).resolve({text:extra});
         assert.equal(withExtra.aligned,true);assert.equal(withExtra.changed,false);
         assert.equal(api.applySubtitleReferenceBoundaryAcceptance(withExtra,new Set(withExtra.reviewDifferences.map(item=>item.signature))).text,ref);
+    });
+    test('frequent short cues resolve from the known paragraph without a rare global anchor: ' + file, () => {
+        const repeated=Array.from({length:130},()=>"She hadn't wanted to remember.").join('\n');
+        const engine=resolver(repeated);const cue={text:"She hadn't wanted to remember."};
+        assert.equal(engine.resolve(cue).trusted,false,'global duplicate occurrences remain ambiguous');
+        // Choose an isolated current paragraph so only that occurrence lies in
+        // the trusted local source-line disambiguation window.
+        const book=Array.from({length:130},()=>"She hadn't wanted to remember.\n"+Array.from({length:10},()=> 'Common intervening prose.').join('\n')).join('\n');
+        const local=resolver(book);
+        const result=local.resolve(cue,{sourceLine:1,sequential:true});
+        assert.equal(result.trusted,true);assert.equal(result.aligned,true);assert.equal(result.text,cue.text);
+        assert.equal(local.hasHighlight([1],cue.text),true);
+        assert.equal(local.hasHighlight([2],cue.text),false);
+        const partial=resolver('A short known sentence. Another unrelated text.');
+        const partialCue='A short known sentence. Xyzzy flob rub invent paragraphs.';
+        const projection=partial.resolve({text:partialCue});
+        assert.equal(projection.trusted,false);assert.equal(partial.hasHighlight([1],partialCue),true);
+        assert.equal(api.getSubtitleReferenceStatus({active:true,hasText:true,hasCue:true,enabled:true,projection,highlighted:true}).text,'已反白文本・尚未完整對齊');
+    });
+    test('a repeated ASR name can be corrected from nearby reference evidence: ' + file, () => {
+        const ref='Iris Marle was thinking about her sister, Rosemary.';
+        const raw='Iris Marl Iris Marl was thinking about her sister, Rosemary.';
+        const result=resolver(ref).resolve({text:raw},{sourceLine:1});
+        assert.equal(result.aligned,true);assert.equal(result.text,ref);assert.equal(result.trusted,true);
+        const book=Array.from({length:130},()=>ref+'\n'+Array.from({length:10},()=> 'Common intervening prose.').join('\n')).join('\n');
+        const engine=resolver(book);const cue={text:raw};
+        assert.equal(engine.resolve(cue).trusted,false);
+        assert.equal(engine.resolve(cue,{sourceLine:1}).text,ref);
     });
     test('name correction rejects ambiguous references, weak context and numbers or ordinary words: ' + file, () => {
         const raw='The ceasefire was reportedly extended across the Haerson region.';

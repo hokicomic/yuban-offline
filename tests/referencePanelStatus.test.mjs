@@ -22,6 +22,9 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']){
   assert.equal(label({loading:true}),'文本載入中');assert.equal(label({error:'failed'}),'文本載入失敗');
   assert.equal(label({hasText:false}),'未載入文本');assert.equal(label({active:false}),'對照未啟用');
   assert.equal(label({hasCue:false}),'尚無字幕');assert.equal(label({}),'本句未對到文本');
+  assert.equal(label({highlighted:true}),'已反白文本・尚未完整對齊');
+  assert.equal(label({highlighted:true,enabled:false}),'已反白文本・校正關閉');
+  assert.equal(label({highlightUpdating:true}),'文本對照更新中');
   assert.equal(label({projection:{aligned:true}}),'已對到文本・無需校正');
   assert.equal(label({projection:{trusted:true,changed:true}}),'已對到文本・已校正');
   assert.equal(label({enabled:false,projection:{aligned:true,changed:true}}),'已對到文本・校正關閉');

@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.247 · reference-panel-status";
+const APP_VERSION = "v5.248 · consistent-reference-evidence";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6451,13 +6451,17 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
 };
 
 const canCollapseBlankReferencePanel = ({documentMode,blankMode,text,loading,error}) => Boolean(documentMode && blankMode && String(text || '').trim() && !loading && !error);
-const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled,projection}) => {
+const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled,projection,highlighted=false,highlightUpdating=false}) => {
     if (loading) return {text:'文本載入中',tone:'text-slate-500'};
     if (error) return {text:'文本載入失敗',tone:'text-amber-700'};
     if (!hasText) return {text:'未載入文本',tone:'text-slate-500'};
     if (!active) return {text:'對照未啟用',tone:'text-slate-500'};
     if (!hasCue) return {text:'尚無字幕',tone:'text-slate-500'};
-    if (!(projection?.aligned || projection?.trusted)) return {text:'本句未對到文本',tone:'text-amber-700'};
+    if (!(projection?.aligned || projection?.trusted)) {
+        if (highlightUpdating) return {text:'文本對照更新中',tone:'text-slate-500'};
+        if (highlighted) return {text:enabled?'已反白文本・尚未完整對齊':'已反白文本・校正關閉',tone:'text-amber-700'};
+        return {text:'本句未對到文本',tone:'text-amber-700'};
+    }
     if (!enabled) return {text:'已對到文本・校正關閉',tone:'text-slate-500'};
     if (projection.reviewDifferences?.length) return {text:'已對到文本・有差異待確認',tone:'text-amber-700'};
     if (projection.boundaryOmissions?.length) return {text:'已對到文本・有漏字待確認',tone:'text-amber-700'};
@@ -6465,14 +6469,15 @@ const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled
 };
 
 const createSubtitleReferenceResolver = searchIndex => {
-    const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map();
+    const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
-        if (/[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)) continue;
         lineTexts.set(entry.sourceLine, entry.raw);
+        if (/[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)) continue;
         for (const word of tokenizeSubtitleReferenceWords(entry.raw)) {
             const position = tokens.length;
             if (!lineStarts.has(entry.sourceLine)) lineStarts.set(entry.sourceLine, position);
             tokens.push({ ...word, sourceLine: entry.sourceLine });
+            lineEnds.set(entry.sourceLine,tokens.length);
             if (word.key.length < 3 || KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key)) continue;
             const positions = postings.get(word.key) || [];
             // Repeated common words are poor anchors; cap both memory and work.
@@ -6523,6 +6528,16 @@ const createSubtitleReferenceResolver = searchIndex => {
             // A common secondary anchor must not discard a useful rare one.
             if (expanded.size > 128) { if (starts.size) break; continue; }
             starts = expanded;
+        }
+        // Frequent words cannot anchor a whole book, but a trusted nearby
+        // paragraph is already a useful search boundary. Include its windows
+        // without requiring a rare word, keeping the same 128-candidate cap.
+        if (Number.isInteger(sourceLine) && sourceLine >= 0) {
+            for (const delta of [0,-1,1,-2,2,-3,3,4]) {
+                const line=sourceLine+delta, first=lineStarts.get(line), end=lineEnds.get(line);
+                if (!Number.isInteger(first)) continue;
+                for (let position=first;position<end && starts.size<128;position++) starts.add(position);
+            }
         }
         // A common short exact cue is still useful for highlighting, but never
         // scan the whole book to find it, nor guess which duplicate was spoken.
@@ -6638,7 +6653,12 @@ const createSubtitleReferenceResolver = searchIndex => {
         }
         return remember({ ...selected, aligned: true, alignmentMethod: selected.alignmentMethod || 'word_mapping', boundaryOmissions });
     };
-    return { resolve, tokenCount: tokens.length };
+    const hasHighlight = (sourceLines, subtitleText, perLineTexts=[]) => sourceLines.some(sourceLine => {
+        const source=lineTexts.get(sourceLine);
+        const cue=perLineTexts.find(range=>range.sourceLine===sourceLine)?.text || subtitleText;
+        return Boolean(source && findKnowledgePreciseSubtitleRanges(source,cue).length);
+    });
+    return { resolve, tokenCount: tokens.length, hasHighlight };
 };
 const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
     if (!(projection?.trusted || projection?.aligned) || !accepted?.size) return projection;
@@ -18759,7 +18779,8 @@ ${userQ}`;
             sourceLine: sameDocument ? progress.maxSourceLine : -1,
             sequential: sameDocument && progress.anchorState === 'anchored' && currentIndex >= progress.subtitleIndex && currentIndex - progress.subtitleIndex <= 2
         });
-    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText]);
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText,
+        embeddedKnowledgePlaybackProgressRef.current.maxSourceLine, embeddedKnowledgePlaybackProgressRef.current.anchorState, embeddedKnowledgePlaybackProgressRef.current.subtitleIndex]);
     const currentSubtitlePresentation = useMemo(() => applySubtitleReferenceBoundaryAcceptance(currentSubtitleProjection,
         subtitles[currentIndex] && referenceBoundaryAcceptancesRef.current.get(subtitles[currentIndex])),
     [currentSubtitleProjection, subtitles, currentIndex, referenceBoundaryRevision]);
@@ -18791,12 +18812,13 @@ ${userQ}`;
     const referenceDocumentProjection = useMemo(() => {
         if (!referenceSubtitleActive) return null;
         const progress = embeddedKnowledgePlaybackProgressRef.current;
+        if (embeddedKnowledgeRenderIndex === currentIndex) return currentSubtitlePresentation;
         const cue = subtitles[embeddedKnowledgeRenderIndex];
         const projection = subtitleReferenceResolver.resolve(cue, {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
         return applySubtitleReferenceBoundaryAcceptance(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue));
-    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceBoundaryRevision]);
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceBoundaryRevision, currentIndex, currentSubtitlePresentation]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
         const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;
@@ -20537,9 +20559,14 @@ ${userQ}`;
         text:embeddedKnowledgeText,loading:embeddedKnowledgeLoading,error:embeddedKnowledgeError});
     const effectiveTopPanelHeight = isBlankReferencePanel ? (blankReferencePanelHeight ?? 0)
         : isTopPanelDocumentMode && isSubtitleBlankMode ? Math.max(28,embeddedKnowledgePanelHeight || 50) : embeddedKnowledgePanelHeight;
+    const subtitleHasReferenceHighlight = useMemo(() => referenceSubtitleActive && embeddedKnowledgeRenderIndex === currentIndex &&
+        (Boolean(currentSubtitlePresentation?.aligned || currentSubtitlePresentation?.trusted) ||
+            subtitleReferenceResolver.hasHighlight(embeddedKnowledgeSourceLines, subtitles[currentIndex]?.text || '', embeddedKnowledgeLineTexts)),
+    [referenceSubtitleActive, embeddedKnowledgeRenderIndex, currentIndex, subtitleReferenceResolver, embeddedKnowledgeSourceLines, subtitles, embeddedKnowledgeLineTexts, currentSubtitlePresentation]);
     const subtitleReferenceStatus = getSubtitleReferenceStatus({loading:embeddedKnowledgeLoading,error:embeddedKnowledgeError,
         hasText:Boolean(embeddedKnowledgeText.trim()),active:referenceSubtitleActive,hasCue:Boolean(subtitles[currentIndex]),
-        enabled:referenceSubtitleCorrectionEnabled,projection:currentSubtitlePresentation});
+        enabled:referenceSubtitleCorrectionEnabled,projection:currentSubtitlePresentation,highlighted:subtitleHasReferenceHighlight,
+        highlightUpdating:embeddedKnowledgeRenderIndex !== currentIndex});
     React.useLayoutEffect(() => { setBlankReferencePanelHeight(null); }, [isSubtitleBlankMode, topPanelMode, embeddedKnowledgeText]);
     const changeTopPanelHeight = value => {
         const height = Math.max(isTopPanelDocumentMode ? 0 : 28, Math.min(72, Number(value)));
