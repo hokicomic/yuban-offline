@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.256 · long-sentence-startup";
+const APP_VERSION = "v5.257 · persistent-file-pickers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -21700,6 +21700,22 @@ ${userQ}`;
     return (
         <AudioCacheContext.Provider value={audioCacheContextValue}>
             <div className="bg-gray-50 text-gray-800 flex flex-col font-sans h-screen overflow-hidden">
+                {/* File inputs stay mounted when either toolbar is collapsed. */}
+                <input type="file" ref={folderInputRef} webkitdirectory="true" directory="true" multiple className="hidden" onChange={handleFolderSelect} />
+                <input
+                    type="file"
+                    ref={manualKnowledgeTxtInputRef}
+                    accept=".txt,.md,.markdown,.srt,.vtt,.lrc,.csv,.tsv,.json,.html,.htm,.xml,.pdf,.epub,text/*,application/pdf,application/epub+zip"
+                    className="hidden"
+                    onChange={(e) => handleManualKnowledgeTxtFileForModal(e.target.files && e.target.files[0])}
+                />
+                <input
+                    type="file"
+                    ref={embeddedKnowledgeTxtInputRef}
+                    accept=".txt,.md,.markdown,.srt,.vtt,.lrc,.csv,.tsv,.json,.html,.htm,.xml,.pdf,.epub,text/*,application/pdf,application/epub+zip"
+                    className="hidden"
+                    onChange={(e) => handleManualKnowledgeTxtFileForEmbedded(e.target.files && e.target.files[0])}
+                />
                 {/* [HEADER] */}
                 {isHeaderVisible && (
                     <header className="bg-white border-b border-gray-200 shadow-sm z-30 transition-all duration-300">
@@ -21763,21 +21779,6 @@ ${userQ}`;
                                     <button onClick={handlePickFolder} className="cursor-pointer bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0"><FolderOpen size={14} /><span className="hidden sm:inline">授權影音資料夾</span></button>
                                     <button onClick={openPCloudBrowser} className="cursor-pointer bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0" title="登入 pCloud，瀏覽雲端資料夾並按需串流目前教材"><Globe size={14} /><span className="hidden sm:inline">pCloud</span></button>
                                     <button onClick={openManualKnowledgeTxtPickerForEmbedded} className="cursor-pointer bg-cyan-50 hover:bg-cyan-100 text-cyan-700 border border-cyan-200 px-3 py-1.5 rounded-md flex items-center gap-1 transition-colors shadow-sm text-xs font-medium shrink-0" title="選擇任意文字檔作為知識文件"><BookOpen size={14} /><span className="hidden sm:inline">知識檔</span></button>
-                                    <input type="file" ref={folderInputRef} webkitdirectory="true" directory="true" multiple className="hidden" onChange={handleFolderSelect} />
-                                    <input
-                                        type="file"
-                                        ref={manualKnowledgeTxtInputRef}
-                                        accept=".txt,.md,.markdown,.srt,.vtt,.lrc,.csv,.tsv,.json,.html,.htm,.xml,.pdf,.epub,text/*,application/pdf,application/epub+zip"
-                                        className="hidden"
-                                        onChange={(e) => handleManualKnowledgeTxtFileForModal(e.target.files && e.target.files[0])}
-                                    />
-                                    <input
-                                        type="file"
-                                        ref={embeddedKnowledgeTxtInputRef}
-                                        accept=".txt,.md,.markdown,.srt,.vtt,.lrc,.csv,.tsv,.json,.html,.htm,.xml,.pdf,.epub,text/*,application/pdf,application/epub+zip"
-                                        className="hidden"
-                                        onChange={(e) => handleManualKnowledgeTxtFileForEmbedded(e.target.files && e.target.files[0])}
-                                    />
                                     <div className="flex items-center gap-1 bg-gray-100 px-2 py-1 rounded-md border border-gray-200 shrink-0" title="Learner level">
                                         <span className="text-[10px] font-bold text-gray-500">LV</span>
                                         <button type="button" onClick={() => setLearnerLevel(Math.max(1, learnerLevel - 1))} className="w-7 h-7 inline-flex items-center justify-center rounded text-gray-600 hover:bg-gray-200 active:bg-gray-300" aria-label="降低學習等級"><Minus size={14} /></button>
