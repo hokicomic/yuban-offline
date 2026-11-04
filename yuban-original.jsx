@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.252 · long-audiobook-lrc";
+const APP_VERSION = "v5.253 · mobile-seek-events";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10347,10 +10347,17 @@ export default function GeminiPlayer() {
     };
 
     const beginProgressSeek = (event) => {
-        if (progressSeekRef.current.dragging || !playerRef.current) return;
+        if (!playerRef.current) return;
+        if (progressSeekRef.current.dragging) {
+            if (event?.pointerId != null) progressSeekRef.current.pointerActive = true;
+            if (event?.key) progressSeekRef.current.keyboardActive = true;
+            return;
+        }
         const player = playerRef.current;
+        const resume = mediaSeekRef.current.active ? mediaSeekRef.current.resume
+            : mediaPlayRef.current.active ? true : isPlaying || !player.paused;
         progressSeekRef.current = {
-            dragging: true, resume: isPlaying || !player.paused,
+            dragging: true, resume, pointerActive: event?.pointerId != null, keyboardActive: Boolean(event?.key),
             originalTime: player.currentTime, track: currentTrackIndex,
             pendingIndex: null
         };
@@ -10366,15 +10373,29 @@ export default function GeminiPlayer() {
     const handleProgressInput = (event) => {
         const value = Number(event.currentTarget.value);
         if (!Number.isFinite(value)) return;
+        // WebKit can deliver input/change after pointerup. A duplicate must not
+        // begin another drag and cancel the seek that pointerup just started.
+        if (!progressSeekRef.current.dragging && progressSeekRef.current.committedValue === value) return;
         beginProgressSeek();
         lastUserSeekValueRef.current = value;
         setProgressPreview(value);
+    };
+
+    const handleProgressChange = (event) => {
+        handleProgressInput(event);
+        const interaction = progressSeekRef.current;
+        // A late native change or accessibility adjustment has no remaining
+        // pointer/key release. Commit it here so playback cannot remain paused.
+        if (!interaction.pointerActive && !interaction.keyboardActive) commitProgressSeek(Number(event.currentTarget.value));
     };
 
     const commitProgressSeek = (value) => {
         const interaction = progressSeekRef.current;
         if (!interaction.dragging) return;
         interaction.dragging = false;
+        interaction.pointerActive = false;
+        interaction.keyboardActive = false;
+        interaction.committedValue = Number(value);
         setProgressPreview(null);
         if (interaction.track !== currentTrackIndex) return;
         seekToSubtitleByTime(value, interaction.resume);
@@ -22145,7 +22166,10 @@ ${userQ}`;
                                 aria-label="整檔播放位置"
                                 onPointerDown={beginProgressSeek}
                                 onInput={handleProgressInput}
-                                onChange={handleProgressInput}
+                                onChange={handleProgressChange}
+                                onKeyDown={(event) => {
+                                    if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) beginProgressSeek(event);
+                                }}
                                 onPointerUp={(event) => commitProgressSeek(Number(event.currentTarget.value))}
                                 onPointerCancel={() => commitProgressSeek(lastUserSeekValueRef.current)}
                                 onLostPointerCapture={() => commitProgressSeek(lastUserSeekValueRef.current)}

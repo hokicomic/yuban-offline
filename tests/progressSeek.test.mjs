@@ -39,7 +39,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             subtitles: [{ start: 0, end: 10 }, { start: 3600, end: 3610 }, { start: 7200, end: 7210 }],
             currentIndex: 0, currentTrackIndex: 0, playbackMode: 'sentence',
             progressSeekRef: { current: { dragging: false, pendingIndex: null } },
-            mediaSeekRef: { current: { active: false } },
+            mediaSeekRef: { current: { active: false } }, mediaPlayRef: { current: { active: false } },
             lastUserSeekValueRef: { current: 0 }, latestStateRef: { current: { playbackMode: 'sentence' } },
             cancelWorkerTimer: () => { token += 1; }, resetShadowStateForSeek() {},
             setCurrentIndex: index => { c.currentIndex = index; },
