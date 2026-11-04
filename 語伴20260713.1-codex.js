@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.250 · indexed-mp3-seeking";
+const APP_VERSION = "v5.251 · compact-index-header";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -21391,6 +21391,9 @@ ${userQ}`;
         }
     }, [currentTrackIndex]);
 
+    const mediaSeekLabel = mediaSeekMode === 'indexed' ? `精準時間索引已就緒 · ${mediaIndexStorage === 'folder' ? '已存同目錄，可跨設備重用' : mediaIndexStorage === 'reused-cache' ? '已重用快取，免重新掃描' : mediaIndexStorage === 'cache' ? '已快取，下次開啟可重用' : '本次暫存'}` : mediaSeekMode === 'stream' ? 'MP3 串流使用原始時間索引；下載後選取本機檔可建立精準索引' : '使用原始 MP3 索引；此檔案或瀏覽器無法建立精準索引';
+    const compactMediaSeekLabel = mediaSeekMode === 'indexed' ? (mediaIndexStorage === 'folder' ? '索引已存同目錄' : mediaIndexStorage === 'reused-cache' ? '已重用索引' : mediaIndexStorage === 'cache' ? '索引已快取' : '索引暫存') : mediaSeekMode === 'stream' ? '串流索引' : '原始索引';
+
     const renderSeekTimeControls = () => !isEchoMode && (
         <form onSubmit={submitSeekTime} className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1 px-3 py-1">
             <label className="flex items-center gap-1 text-[11px] text-gray-600">
@@ -21502,12 +21505,23 @@ ${userQ}`;
                 {/* [HEADER] */}
                 {isHeaderVisible && (
                     <header className="bg-white border-b border-gray-200 shadow-sm z-30 transition-all duration-300">
-                        <div className="flex items-center justify-between p-3">
-                            <div className="flex items-center gap-2">
-                                <div className="bg-black text-white p-1.5 rounded-lg"><span className="text-xl">🎧</span></div>
-                                <h1 className="text-lg font-bold text-gray-900 tracking-tight">語伴</h1>
+                        <div className="flex items-center justify-between gap-2 p-3">
+                            <div className="flex min-w-0 flex-1 items-center gap-2">
+                                <div className="shrink-0 bg-black text-white p-1.5 rounded-lg"><span className="text-xl">🎧</span></div>
+                                <div className="flex min-w-0 flex-1 items-center gap-2">
+                                    <h1 className="shrink-0 text-lg font-bold text-gray-900 tracking-tight">語伴</h1>
+                                    <span className="shrink-0 text-[10px] font-mono text-slate-400 select-all" title={APP_VERSION}>
+                                        <span className="sm:hidden">{APP_VERSION.split(' · ')[0]}</span><span className="hidden sm:inline">{APP_VERSION}</span>
+                                    </span>
+                                    {mediaSeekMode && <div className="flex min-w-0 flex-1 items-center gap-2 text-[10px] text-slate-500" aria-label="播放時間索引狀態">
+                                        <span className="min-w-0 truncate" title={mediaSeekLabel}><span className="sm:hidden">{compactMediaSeekLabel}</span><span className="hidden sm:inline">{mediaSeekLabel}</span></span>
+                                        {mediaSeekMode === 'indexed' && mediaIndexExportRef.current && <button type="button" data-subtitle-focus-restore
+                                            className="shrink-0 whitespace-nowrap rounded border border-blue-200 px-1.5 py-0.5 text-blue-700" title="將索引檔放在音檔旁，連同音檔複製到其他設備即可重用"
+                                            onClick={() => { const record=mediaIndexExportRef.current;if(record)saveBlobByBrowserDownload(record.blob,record.filename); }}>下載索引</button>}
+                                    </div>}
+                                </div>
                             </div>
-                            <button onClick={() => setIsHeaderExpanded(!isHeaderExpanded)} className="p-2 text-gray-500 hover:bg-gray-100 rounded-full">
+                            <button onClick={() => setIsHeaderExpanded(!isHeaderExpanded)} className="shrink-0 p-2 text-gray-500 hover:bg-gray-100 rounded-full">
                                 {isHeaderExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
                             </button>
                         </div>
@@ -21967,12 +21981,6 @@ ${userQ}`;
                             </div>
                         )}
                     </div>
-                    {mediaSeekMode && <div className="w-full flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-0.5 text-[10px] text-slate-500" aria-label="播放時間索引狀態">
-                        <span>{mediaSeekMode === 'indexed' ? `精準時間索引已就緒 · ${mediaIndexStorage === 'folder' ? '已存同目錄，可跨設備重用' : mediaIndexStorage === 'reused-cache' ? '已重用快取，免重新掃描' : mediaIndexStorage === 'cache' ? '已快取，下次開啟可重用' : '本次暫存'}` : mediaSeekMode === 'stream' ? 'MP3 串流使用原始時間索引；下載後選取本機檔可建立精準索引' : '使用原始 MP3 索引；此檔案或瀏覽器無法建立精準索引'}</span>
-                        {mediaSeekMode === 'indexed' && mediaIndexExportRef.current && <button type="button" data-subtitle-focus-restore
-                            className="rounded border border-blue-200 px-1.5 py-0.5 text-blue-700" title="將索引檔放在音檔旁，連同音檔複製到其他設備即可重用"
-                            onClick={() => { const record=mediaIndexExportRef.current;if(record)saveBlobByBrowserDownload(record.blob,record.filename); }}>下載索引</button>}
-                    </div>}
                     {seekNotice && <div role="status" aria-live="polite" className="w-full px-3 py-1 text-xs text-amber-800">{seekNotice}</div>}
                     {mediaError && (
                         <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 space-y-3">
