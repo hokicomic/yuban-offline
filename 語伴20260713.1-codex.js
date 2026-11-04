@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.257 · persistent-file-pickers";
+const APP_VERSION = "v5.258 · decoder-stall-recovery";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3896,7 +3896,7 @@ const monitorMediaPlayback = (player, { isSuppressed, onState, onRecover, onFail
     let stopped = false, timer = null, lastTime = Number(player.currentTime) || 0;
     let lastProgress = Date.now(), recoveries = 0, lastStatus = '';
     const source = player.src;
-    const events = ['playing', 'pause', 'waiting', 'stalled', 'timeupdate', 'seeked', 'canplay', 'ended'];
+    const events = ['playing', 'pause', 'waiting', 'stalled', 'timeupdate', 'seeking', 'seeked', 'canplay', 'ended'];
     const status = value => {
         if (lastStatus !== value) { lastStatus = value; onState(value); }
     };
@@ -3907,11 +3907,17 @@ const monitorMediaPlayback = (player, { isSuppressed, onState, onRecover, onFail
         if (player.src !== source) { cleanup(); return; }
         if (event?.type === 'pause' && player.paused) snapshot('native-paused');
         const time = Number(player.currentTime) || 0, now = Date.now();
-        if (isSuppressed()) { lastTime = time; lastProgress = now; return; }
+        if (isSuppressed()) {
+            lastTime = time; lastProgress = now; lastStatus = ''; return;
+        }
+        if (event?.type === 'seeking' || event?.type === 'seeked') { lastTime = time; lastProgress = now; return; }
         if (player.paused || player.ended) {
             status('paused'); lastTime = time; lastProgress = now; return;
         }
-        const advanced = Math.abs(time - lastTime) > 0.025;
+        // A seek/discontinuity (including CoreMedia rounding backwards after
+        // play()) is not proof that decoding has resumed.
+        if (time < lastTime || player.seeking) lastTime = time;
+        const advanced = !player.seeking && time > lastTime + 0.025;
         if (advanced) {
             lastTime = time; lastProgress = now; recoveries = 0;
             if (!player.seeking) status('playing');
@@ -3919,7 +3925,7 @@ const monitorMediaPlayback = (player, { isSuppressed, onState, onRecover, onFail
         }
         if (player.seeking || player.readyState < 2 || event?.type === 'waiting' || event?.type === 'stalled') status('waiting');
         const idle = now - lastProgress;
-        if (idle >= stallMs && recoveries === 0 && !player.seeking) {
+        if (idle >= stallMs && recoveries === 0) {
             recoveries = 1; snapshot('resume-stalled-clock'); status('waiting'); onRecover();
         } else if (idle >= failureMs && recoveries > 0) {
             snapshot('stalled-clock-failed'); recoveries = 0; lastProgress = now;
@@ -3938,9 +3944,9 @@ const monitorMediaPlayback = (player, { isSuppressed, onState, onRecover, onFail
 };
 
 // A seek request is not proof that audio decoding has reached the target.
-const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, onDiagnostic = () => {}, timeoutMs = 15000 }) => {
-    let timer = null, finished = false, attempts = 0, reloaded = false, recovering = false;
-    let observedCompletion = !player.seeking && Math.abs(Number(player.currentTime) - target) <= 0.15;
+const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, onDiagnostic = () => {}, timeoutMs = 15000, reload = false }) => {
+    let timer = null, finished = false, attempts = 0, reloaded = reload, recovering = reload;
+    let observedCompletion = !reload && !player.seeking && Math.abs(Number(player.currentTime) - target) <= 0.15;
     const started = Date.now();
     let lastAssignment = started, lastProgress = started, lastState = '';
     const source = player.src;
@@ -4001,8 +4007,16 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
     player.addEventListener('error', fail);
     player.addEventListener('emptied', emptied);
     player.pause();
+    if (reload) {
+        // play() alone cannot reset a decoder stalled after repeated native
+        // seeks. Reopen the same URL, then wait for data at the original target.
+        const rate = player.playbackRate;
+        report('reload');
+        try { player.load(); if (Number.isFinite(rate)) player.playbackRate = rate; }
+        catch (_) { fail(); }
+    }
     // Always supersede an old seek, including when it never emitted seeked.
-    if (player.seeking || Math.abs(Number(player.currentTime) - target) > 0.15) assignTarget(true);
+    if (!finished && (player.seeking || Math.abs(Number(player.currentTime) - target) > 0.15)) assignTarget(true);
     poll();
     return cancel;
 };
@@ -10276,7 +10290,8 @@ export default function App() {
     const requestMediaPlay = ({ quiet = false } = {}) => {
         const player = playerRef.current;
         if (!player || mediaPlayRef.current.active) return;
-        const session = { active: true, cancel: null };
+        const session = { active: true, cancel: null,
+            recoverySource: mediaPlayRef.current.recoverySource, recoveryTarget: mediaPlayRef.current.recoveryTarget };
         mediaPlayRef.current = session;
         if (!quiet) setSeekNotice('正在準備播放…');
         session.cancel = performManagedMediaPlay(player, {
@@ -10307,11 +10322,16 @@ export default function App() {
         });
     };
 
-    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { bufferedEnd = null } = {}) => {
+    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { bufferedEnd = null, reload = false } = {}) => {
         const player = playerRef.current;
         if (!player) return;
         const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
-        if (shouldPlay && !onLocated && !mediaSeekRef.current.active && !mediaPlayRef.current.active &&
+        const needsReload = reload || Boolean(mediaPlayRef.current.recoverySource && mediaPlayRef.current.recoverySource === player.src);
+        if (needsReload) {
+            mediaPlayRef.current.recoverySource = player.src;
+            mediaPlayRef.current.recoveryTarget = t;
+        }
+        if (!needsReload && shouldPlay && !onLocated && !mediaSeekRef.current.active && !mediaPlayRef.current.active &&
             isMediaReplayBuffered(player, t, bufferedEnd)) {
             // A buffered seek already preserves native playback. Do not pause
             // or issue play() again while it is running, and never seek back a
@@ -10329,6 +10349,8 @@ export default function App() {
                     onFailure: () => {
                         mediaPlayRef.current.cancel?.();
                         mediaPlayRef.current.active = false;
+                        mediaPlayRef.current.recoverySource = player.src;
+                        mediaPlayRef.current.recoveryTarget = t;
                         player.pause(); setIsPlaying(false);
                         setSeekNotice('跳轉後播放未恢復，請按播放重試。');
                         recordPCloudDebug('media.buffered-seek.fail', { target: t, actual: Number(player.currentTime) || 0, readyState: player.readyState });
@@ -10354,6 +10376,7 @@ export default function App() {
             if (onLocated) onLocated(actual);
         };
         session.cancel = performVerifiedMediaSeek(player, t, {
+            reload: needsReload,
             isCurrent: () => token === timerTokenRef.current && playerRef.current === player,
             onLocated: (actual) => {
                 session.active = false;
@@ -10365,6 +10388,8 @@ export default function App() {
             onDiagnostic: details => recordPCloudDebug('media.seek', details),
             onFailure: (actual) => {
                 session.active = false;
+                mediaPlayRef.current.recoverySource = player.src;
+                mediaPlayRef.current.recoveryTarget = t;
                 syncActual(actual);
                 setIsPlaying(false);
                 setSeekNotice('定位未完成，已停止播放。請重試，或改用下載後的本機媒體檔。');
@@ -11531,6 +11556,13 @@ export default function App() {
             setIsPlaying(false);
             return;
         }
+        if (mediaPlayRef.current.recoverySource && mediaPlayRef.current.recoverySource === player.src) {
+            const target = Number.isFinite(mediaPlayRef.current.recoveryTarget)
+                ? mediaPlayRef.current.recoveryTarget : Number(player.currentTime) || 0;
+            cancelWorkerTimer();
+            seekThenMaybePlay(target, true, null, { reload: true });
+            return;
+        }
         const wasWaiting = isWaitingShadowRef.current;
         cancelWorkerTimer();
         setIsWaitingShadow(false);
@@ -11905,9 +11937,25 @@ export default function App() {
             isSuppressed: () => mediaSeekRef.current.active || mediaPlayRef.current.active || progressSeekRef.current.dragging ||
                 isGapPausing.current || isWaitingShadowRef.current || showModal || isSurvivalMode ||
                 (echoModeRef.current && echoPhaseRef.current === 'ready'),
-            onState: state => { setIsPlaying(state === 'playing'); if (state === 'playing') setSeekNotice(''); },
-            onRecover: () => { player.pause(); requestMediaPlay({ quiet: true }); },
-            onFailure: () => { setIsPlaying(false); setSeekNotice('音訊暫時停止前進，已停止等待。請按播放重試。'); },
+            onState: state => {
+                setIsPlaying(state === 'playing');
+                if (state === 'playing') { mediaPlayRef.current.recoverySource = null; setSeekNotice(''); }
+            },
+            onRecover: () => {
+                const target = Number(player.currentTime) || 0;
+                cancelWorkerTimer();
+                recordPCloudDebug('media.recovery', { stage: 'reload', target });
+                seekThenMaybePlay(target, true, null, { reload: true });
+            },
+            onFailure: () => {
+                const target = mediaPlayRef.current.recoverySource === player.src && Number.isFinite(mediaPlayRef.current.recoveryTarget)
+                    ? mediaPlayRef.current.recoveryTarget : Number(player.currentTime) || 0;
+                cancelWorkerTimer();
+                mediaPlayRef.current.recoverySource = player.src;
+                mediaPlayRef.current.recoveryTarget = target;
+                player.pause(); setIsPlaying(false);
+                setSeekNotice('音訊恢復未完成。請按播放，將重新載入並回到停止的位置。');
+            },
             onDiagnostic: details => recordPCloudDebug('media.playback.health', details)
         });
     }, [mediaSrc, showModal, isSurvivalMode]);

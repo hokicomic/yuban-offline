@@ -56,6 +56,22 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(h.player.currentTime, 7500); assert.equal(h.player.paused, true);
         h.stop();
     });
+    test('a backwards clock adjustment cannot reset the failed-decoder recovery budget: ' + file, () => {
+        const h = setup(); h.advance(2000); assert.equal(h.recoveries(), 1);
+        h.player.currentTime -= 0.0334429; h.player.emit('timeupdate'); h.advance(3200);
+        assert.equal(h.recoveries(), 1); assert.equal(h.failures(), 1);
+        assert.notEqual(h.states.at(-1), 'playing'); h.stop();
+    });
+    test('a seek completion alone cannot count as successful playback recovery: ' + file, () => {
+        const h = setup(); h.advance(2000);
+        h.player.currentTime = 9000; h.player.emit('seeked');
+        h.advance(5200); assert.equal(h.recoveries(), 1); assert.equal(h.failures(), 1);
+        h.stop();
+    });
+    test('an uncompleted native seek outside a managed request is also bounded: ' + file, () => {
+        const h = setup(); h.player.seeking = true; h.player.emit('seeking'); h.advance(5200);
+        assert.equal(h.recoveries(), 1); assert.equal(h.failures(), 1); h.stop();
+    });
     test('data arriving after a stall resumes the icon and permits subsequent sentence monitoring: ' + file, () => {
         const h = setup(); h.advance(2000);
         assert.equal(h.recoveries(), 1);
@@ -80,6 +96,13 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         h.suppress(false); h.advance(1200); assert.equal(h.recoveries(), 0);
         h.player.currentTime += 0.25; h.player.emit('timeupdate');
         assert.equal(h.states.at(-1), 'playing'); h.stop();
+    });
+    test('actual progression after a managed operation re-confirms running state even if it was already playing: ' + file, () => {
+        const h = setup(); h.player.currentTime += 0.5; h.player.emit('timeupdate');
+        h.suppress(true); h.advance(400); h.suppress(false);
+        h.player.currentTime += 0.5; h.player.emit('timeupdate');
+        assert.deepEqual(h.states, ['playing', 'playing'], 'the recovery marker must be released after every managed restart');
+        h.stop();
     });
     test('source replacement and unmount discard pending recovery and event listeners: ' + file, () => {
         const h = setup(); h.player.src = 'blob:next'; h.player.emit('canplay'); h.advance(10000);

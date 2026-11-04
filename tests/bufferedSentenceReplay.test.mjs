@@ -10,20 +10,27 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const actions = source.slice(source.indexOf('    const requestMediaPlay ='), source.indexOf('    const jumpTrackByOffset ='));
     const navigation = source.slice(source.indexOf('    const jumpToSubtitle ='), source.indexOf('    const resetShadowStateForSeek ='));
     const cancel = source.slice(source.indexOf('    const cancelWorkerTimer ='), source.indexOf('    const clampEchoTime ='));
+    const toggle = source.slice(source.indexOf('    const togglePlay ='), source.indexOf('    // --- WORKER INTEGRATION ---'));
+    const healthCallbacks = source.match(/return monitorMediaPlayback\(player, (\{[\s\S]*?\n        \})\);/)[1];
     const setup = (ranges = [[0, 100]]) => {
         const requests = [], plays = [], notices = [], timers = new Map(), listeners = new Map();
-        let id = 0, pauses = 0;
+        let id = 0, pauses = 0, loads = 0;
         const player = { src: 'blob:chapter', duration: 100, actual: 15, paused: true, seeking: false, readyState: 4, error: null,
             buffered: { get length() { return ranges.length; }, start: index => ranges[index][0], end: index => ranges[index][1] },
             get currentTime() { return this.actual; },
             set currentTime(value) { requests.push(value); this.seeking = true; },
             play() { return new Promise((resolve, reject) => plays.push({ resolve, reject })); },
             pause() { pauses++; this.paused = true; },
+            load() { loads++; this.actual = 0; this.readyState = 0; this.seeking = false; this.emit('emptied'); },
+            playbackRate: 1.25,
             addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); },
             removeEventListener(name, fn) { listeners.get(name)?.delete(fn); },
             emit(name) { for (const fn of [...(listeners.get(name) || [])]) fn({ type: name }); } };
         const c = { queueMicrotask, setTimeout: (fn, delay) => { timers.set(++id, { fn, delay }); return id; },
-            clearTimeout: key => timers.delete(key), playerRef: { current: player }, duration: 100,
+            clearTimeout: key => timers.delete(key), player, playerRef: { current: player }, duration: 100,
+            trackLoadRef: { current: { active: false } }, autoplayOnLoadRef: { current: false },
+            progressSeekRef: { current: { dragging: false } }, echoModeRef: { current: false }, echoPhaseRef: { current: 'ready' },
+            showModal: false, isSurvivalMode: false, playbackMode: 'sentence',
             mediaPlayRef: { current: { active: false } }, mediaSeekRef: { current: { active: false } },
             timerTokenRef: { current: 0 }, workerRef: { current: null },
             subtitles: [{ start: 0, end: 5 }, { start: 10, end: 15 }, { start: 20, end: 25 }], currentIndex: 1,
@@ -33,10 +40,10 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             setSeekNotice: value => notices.push(value),
             setIsPlaying: value => { c.playing = value; }, setMediaError() {},
             setCurrentTime: value => { c.time = value; }, recordPCloudDebug() {} };
-        const api = vm.runInNewContext(helpers + '\n' + actions + cancel + navigation + '\n({seekThenMaybePlay,jumpToSubtitle})', c);
+        const api = vm.runInNewContext(helpers + '\n' + actions + cancel + navigation + toggle + '\n({seekThenMaybePlay,jumpToSubtitle,togglePlay,health:' + healthCallbacks + '})', c);
         const locate = time => { player.actual = time; player.seeking = false; player.emit('seeked'); };
         const startPlaying = async () => { player.paused = false; plays.at(-1).resolve(); player.emit('playing'); await flush(); };
-        return { api, c, player, requests, plays, notices, timers, locate, startPlaying, pauses: () => pauses };
+        return { api, c, player, requests, plays, notices, timers, locate, startPlaying, pauses: () => pauses, loads: () => loads };
     };
     test('cached sentence repeats with one native rewind and no verification polling or extra pause: ' + file, async () => {
         const { api, c, player, requests, plays, notices, timers, locate, startPlaying, pauses } = setup();
@@ -107,6 +114,60 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.notEqual(c.playing, true); assert.equal(c.mediaPlayRef.current.active, false);
         assert.deepEqual(requests, [10]); assert.ok(notices.at(-1).includes('未恢復'));
         assert.equal(timers.size, 0);
+    });
+    test('stalled-clock recovery reopens the source and waits at the exact stopped position before playing: ' + file, async () => {
+        const { api, c, player, requests, plays, timers, locate, startPlaying, loads } = setup();
+        player.actual = 22.33; player.paused = false;
+        api.health.onRecover();
+        assert.equal(loads(), 1); assert.equal(player.actual, 0);
+        assert.equal(c.mediaSeekRef.current.active, true); assert.equal(plays.length, 0, 'never play the beginning after a reload');
+        assert.equal(player.playbackRate, 1.25);
+        player.readyState = 1; player.emit('loadedmetadata');
+        assert.deepEqual(requests, [22.33]);
+        player.readyState = 4; locate(22.33); await startPlaying();
+        assert.equal(c.time, 22.33); assert.equal(c.playing, true);
+        assert.equal(c.mediaPlayRef.current.recoverySource, player.src, 'playing event alone cannot declare decoder recovery');
+        api.health.onState('playing');
+        assert.equal(c.mediaPlayRef.current.recoverySource, null);
+        api.jumpToSubtitle(2); locate(20); player.emit('playing');
+        assert.equal(loads(), 1, 'normal buffered next remains fast after actual clock progression');
+        assert.equal(plays.length, 1); assert.equal(timers.size, 0);
+    });
+    test('failure retires stale starts and manual retry reloads the saved position even if the native clock reset to zero: ' + file, async () => {
+        const { api, c, player, requests, plays, locate, startPlaying, loads } = setup();
+        player.actual = 22.33; player.paused = false; api.health.onRecover();
+        player.readyState = 1; player.emit('loadedmetadata'); player.readyState = 4; locate(22.33);
+        assert.equal(plays.length, 1);
+        api.health.onFailure(); player.actual = 0;
+        assert.equal(c.mediaPlayRef.current.active, false); assert.equal(c.mediaSeekRef.current.active, false);
+        api.togglePlay(); assert.equal(loads(), 2); assert.equal(plays.length, 1);
+        plays[0].resolve(); await flush(); assert.equal(c.playing, false, 'cancelled recovery cannot revive an old request');
+        player.readyState = 1; player.emit('loadedmetadata'); player.readyState = 4; locate(22.33); await startPlaying();
+        assert.deepEqual(requests, [22.33, 22.33]); assert.equal(c.time, 22.33);
+        assert.equal(c.playing, true);
+    });
+    test('manual pause during a newly recovered start remains a pause rather than another reload: ' + file, async () => {
+        const { api, player, locate, startPlaying, loads } = setup();
+        player.actual = 22.33; player.paused = false; api.health.onRecover();
+        player.readyState = 1; player.emit('loadedmetadata'); player.readyState = 4; locate(22.33); await startPlaying();
+        api.togglePlay(); assert.equal(player.paused, true); assert.equal(loads(), 1);
+    });
+    test('a reload exception releases the seek lock and permits another manual retry: ' + file, async () => {
+        const { api, c, player, locate, startPlaying, loads } = setup();
+        player.actual = 22.33; player.paused = false;
+        const reload = player.load; player.load = () => { throw Error('temporary file read error'); };
+        api.health.onRecover(); assert.equal(c.mediaSeekRef.current.active, false);
+        player.load = reload; api.togglePlay(); assert.equal(loads(), 1);
+        player.readyState = 1; player.emit('loadedmetadata'); player.readyState = 4; locate(22.33); await startPlaying();
+        assert.equal(c.time, 22.33); assert.equal(c.playing, true);
+    });
+    test('next sentence supersedes recovery without playing an old target or resetting to file start: ' + file, async () => {
+        const { api, c, player, requests, plays, locate, startPlaying, loads } = setup();
+        player.actual = 22.33; player.paused = false; api.health.onRecover();
+        api.jumpToSubtitle(2); assert.equal(loads(), 2); assert.equal(plays.length, 0);
+        player.readyState = 1; player.emit('loadedmetadata'); player.readyState = 4; locate(20); await startPlaying();
+        assert.deepEqual(requests, [20]); assert.equal(c.currentIndex, 2); assert.equal(c.time, 20);
+        assert.equal(c.playing, true);
     });
     test('uncached next sentence remains verified and crossing tracks still loads the adjacent track: ' + file, () => {
         const { api, c, requests, plays } = setup([[0, 15]]);
