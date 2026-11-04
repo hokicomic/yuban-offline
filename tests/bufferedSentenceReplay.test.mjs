@@ -35,7 +35,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             setCurrentTime: value => { c.time = value; }, recordPCloudDebug() {} };
         const api = vm.runInNewContext(helpers + '\n' + actions + cancel + navigation + '\n({seekThenMaybePlay,jumpToSubtitle})', c);
         const locate = time => { player.actual = time; player.seeking = false; player.emit('seeked'); };
-        const startPlaying = async () => { player.paused = false; plays.at(-1).resolve(); await flush(); };
+        const startPlaying = async () => { player.paused = false; plays.at(-1).resolve(); player.emit('playing'); await flush(); };
         return { api, c, player, requests, plays, notices, timers, locate, startPlaying, pauses: () => pauses };
     };
     test('cached sentence repeats with one native rewind and no verification polling or extra pause: ' + file, async () => {
@@ -71,6 +71,32 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.deepEqual(requests, [20, 10]);
         assert.equal(pauses(), 0);
         assert.ok(notices.every(value => value === ''));
+    });
+    test('native pause during a buffered next seek resumes once without a second rewind: ' + file, async () => {
+        const { api, c, player, requests, plays, locate, startPlaying, timers, pauses } = setup();
+        player.paused = false; api.jumpToSubtitle(2);
+        player.paused = true; player.emit('pause');
+        assert.equal(plays.length, 0, 'wait for asynchronous native seek to finish');
+        locate(20); assert.equal(plays.length, 1);
+        player.emit('canplay'); assert.equal(plays.length, 1);
+        await startPlaying();
+        assert.equal(c.playing, true); assert.deepEqual(requests, [20]);
+        assert.equal(pauses(), 0); assert.equal(timers.size, 0);
+    });
+    test('a cancelled buffered seek must not restart a deliberate user pause: ' + file, async () => {
+        const { api, c, player, plays, locate, timers } = setup();
+        player.paused = false; api.jumpToSubtitle(2);
+        c.mediaSeekRef.current.cancel(); player.paused = true; locate(20); await flush();
+        assert.equal(plays.length, 0); assert.equal(timers.size, 0);
+    });
+    test('timed-out buffered playback retires a late play promise before showing failure: ' + file, async () => {
+        const { api, c, player, requests, plays, notices, timers, locate } = setup();
+        api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 }); locate(10);
+        const timeout = [...timers.values()][0]; timeout.fn();
+        player.paused = false; plays[0].resolve(); await flush();
+        assert.notEqual(c.playing, true); assert.equal(c.mediaPlayRef.current.active, false);
+        assert.deepEqual(requests, [10]); assert.ok(notices.at(-1).includes('未恢復'));
+        assert.equal(timers.size, 0);
     });
     test('uncached next sentence remains verified and crossing tracks still loads the adjacent track: ' + file, () => {
         const { api, c, requests, plays } = setup([[0, 15]]);

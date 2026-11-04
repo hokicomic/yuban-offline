@@ -37,37 +37,37 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             c.mediaSeekRef.current.active = false; player.paused = false; state.isPlaying = true; };
         return { c, player, state, requests, timers, send, located };
     };
-    test('single sentence repeats through multiple slow verified seeks: ' + file, () => {
-        const { c, player, state, requests, timers, send, located } = setup();
+    test('single sentence directly rewinds at B across slow seeks without a gap timer: ' + file, () => {
+        const { c, player, state, timers, send, located } = setup();
         for (let cycle = 0; cycle < 3; cycle++) {
             player.time = 15.1;
             send('TICK');
-            assert.equal(player.paused, true);
-            assert.equal(state.isGapPausingRef.current, true);
-            assert.equal(timers.at(-1).payload.delay, 400);
-            assert.equal(requests.length, 0, 'pausing at B must not start another seek');
-            state.isPlaying = false; // native pause event arrives before timer
-            player.seeking = true; // even a delayed native seek must not discard TIMER_DONE
-            send('TIMER_DONE');
-            assert.equal(state.isGapPausingRef.current, false);
             assert.equal(c.mediaSeekRef.current.target, 10);
+            assert.equal(c.mediaSeekRef.current.resume, true);
+            assert.equal(state.isGapPausingRef.current, false);
+            assert.equal(timers.length, 0, 'no pause timer or delayed mobile callback between repeats');
             send('TICK');
-            assert.equal(timers.length, cycle + 1, 'no boundary checks while locating');
+            assert.equal(c.mediaSeekRef.current.target, 10, 'pending seek must not be replaced');
             located();
             send('TICK');
             assert.equal(player.paused, false);
-            assert.equal(timers.length, cycle + 1);
+            assert.equal(timers.length, 0);
         }
     });
-    test('EOF still starts single-sentence repetition after native pause: ' + file, () => {
+    test('EOF directly restarts the selected sentence even after native pause: ' + file, () => {
         const { player, state, send, timers, c } = setup();
         player.ended = true; player.paused = true; state.isPlaying = false;
         send('TICK');
-        assert.equal(timers.length, 1);
-        send('TIMER_DONE', c.timerTokenRef.current - 1);
-        assert.equal(state.isGapPausingRef.current, true, 'stale timer cannot unlock');
-        send('TIMER_DONE');
+        assert.equal(timers.length, 0);
         assert.equal(c.mediaSeekRef.current.target, 10);
+        assert.equal(c.mediaSeekRef.current.resume, true);
+    });
+    test('an obsolete shadow timer cannot unlock or replay the current sentence: ' + file, () => {
+        const { c, state, send } = setup(); state.isShadowing = true;
+        send('TICK'); send('TIMER_DONE', c.timerTokenRef.current - 1);
+        assert.equal(state.isGapPausingRef.current, true);
+        assert.equal(c.mediaSeekRef.current.active, false);
+        send('TIMER_DONE'); assert.equal(c.mediaSeekRef.current.target, 10);
     });
     test('shadow repeats stay in the selected sentence after the repeat count: ' + file, () => {
         const { c, state, player, send, located } = setup();
@@ -95,7 +95,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         player.ended = true; player.paused = true; state.isPlaying = false;
         player.time = 14.9; // subtitle B can slightly exceed media duration
         ended();
-        assert.equal(timers.length, 1);
+        assert.equal(timers.length, 0);
+        assert.equal(c.mediaSeekRef.current.target, 10);
         assert.equal(transitions, 0);
         state.playbackMode = 'continuous';
         ended();

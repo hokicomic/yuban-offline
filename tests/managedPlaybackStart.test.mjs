@@ -47,6 +47,21 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         calls[1].resolve(); await flush();
         assert.deepEqual(events, ['playing']);
     });
+    test('a late play promise while natively paused cannot report playback success: ' + file, async () => {
+        const { player, calls, events, start } = setup(); player.readyState = 4; start();
+        player.paused = true; calls[0].resolve(); await flush();
+        assert.equal(calls.length, 2, 'retry one unexpected native interruption');
+        assert.deepEqual(events, []);
+        player.paused = false; calls[1].resolve(); await flush();
+        assert.deepEqual(events, ['playing']);
+    });
+    test('cancelling a retry prevents a late callback from restarting playback: ' + file, async () => {
+        const { player, calls, events, timers, start } = setup(); player.readyState = 4;
+        const cancel = start(); player.paused = true; calls[0].resolve(); await flush();
+        cancel(); calls[1].resolve(); await flush();
+        assert.equal(calls.length, 2); assert.equal(player.paused, true);
+        assert.deepEqual(events, []); assert.equal(timers.size, 0);
+    });
     test('permission denial is explicit and never automatically retried: ' + file, async () => {
         const { player, calls, events, start } = setup(); start();
         calls[0].reject({ name: 'NotAllowedError' }); await flush();

@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.254 · durable-mobile-index-cache";
+const APP_VERSION = "v5.255 · resilient-sentence-playback";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3849,6 +3849,89 @@ const isMediaReplayBuffered = (player, start, end) => {
     return false;
 };
 
+// A cached rewind is still asynchronous. Observe its completion without another
+// seek or a polling loop; resume only if the native element stopped at the seek.
+const observeBufferedMediaSeek = (player, target, { isCurrent, onRunning, onResume, onFailure, timeoutMs = 15000 }) => {
+    const source = player.src;
+    let finished = false, resumeRequested = false;
+    const events = ['seeked', 'canplay', 'playing', 'timeupdate', 'pause'];
+    const cleanup = () => {
+        finished = true;
+        clearTimeout(timer);
+        events.forEach(name => player.removeEventListener(name, check));
+        player.removeEventListener('error', fail);
+    };
+    const valid = () => isCurrent() && player.src === source;
+    const fail = () => {
+        if (finished) return;
+        const current = valid();
+        cleanup();
+        if (current) onFailure();
+    };
+    const check = event => {
+        if (finished) return;
+        if (!valid()) { cleanup(); return; }
+        if (player.seeking || player.readyState < 2) return;
+        if (player.paused) {
+            if (!resumeRequested) { resumeRequested = true; onResume(); }
+            return;
+        }
+        onRunning();
+        if (event?.type === 'playing' || (event?.type === 'timeupdate' && Number(player.currentTime) > target + 0.025)) cleanup();
+    };
+    const timer = setTimeout(fail, timeoutMs);
+    events.forEach(name => player.addEventListener(name, check));
+    player.addEventListener('error', fail);
+    return cleanup;
+};
+
+// Native playback can wait for data while paused remains false. Track actual
+// clock progress, keep the icon honest, and retry once without rewinding speech.
+const monitorMediaPlayback = (player, { isSuppressed, onState, onRecover, onFailure, onDiagnostic = () => {}, stallMs = 1800, failureMs = 5000 }) => {
+    let stopped = false, timer = null, lastTime = Number(player.currentTime) || 0;
+    let lastProgress = Date.now(), recoveries = 0, lastStatus = '';
+    const source = player.src;
+    const events = ['playing', 'pause', 'waiting', 'stalled', 'timeupdate', 'seeked', 'canplay', 'ended'];
+    const status = value => {
+        if (lastStatus !== value) { lastStatus = value; onState(value); }
+    };
+    const snapshot = stage => onDiagnostic({ stage, currentTime: Number(player.currentTime) || 0,
+        paused: Boolean(player.paused), seeking: Boolean(player.seeking), readyState: player.readyState, managedOperation: Boolean(isSuppressed()) });
+    const check = event => {
+        if (stopped) return;
+        if (player.src !== source) { cleanup(); return; }
+        if (event?.type === 'pause' && player.paused) snapshot('native-paused');
+        const time = Number(player.currentTime) || 0, now = Date.now();
+        if (isSuppressed()) { lastTime = time; lastProgress = now; return; }
+        if (player.paused || player.ended) {
+            status('paused'); lastTime = time; lastProgress = now; return;
+        }
+        const advanced = Math.abs(time - lastTime) > 0.025;
+        if (advanced) {
+            lastTime = time; lastProgress = now; recoveries = 0;
+            if (!player.seeking) status('playing');
+            return;
+        }
+        if (player.seeking || player.readyState < 2 || event?.type === 'waiting' || event?.type === 'stalled') status('waiting');
+        const idle = now - lastProgress;
+        if (idle >= stallMs && recoveries === 0 && !player.seeking) {
+            recoveries = 1; snapshot('resume-stalled-clock'); status('waiting'); onRecover();
+        } else if (idle >= failureMs && recoveries > 0) {
+            snapshot('stalled-clock-failed'); recoveries = 0; lastProgress = now;
+            player.pause(); status('paused'); onFailure();
+        }
+    };
+    const poll = () => { check(); if (!stopped) timer = setTimeout(poll, 400); };
+    const cleanup = () => {
+        stopped = true;
+        if (timer != null) clearTimeout(timer);
+        events.forEach(name => player.removeEventListener(name, check));
+    };
+    events.forEach(name => player.addEventListener(name, check));
+    poll();
+    return cleanup;
+};
+
 // A seek request is not proof that audio decoding has reached the target.
 const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, onDiagnostic = () => {}, timeoutMs = 15000 }) => {
     let timer = null, finished = false, attempts = 0, reloaded = false, recovering = false;
@@ -3934,10 +4017,10 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
         if (timer != null) clearTimeout(timer);
         ['canplay', 'loadeddata'].forEach(name => player.removeEventListener(name, retry));
         player.removeEventListener('error', mediaError);
-        player.removeEventListener('seeked', finishPlaying);
+        ['seeked', 'playing', 'canplay'].forEach(name => player.removeEventListener(name, finishPlaying));
     };
     const finishPlaying = () => {
-        if (finished || !playResolved || player.seeking) return;
+        if (finished || !playResolved || player.seeking || player.paused || player.readyState < 2) return;
         const valid = current();
         cleanup();
         if (valid) onPlaying();
@@ -3954,7 +4037,11 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
         let result;
         try { result = player.play(); } catch (error) { fail(error); return; }
         Promise.resolve(result).then(() => {
+            if (finished || !current()) { cleanup(); return; }
             playResolved = true;
+            if (player.paused && !player.seeking && retries < 1) {
+                retries++; playResolved = false; queueMicrotask(attempt); return;
+            }
             finishPlaying();
         }).catch(error => {
             if (finished || !current()) { cleanup(); return; }
@@ -3972,7 +4059,7 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
     const mediaError = () => fail({ name: 'MediaError', code: player.error?.code, message: player.error?.message || '媒體讀取失敗' });
     ['canplay', 'loadeddata'].forEach(name => player.addEventListener(name, retry));
     player.addEventListener('error', mediaError);
-    player.addEventListener('seeked', finishPlaying);
+    ['seeked', 'playing', 'canplay'].forEach(name => player.addEventListener(name, finishPlaying));
     timer = setTimeout(() => fail({ name: 'TimeoutError', message: '等待媒體資料逾時' }), timeoutMs);
     // This call stays in the original click handler whenever no seek is needed.
     attempt();
@@ -10215,15 +10302,27 @@ export default function App() {
             // or issue play() again while it is running, and never seek back a
             // second time merely because a play promise reports success late.
             try {
-                timerTokenRef.current += 1;
+                mediaSeekRef.current.cancel?.();
+                const token = ++timerTokenRef.current;
                 const keepPlaying = !player.paused && !player.ended;
+                const session = { active: false, cancel: null, target: t, resume: true };
+                mediaSeekRef.current = session;
+                session.cancel = observeBufferedMediaSeek(player, t, {
+                    isCurrent: () => token === timerTokenRef.current && playerRef.current === player,
+                    onRunning: () => setIsPlaying(!player.paused && !player.seeking),
+                    onResume: () => requestMediaPlay({ quiet: true }),
+                    onFailure: () => {
+                        mediaPlayRef.current.cancel?.();
+                        mediaPlayRef.current.active = false;
+                        player.pause(); setIsPlaying(false);
+                        setSeekNotice('跳轉後播放未恢復，請按播放重試。');
+                        recordPCloudDebug('media.buffered-seek.fail', { target: t, actual: Number(player.currentTime) || 0, readyState: player.readyState });
+                    }
+                });
                 player.currentTime = t;
                 setSeekNotice('');
-                if (keepPlaying) {
-                    setIsPlaying(true);
-                } else {
-                    requestMediaPlay({ quiet: true });
-                }
+                setIsPlaying(!player.paused && !player.seeking);
+                if (!keepPlaying) requestMediaPlay({ quiet: true });
                 return;
             } catch (_) { /* A rejected assignment uses verified seeking below. */ }
         }
@@ -11675,6 +11774,11 @@ export default function App() {
                     const shouldPauseAtEnd = playbackMode !== 'continuous';
 
                     if (now >= end || endedSingleSentence) {
+                        if (shouldPauseAtEnd && !isShadowing && loopMode === 'single') {
+                            const range = getBufferedRange(currentSub);
+                            seekThenMaybePlay(range.start, true, null, { bufferedEnd: range.end });
+                            return;
+                        }
                         if (shouldPauseAtEnd) {
                             player.pause();
                             isGapPausingRef.current = true; // Lock
@@ -11776,6 +11880,20 @@ export default function App() {
             }
         };
     }, []); // Empty dependency array because we rely on latestStateRef
+
+    useEffect(() => {
+        const player = playerRef.current;
+        if (!player || !mediaSrc) return;
+        return monitorMediaPlayback(player, {
+            isSuppressed: () => mediaSeekRef.current.active || mediaPlayRef.current.active || progressSeekRef.current.dragging ||
+                isGapPausing.current || isWaitingShadowRef.current || showModal || isSurvivalMode ||
+                (echoModeRef.current && echoPhaseRef.current === 'ready'),
+            onState: state => { setIsPlaying(state === 'playing'); if (state === 'playing') setSeekNotice(''); },
+            onRecover: () => { player.pause(); requestMediaPlay({ quiet: true }); },
+            onFailure: () => { setIsPlaying(false); setSeekNotice('音訊暫時停止前進，已停止等待。請按播放重試。'); },
+            onDiagnostic: details => recordPCloudDebug('media.playback.health', details)
+        });
+    }, [mediaSrc, showModal, isSurvivalMode]);
 
     // [FIX] Removed `handlePlaybackTick` and RAF loop completely
     // The Worker TICK message now drives the logic.
@@ -21892,7 +22010,7 @@ ${userQ}`;
                                     readyState: e.currentTarget.readyState
                                 });
                                 setMediaError(buildMediaPlaybackErrorMessage(currentPlaylistTrack?.mediaFile, e?.currentTarget?.error || null));
-                            }} onPlaying={() => { if (!mediaSeekRef.current.active) setIsPlaying(true); }} onPause={() => setIsPlaying(false)} onRateChange={(e) => setPlaybackRate(e.target.playbackRate)} onEnded={() => {
+                            }} onPlaying={(event) => { const player = event.currentTarget; if (!mediaSeekRef.current.active && !player.paused && !player.seeking && player.readyState >= 2) setIsPlaying(true); }} onPause={(event) => { if (event.currentTarget.paused) setIsPlaying(false); }} onRateChange={(e) => setPlaybackRate(e.target.playbackRate)} onEnded={() => {
                                 // Ensure progress reaches 100% when the media completes
                                 markAllSubtitlesWatched();
                                 // In sentence-loop drill, never auto-switch track at media end.
