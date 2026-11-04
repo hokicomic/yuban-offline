@@ -55,6 +55,49 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         for (const f of frames) { let size=0,byte; do { byte=caf[at++]; size=(size<<7)|(byte&127); } while(byte&128); assert.equal(size,f.length); }
         assert.deepEqual(caf.subarray(caf.indexOf(Buffer.from('data'))+16),concat(...frames));
     });
+    test('native chunks remain bounded and every VBR sample maps to its original bytes: ' + file, async () => {
+        const frames = Array.from({length: 263}, (_, i) => frame(i % 2 ? 14 : 4));
+        const result = await buildIndexedMp3(new Blob(frames));
+        assert.equal(result.chunkCount, 3);
+        for (const blob of [result.blob, result.mov]) {
+            const bytes = Buffer.from(await blob.arrayBuffer()), offsets = findBox(bytes, 'stco'), map = findBox(bytes, 'stsc');
+            assert.equal(offsets.readUInt32BE(4), 3);
+            assert.equal(map.readUInt32BE(4), 2);
+            assert.deepEqual(Array.from({length:6}, (_, i) => map.readUInt32BE(8 + i*4)), [1,128,1,3,7,1]);
+            let relative = bytes.indexOf(Buffer.from('mdat')) + 4;
+            for (let chunk = 0; chunk < 3; chunk++) {
+                assert.equal(offsets.readUInt32BE(8 + chunk*4), relative);
+                const payload = concat(...frames.slice(chunk*128, (chunk+1)*128));
+                assert.deepEqual(bytes.subarray(relative, relative+payload.length), payload);
+                assert.ok(payload.length < 256*1024);
+                relative += payload.length;
+            }
+            assert.equal(relative, bytes.length);
+        }
+    });
+    test('nineteen-hour QuickTime duration stays within signed range with unchanged audio sample rate and exact frame timing: ' + file, async () => {
+        const count = 2616659, header = {version:3,sampleRate:44100,samples:1152,channels:2};
+        const sizes = Array(count).fill(417), audioStart = 351, audioEnd = audioStart + count*417;
+        let slices = 0;
+        const sparseFile = {size:audioEnd,slice:(a,b)=>{slices++;assert.equal(a,audioStart);assert.equal(b,audioEnd);return new Blob([]);}};
+        const index = {header,sizes,audioStart,audioEnd,encoderDelay:576,endPadding:832,hasGapless:true};
+        const result = await buildIndexedMp3(sparseFile, {index});
+        assert.equal(slices, 3, 'reusing the portable frame index only builds native wrappers');
+        assert.equal(result.duration, (count*1152-1408)/44100);
+        for (const blob of [result.blob, result.mov]) {
+            const bytes = Buffer.from(await blob.arrayBuffer());
+            const mdhd = findBox(bytes,'mdhd'), stts = findBox(bytes,'stts'), elst = findBox(bytes,'elst');
+            const scale = mdhd.readUInt32BE(12), duration = mdhd.readUInt32BE(16), packet = stts.readUInt32BE(12);
+            assert.equal(scale,22050); assert.equal(packet,576); assert.ok(duration < 0x7fffffff);
+            assert.equal(duration/scale, count*1152/44100);
+            assert.equal(packet/scale, 1152/44100);
+            assert.ok(Math.abs(elst.readUInt32BE(12)/scale - 1105/44100) <= 0.5/scale);
+            assert.equal(findBox(bytes,'stco').readUInt32BE(4),Math.ceil(count/128));
+        }
+        const entry = findBox(Buffer.from(await result.mov.arrayBuffer()),'.mp3');
+        assert.equal(entry.readUInt32BE(24),44100*65536,'codec sample rate stays unchanged');
+        assert.equal(entry.readUInt32BE(28),1152,'decoded samples per packet stay unchanged');
+    });
     test('MPEG-2/2.5 mono, ID3 footer and raw CBR receive real sample counts: ' + file, async () => {
         for (const version of [0,2,3]) {
             const samples = version === 3 ? 1152 : 576;

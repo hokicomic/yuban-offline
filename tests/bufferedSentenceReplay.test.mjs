@@ -146,6 +146,15 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.deepEqual(requests, [22.33, 22.33]); assert.equal(c.time, 22.33);
         assert.equal(c.playing, true);
     });
+    test('manual recovery does not automatically repeat an already attempted decoder reload: ' + file, () => {
+        const { api, player, loads } = setup();
+        player.actual = 22.33; player.paused = false; api.health.onRecover();
+        assert.equal(loads(), 1);
+        api.health.onRecover(); assert.equal(loads(), 1, 'the same recovery session gets one reload');
+        api.health.onFailure();
+        api.togglePlay(); assert.equal(loads(), 2, 'an explicit manual action may retry once');
+        api.health.onRecover(); assert.equal(loads(), 2);
+    });
     test('manual pause during a newly recovered start remains a pause rather than another reload: ' + file, async () => {
         const { api, player, locate, startPlaying, loads } = setup();
         player.actual = 22.33; player.paused = false; api.health.onRecover();

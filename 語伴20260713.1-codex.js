@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.258 · decoder-stall-recovery";
+const APP_VERSION = "v5.259 · long-mp3-container";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3611,6 +3611,36 @@ const buildIndexedMp3 = async (file, { index = null, isCurrent = () => true, onP
     const full = (type, flags, ...parts) => box(type, u32(flags), ...parts);
     const matrix = u32(65536,0,0,0,65536,0,0,0,1073741824);
     const movieDuration = Math.round(playableSamples / header.sampleRate * 1000);
+    // Keep QuickTime media duration within its signed 32-bit compatibility limit.
+    // Compression ID -2 permits a media timebase distinct from sample rate;
+    // reduce both timebase and packet duration by an exact common divisor.
+    const gcd = (a, b) => b ? gcd(b, a % b) : a;
+    let timeDivisor = 1;
+    if (totalSamples >= 0x7fffffff) {
+        const common = gcd(header.sampleRate, header.samples);
+        for (let divisor = 2; divisor <= common; divisor++) {
+            if (common % divisor === 0 && totalSamples / divisor < 0x7fffffff) { timeDivisor = divisor; break; }
+        }
+    }
+    const mediaTimescale = header.sampleRate / timeDivisor;
+    const packetDuration = header.samples / timeDivisor;
+    const mediaDuration = sizes.length * packetDuration;
+    if (mediaDuration >= 0x7fffffff) throw new Error('音檔超過安全的播放時間範圍');
+    const mediaTrim = Math.round(trimStart / timeDivisor);
+    // Do not describe a gigabyte audiobook as a single native decoder chunk.
+    const framesPerChunk = 128;
+    const chunkOffsets = [];
+    let relativeOffset = 0;
+    sizes.forEach((size, i) => { if (i % framesPerChunk === 0) chunkOffsets.push(relativeOffset); relativeOffset += size; });
+    const chunkMap = sizes.length <= framesPerChunk ? [1, 1, sizes.length, 1]
+        : sizes.length % framesPerChunk ? [2, 1, framesPerChunk, 1, chunkOffsets.length, sizes.length % framesPerChunk, 1]
+        : [1, 1, framesPerChunk, 1];
+    const chunkTable = offset => {
+        const bytes = new Uint8Array((chunkOffsets.length + 1) * 4), view = new DataView(bytes.buffer);
+        view.setUint32(0, chunkOffsets.length);
+        chunkOffsets.forEach((relative, i) => view.setUint32((i + 1) * 4, offset + relative));
+        return bytes;
+    };
     const ftyp = box('ftyp', ascii('isom'), u32(512), ascii('isomiso2mp41'));
     const descriptor = (tag, bytes) => { let n = bytes.length; const length = [n & 127]; while ((n >>>= 7)) length.unshift((n & 127) | 128); return join([new Uint8Array([tag, ...length]), bytes]); };
     const esds = full('esds', 0, descriptor(3, join([new Uint8Array([0,1,0]), descriptor(4, join([new Uint8Array([header.version === 3 ? 107 : 105, 21, 0, 0, 0]), u32(0,0)])), descriptor(6, new Uint8Array([2]))])));
@@ -3618,13 +3648,13 @@ const buildIndexedMp3 = async (file, { index = null, isCurrent = () => true, onP
     const makeMoov = (offset, entry = audioEntry) => box('moov',
         full('mvhd', 0, u32(0,0,1000,movieDuration,65536), new Uint8Array([1,0,0,0]), new Uint8Array(8), matrix, new Uint8Array(24), u32(2)),
         box('trak', full('tkhd', 3, u32(0,0,1,0,movieDuration), new Uint8Array(8), new Uint8Array([0,0,0,0,1,0,0,0]), matrix, u32(0,0)),
-            box('edts', full('elst', 0, u32(1,movieDuration,trimStart,65536))),
-            box('mdia', full('mdhd', 0, u32(0,0,header.sampleRate,totalSamples), new Uint8Array([85,196,0,0])),
+            box('edts', full('elst', 0, u32(1,movieDuration,mediaTrim,65536))),
+            box('mdia', full('mdhd', 0, u32(0,0,mediaTimescale,mediaDuration), new Uint8Array([85,196,0,0])),
                 full('hdlr', 0, u32(0), ascii('soun'), new Uint8Array(12), ascii('SoundHandler\0')),
                 box('minf', full('smhd',0,u32(0)), box('dinf', full('dref',0,u32(1),full('url ',1))),
-                    box('stbl', full('stsd',0,u32(1),entry), full('stts',0,u32(1,sizes.length,header.samples)),
-                        full('stsc',0,u32(1,1,sizes.length,1)), full('stsz',0,u32(0,sizes.length), (() => { const b = new Uint8Array(sizes.length * 4); const v = new DataView(b.buffer); sizes.forEach((size,i) => v.setUint32(i * 4,size)); return b; })()),
-                        full('stco',0,u32(1,offset)))))));
+                    box('stbl', full('stsd',0,u32(1),entry), full('stts',0,u32(1,sizes.length,packetDuration)),
+                        full('stsc',0,u32(...chunkMap)), full('stsz',0,u32(0,sizes.length), (() => { const b = new Uint8Array(sizes.length * 4); const v = new DataView(b.buffer); sizes.forEach((size,i) => v.setUint32(i * 4,size)); return b; })()),
+                        full('stco',0,chunkTable(offset)))))));
     const moov = makeMoov(0);
     const result = new Blob([ftyp, makeMoov(ftyp.length + moov.length + 8), u32(position - audioStart + 8), ascii('mdat'), file.slice(audioStart, position)], { type: 'audio/mp4' });
     // QuickTime's native MP3 sample description is .mp3 version 1, not
@@ -3651,7 +3681,7 @@ const buildIndexedMp3 = async (file, { index = null, isCurrent = () => true, onP
         cafChunk('pakt', u64(sizes.length), u64(playableSamples), u32(Math.min(trimStart, totalSamples - playableSamples), Math.max(0, totalSamples - playableSamples - trimStart)), packetSizes.subarray(0,packetBytes)),
         ascii('data'), u64(position - audioStart + 4), u32(0), file.slice(audioStart, position)], { type: 'audio/x-caf' });
     abort(); onProgress(100);
-    return { blob: result, mov, caf, index: record, frames: sizes.length, duration: playableSamples / header.sampleRate, sampleRate: header.sampleRate };
+    return { blob: result, mov, caf, index: record, frames: sizes.length, duration: playableSamples / header.sampleRate, sampleRate: header.sampleRate, mediaTimescale, packetDuration, chunkCount: chunkOffsets.length };
 };
 
 const probeIndexedMp3 = (blob, { isCurrent = () => true, timeoutMs = 8000 } = {}) => new Promise((resolve, reject) => {
@@ -11468,7 +11498,7 @@ export default function App() {
                     setMediaSeekMode('indexed');
                     setMediaIndexStorage(indexed.indexSource === 'folder' ? 'folder' : indexed.indexSource === 'cache' ? 'reused-cache' : indexed.cacheSaved ? 'cache' : 'memory');
                     mediaIndexExportRef.current = indexed.indexBlob ? { blob: indexed.indexBlob, filename: getMp3IndexFileName(track.mediaFile), verification: indexed.verification, source: indexed.indexSource, container: indexed.container } : null;
-                    recordPCloudDebug('media.index.ready', { frames: indexed.frames, duration: indexed.duration, container: indexed.container, source: indexed.indexSource, buildMs: indexed.buildMs, prepareMs: indexed.prepareMs, verification: indexed.verification, rejectedIndexes: indexed.rejectedIndexes });
+                    recordPCloudDebug('media.index.ready', { frames: indexed.frames, duration: indexed.duration, container: indexed.container, source: indexed.indexSource, buildMs: indexed.buildMs, prepareMs: indexed.prepareMs, verification: indexed.verification, rejectedIndexes: indexed.rejectedIndexes, mediaTimescale: indexed.mediaTimescale, packetDuration: indexed.packetDuration, chunkCount: indexed.chunkCount });
                     if (indexed.indexBlob && indexed.indexSource !== 'folder') {
                         void saveMp3IndexBesideMedia(track.mediaFile, indexed.indexBlob, openedFolderHandleRef.current, () => loadToken === trackLoadRef.current.token).then(saved => {
                             if (saved && loadToken === trackLoadRef.current.token) setMediaIndexStorage('folder');
@@ -11942,6 +11972,10 @@ export default function App() {
                 if (state === 'playing') { mediaPlayRef.current.recoverySource = null; setSeekNotice(''); }
             },
             onRecover: () => {
+                if (mediaPlayRef.current.recoverySource === player.src) {
+                    recordPCloudDebug('media.recovery', { stage: 'reload-already-tried', target: mediaPlayRef.current.recoveryTarget });
+                    return;
+                }
                 const target = Number(player.currentTime) || 0;
                 cancelWorkerTimer();
                 recordPCloudDebug('media.recovery', { stage: 'reload', target });
@@ -11954,7 +11988,7 @@ export default function App() {
                 mediaPlayRef.current.recoverySource = player.src;
                 mediaPlayRef.current.recoveryTarget = target;
                 player.pause(); setIsPlaying(false);
-                setSeekNotice('音訊恢復未完成。請按播放，將重新載入並回到停止的位置。');
+                setSeekNotice('此播放來源重載後仍無法前進。請重新選取音檔；不會繼續自動重試。');
             },
             onDiagnostic: details => recordPCloudDebug('media.playback.health', details)
         });
