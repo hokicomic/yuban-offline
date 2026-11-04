@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.251 · compact-index-header";
+const APP_VERSION = "v5.252 · long-audiobook-lrc";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3615,19 +3615,28 @@ const buildIndexedMp3 = async (file, { index = null, isCurrent = () => true, onP
     const descriptor = (tag, bytes) => { let n = bytes.length; const length = [n & 127]; while ((n >>>= 7)) length.unshift((n & 127) | 128); return join([new Uint8Array([tag, ...length]), bytes]); };
     const esds = full('esds', 0, descriptor(3, join([new Uint8Array([0,1,0]), descriptor(4, join([new Uint8Array([header.version === 3 ? 107 : 105, 21, 0, 0, 0]), u32(0,0)])), descriptor(6, new Uint8Array([2]))])));
     const audioEntry = box('mp4a', new Uint8Array(6), new Uint8Array([0,1]), new Uint8Array(8), new Uint8Array([0,header.channels,0,16,0,0,0,0]), u32(header.sampleRate * 65536), esds);
-    const makeMoov = offset => box('moov',
+    const makeMoov = (offset, entry = audioEntry) => box('moov',
         full('mvhd', 0, u32(0,0,1000,movieDuration,65536), new Uint8Array([1,0,0,0]), new Uint8Array(8), matrix, new Uint8Array(24), u32(2)),
         box('trak', full('tkhd', 3, u32(0,0,1,0,movieDuration), new Uint8Array(8), new Uint8Array([0,0,0,0,1,0,0,0]), matrix, u32(0,0)),
             box('edts', full('elst', 0, u32(1,movieDuration,trimStart,65536))),
             box('mdia', full('mdhd', 0, u32(0,0,header.sampleRate,totalSamples), new Uint8Array([85,196,0,0])),
                 full('hdlr', 0, u32(0), ascii('soun'), new Uint8Array(12), ascii('SoundHandler\0')),
                 box('minf', full('smhd',0,u32(0)), box('dinf', full('dref',0,u32(1),full('url ',1))),
-                    box('stbl', full('stsd',0,u32(1),audioEntry), full('stts',0,u32(1,sizes.length,header.samples)),
+                    box('stbl', full('stsd',0,u32(1),entry), full('stts',0,u32(1,sizes.length,header.samples)),
                         full('stsc',0,u32(1,1,sizes.length,1)), full('stsz',0,u32(0,sizes.length), (() => { const b = new Uint8Array(sizes.length * 4); const v = new DataView(b.buffer); sizes.forEach((size,i) => v.setUint32(i * 4,size)); return b; })()),
                         full('stco',0,u32(1,offset)))))));
     const moov = makeMoov(0);
     const result = new Blob([ftyp, makeMoov(ftyp.length + moov.length + 8), u32(position - audioStart + 8), ascii('mdat'), file.slice(audioStart, position)], { type: 'audio/mp4' });
-    // WebKit/Core Audio supports MP3 in CAF rather than MP4. Its packet
+    // QuickTime's native MP3 sample description is .mp3 version 1, not
+    // MPEG-4 mp4a/esds. Keep the dense seek table and native pitch-preserving playback.
+    const movFtyp = box('ftyp', ascii('qt  '), u32(512), ascii('qt  '));
+    const movEntry = box('.mp3', new Uint8Array(6), new Uint8Array([0,1]), u32(65536,0),
+        new Uint8Array([0,header.channels,0,16,255,254,0,0]), u32(header.sampleRate * 65536), u32(header.samples,0,0,2));
+    const movMoov = makeMoov(0, movEntry);
+    const mov = new Blob([movFtyp, makeMoov(movFtyp.length + movMoov.length + 8, movEntry),
+        u32(position - audioStart + 8), ascii('mdat'), file.slice(audioStart, position)], { type: 'video/quicktime' });
+    // Retain CAF as a compatibility fallback. Its packet
+
     // table carries the same exact frame sizes and encoder priming/trimming.
     const u64 = value => u32(Math.floor(value / 4294967296), value >>> 0);
     const cafChunk = (type, ...parts) => { const data = join(parts); return join([ascii(type), u64(data.length), data]); };
@@ -3642,7 +3651,7 @@ const buildIndexedMp3 = async (file, { index = null, isCurrent = () => true, onP
         cafChunk('pakt', u64(sizes.length), u64(playableSamples), u32(Math.min(trimStart, totalSamples - playableSamples), Math.max(0, totalSamples - playableSamples - trimStart)), packetSizes.subarray(0,packetBytes)),
         ascii('data'), u64(position - audioStart + 4), u32(0), file.slice(audioStart, position)], { type: 'audio/x-caf' });
     abort(); onProgress(100);
-    return { blob: result, caf, index: record, frames: sizes.length, duration: playableSamples / header.sampleRate, sampleRate: header.sampleRate };
+    return { blob: result, mov, caf, index: record, frames: sizes.length, duration: playableSamples / header.sampleRate, sampleRate: header.sampleRate };
 };
 
 const probeIndexedMp3 = (blob, { isCurrent = () => true, timeoutMs = 8000 } = {}) => new Promise((resolve, reject) => {
@@ -3761,9 +3770,34 @@ const saveMp3IndexBesideMedia = async (file, blob, fallbackFolder, isCurrent) =>
     } catch (_) { return false; }
 };
 
+const validateMp3FrameIndex = async (file, index, isCurrent = () => true) => {
+    const {header,sizes,audioStart,audioEnd,encoderDelay,endPadding,hasGapless}=index;
+    const totalSamples=sizes.length*header.samples;
+    const trim=hasGapless?encoderDelay+529:0;
+    const duration=(totalSamples-(hasGapless?encoderDelay+endPadding:0))/header.sampleRate;
+    const wanted=new Map();
+    for(let i=0;i<16;i++)wanted.set(Math.floor((sizes.length-1)*i/15),null);
+    for(const seconds of [120,7200,7500])if(seconds<duration)wanted.set(Math.min(sizes.length-1,Math.floor((seconds*header.sampleRate+trim)/header.samples)),seconds);
+    const points=[];let offset=audioStart;
+    for(let frame=0;frame<sizes.length;frame++){
+        if(wanted.has(frame))points.push({frame,offset,size:sizes[frame],time:Math.max(0,(frame*header.samples-trim)/header.sampleRate),target:wanted.get(frame)});
+        offset+=sizes[frame];
+    }
+    if(offset!==audioEnd||audioEnd>file.size)throw new Error('索引與音檔總長度不符');
+    for(const point of points){
+        if(!isCurrent())throw Object.assign(new Error('音檔已切換'),{name:'AbortError'});
+        const bytes=new Uint8Array(await file.slice(point.offset,point.offset+4).arrayBuffer());
+        const frame=readMp3FrameHeader(bytes);
+        if(!frame||frame.length!==point.size||frame.sampleRate!==header.sampleRate||frame.version!==header.version||frame.channels!==header.channels)
+            throw new Error(`索引在 ${point.time.toFixed(2)} 秒與原音框不符`);
+    }
+    return {frameCount:sizes.length,sampleRate:header.sampleRate,duration,audioBytes:audioEnd-audioStart,sourceBytes:file.size,checkedFrames:points.length,points};
+};
+
 const prepareIndexedMp3 = async (file, options) => {
     const preparationStarted=Date.now();
-    let fingerprint=null,index=null,indexBlob=null,indexSource='scan';
+    let fingerprint=null,index=null,indexBlob=null,indexSource='scan',verification=null;
+    const rejectedIndexes=[];
     try { fingerprint=await fingerprintMp3File(file); } catch (_) { /* Cache is optional. */ }
     const isCurrent=()=>options.isCurrent();
     if(fingerprint){
@@ -3773,24 +3807,27 @@ const prepareIndexedMp3 = async (file, options) => {
             try {
                 const blob=sidecar || (kind==='cache' ? await accessMp3IndexCache(fingerprint) : null);
                 if(!blob)continue;
-                index=await decodeMp3Index(blob,file,fingerprint);indexBlob=blob;indexSource=kind;break;
-            }catch(_){ /* Changed/corrupt/stale indexes must be rebuilt. */ }
+                const candidate=await decodeMp3Index(blob,file,fingerprint);
+                verification=await validateMp3FrameIndex(file,candidate,isCurrent);
+                index=candidate;indexBlob=blob;indexSource=kind;break;
+            }catch(error){rejectedIndexes.push({source:kind,message:String(error?.message||error)}); /* Rebuild invalid indexes. */ }
         }
     }
     if(index)options.onReuse?.(indexSource);
     const started=Date.now();
     const indexed=await buildIndexedMp3(file,{...options,index});
     const buildMs=Date.now()-started;
+    if(!verification)verification=await validateMp3FrameIndex(file,indexed.index,isCurrent);
     if(!indexBlob&&fingerprint)indexBlob=encodeMp3Index(indexed.index,file,fingerprint);
     const preferCaf=Boolean(document.createElement('audio').canPlayType('audio/x-caf'));
-    const candidates=preferCaf?[indexed.caf,indexed.blob]:[indexed.blob,indexed.caf];
+    const candidates=(preferCaf?[indexed.mov,indexed.caf,indexed.blob]:[indexed.blob,indexed.mov,indexed.caf]).filter(Boolean);
     for(const blob of candidates){
         if(!isCurrent())throw Object.assign(new Error('音檔已切換'),{name:'AbortError'});
         try {
             await probeIndexedMp3(blob,options);
             const cacheSaved=Boolean(indexBlob&&await accessMp3IndexCache(fingerprint,indexBlob));
             if(!isCurrent())throw Object.assign(new Error('音檔已切換'),{name:'AbortError'});
-            return {...indexed,blob,container:blob.type,indexBlob,indexSource,cacheSaved,buildMs,prepareMs:Date.now()-preparationStarted};
+            return {...indexed,blob,container:blob.type,indexBlob,indexSource,cacheSaved,buildMs,verification,rejectedIndexes,prepareMs:Date.now()-preparationStarted};
         }catch(error){if(!isCurrent())throw error;}
     }
     throw new Error('此瀏覽器不支援精準索引容器，改用原始 MP3');
@@ -3973,19 +4010,20 @@ const parseSRT = (data) => {
 };
 
 const parseLRC = (data) => {
-    const lines = data.split(/\r?\n/);
-    const timeRegex = /\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\]/g;
+    const lines = String(data || '').replace(/^\uFEFF/, '').split(/\r?\n/);
+    // Audiobooks commonly use cumulative minutes: [125:03.27], [1139:10.67].
+    // Also accept explicit hours without interpreting them as minute/second tags.
+    const timeRegex = /\[(?:(\d+):)?(\d+):(\d{1,2})(?:\.(\d{1,3}))?\]/g;
     let entries = [];
     lines.forEach(line => {
         let match;
         const matches = [];
         timeRegex.lastIndex = 0;
         while ((match = timeRegex.exec(line)) !== null) {
-            matches.push({
-                time: parseInt(match[1]) * 60 + parseInt(match[2]) + (match[3] ? parseFloat('0.' + match[3]) : 0),
-                length: match[0].length,
-                index: match.index
-            });
+            const hours = Number(match[1] || 0), minutes = Number(match[2]), seconds = Number(match[3]);
+            const time = hours * 3600 + minutes * 60 + seconds + (match[4] ? Number('0.' + match[4]) : 0);
+            if (seconds >= 60 || (match[1] != null && minutes >= 60) || !Number.isFinite(time)) continue;
+            matches.push({ time, length: match[0].length, index: match.index });
         }
         if (matches.length > 0) {
             const lastMatch = matches[matches.length - 1];
@@ -11265,8 +11303,8 @@ export default function App() {
                     if (loadToken !== trackLoadRef.current.token) return;
                     setMediaSeekMode('indexed');
                     setMediaIndexStorage(indexed.indexSource === 'folder' ? 'folder' : indexed.indexSource === 'cache' ? 'reused-cache' : indexed.cacheSaved ? 'cache' : 'memory');
-                    mediaIndexExportRef.current = indexed.indexBlob ? { blob: indexed.indexBlob, filename: getMp3IndexFileName(track.mediaFile) } : null;
-                    recordPCloudDebug('media.index.ready', { frames: indexed.frames, duration: indexed.duration, container: indexed.container, source: indexed.indexSource, buildMs: indexed.buildMs, prepareMs: indexed.prepareMs });
+                    mediaIndexExportRef.current = indexed.indexBlob ? { blob: indexed.indexBlob, filename: getMp3IndexFileName(track.mediaFile), verification: indexed.verification, source: indexed.indexSource, container: indexed.container } : null;
+                    recordPCloudDebug('media.index.ready', { frames: indexed.frames, duration: indexed.duration, container: indexed.container, source: indexed.indexSource, buildMs: indexed.buildMs, prepareMs: indexed.prepareMs, verification: indexed.verification, rejectedIndexes: indexed.rejectedIndexes });
                     if (indexed.indexBlob && indexed.indexSource !== 'folder') {
                         void saveMp3IndexBesideMedia(track.mediaFile, indexed.indexBlob, openedFolderHandleRef.current, () => loadToken === trackLoadRef.current.token).then(saved => {
                             if (saved && loadToken === trackLoadRef.current.token) setMediaIndexStorage('folder');
@@ -20933,7 +20971,7 @@ ${userQ}`;
         else setEmbeddedKnowledgePanelHeight(height);
     };
     const effectiveSubtitleFontSize = Math.max(16, subtitleFontSize - 3);
-    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && (currentSubtitlePresentation?.aligned || currentSubtitlePresentation?.trusted) ? currentSubtitlePresentation.text : subtitles[currentIndex]?.text) || "Load File...";
+    const subtitleDisplayText = (referenceSubtitleCorrectionEnabled && (currentSubtitlePresentation?.aligned || currentSubtitlePresentation?.trusted) ? currentSubtitlePresentation.text : subtitles[currentIndex]?.text) || (subtitles.length ? '目前時間沒有對應字幕' : mediaSrc ? '此影音尚未載入字幕' : '請先載入影音與字幕');
     // The divider keeps the top reference/media panel and the subtitle panel as
     // one adjustable reading surface.  The subtitle card itself flexes into all
     // remaining vertical space, so no empty strip is left below it.
@@ -21402,7 +21440,7 @@ ${userQ}`;
                     onChange={event => setSeekTimeInput(event.target.value)}
                     placeholder="1:23:45" aria-label="起播時間，時分秒"
                     autoComplete="off" spellCheck={false}
-                    className="w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-mono text-gray-800" />
+                    className="w-28 sm:w-24 rounded border border-gray-300 bg-white px-2 py-1 text-base leading-4 sm:text-xs font-mono text-gray-800" />
             </label>
             <button type="submit" disabled={!mediaSrc || (trackLoadRef.current.active && !trackLoadRef.current.metadataReady)} data-subtitle-focus-restore className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
         </form>
@@ -21623,6 +21661,16 @@ ${userQ}`;
 
                 {showSettings && (
                     <div ref={settingsPanelRef} className="absolute top-16 right-4 z-[100] bg-white border border-gray-200 shadow-xl rounded-xl p-4 w-80 animate-in fade-in slide-in-from-top-2 max-h-[80vh] overflow-y-auto">
+                        {mediaIndexExportRef.current?.verification && <details className="mb-3 rounded border border-slate-200 p-2 text-xs text-slate-600" aria-label="目前音檔索引檢查">
+                            <summary className="cursor-pointer font-medium">目前音檔索引檢查：通過</summary>
+                            <p className="mt-2">來源：{mediaIndexExportRef.current.source === 'cache' ? '重用手機／瀏覽器快取' : mediaIndexExportRef.current.source === 'folder' ? '重用同目錄索引檔' : '本次掃描建立'}</p>
+                            <p>音框：{mediaIndexExportRef.current.verification.frameCount.toLocaleString()} · 時長：{formatTime(mediaIndexExportRef.current.verification.duration)}</p>
+                            <p>原音檔：{(mediaIndexExportRef.current.verification.sourceBytes / 1048576).toFixed(1)} MB</p>
+                            <p>已核對總長度，並抽查 {mediaIndexExportRef.current.verification.checkedFrames} 個位置的原音框。</p>
+                            <p className="mt-1 break-all">播放封裝：{mediaIndexExportRef.current.container}</p>
+                            <p className="mt-1 text-[10px]">這是索引資料檢查；能否實際播放仍由播放器另行確認。</p>
+                        </details>}
+
                         <h3 className="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2"><Key size={16} /> API Key</h3>
                         <input type="password" value={currentApiKey} onChange={(e) => setCurrentApiKey(e.target.value)} placeholder="API Key" className="w-full border border-gray-300 rounded p-2 text-sm mb-3" />
 

@@ -41,6 +41,9 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(offset,mp4.indexOf(Buffer.from('mdat'))+4);
         assert.deepEqual(mp4.subarray(offset),concat(...frames));
         const elst = findBox(mp4,'elst'); assert.equal(elst.readUInt32BE(12),1105,'include MP3 decoder priming');
+        const mov=Buffer.from(await result.mov.arrayBuffer());
+        assert.deepEqual(findBox(mov,'mdat'),concat(...frames));
+        const entry=findBox(mov,'.mp3');assert.equal(entry.readUInt16BE(8),1);assert.equal(entry.readInt16BE(20),-2);assert.equal(entry.readUInt32BE(28),1152);
         const caf = Buffer.from(await result.caf.arrayBuffer());
         assert.equal(caf.toString('ascii',0,4),'caff');
         const pakt = caf.indexOf(Buffer.from('pakt')) + 12;
@@ -89,7 +92,7 @@ for (const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
     test('choose Core Audio or MP4 by capability, probe failures fall back and stale work is cancelled: '+file, async()=>{
         for(const preferCaf of [true,false]) {
             let calls=[];let current=true;let rejectFirst=true;
-            const c={fingerprintMp3File:async()=>null,document:{createElement:()=>({canPlayType:()=>preferCaf?'maybe':''})},
+            const c={fingerprintMp3File:async()=>null,validateMp3FrameIndex:async()=>({checkedFrames:1}),document:{createElement:()=>({canPlayType:()=>preferCaf?'maybe':''})},
                 buildIndexedMp3:async()=>({blob:{type:'audio/mp4'},caf:{type:'audio/x-caf'}}),
                 probeIndexedMp3:async(blob)=>{calls.push(blob.type);if(rejectFirst){rejectFirst=false;throw Error('unsupported');}}};
             const prepare=vm.runInNewContext(code+';prepareIndexedMp3',c);
@@ -107,7 +110,7 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']){
     const source=fs.readFileSync(new URL('../'+file,import.meta.url),'utf8');
     const buildCode=source.slice(source.indexOf('const readMp3FrameHeader ='),source.indexOf('const probeIndexedMp3 ='));
     const cacheCode=source.slice(source.indexOf('const mp3SourceFolderHandles ='),source.indexOf('const prepareIndexedMp3 ='));
-    const api=vm.runInNewContext(buildCode+cacheCode+';({buildIndexedMp3,fingerprintMp3File,encodeMp3Index,decodeMp3Index,accessMp3IndexCache,saveMp3IndexBesideMedia,mp3SourceFolderHandles,findMp3IndexFile})', {Blob,Uint8Array,DataView,TextEncoder,TextDecoder,crypto:webcrypto,setTimeout,clearTimeout});
+    const api=vm.runInNewContext(buildCode+cacheCode+';({buildIndexedMp3,fingerprintMp3File,encodeMp3Index,decodeMp3Index,accessMp3IndexCache,saveMp3IndexBesideMedia,mp3SourceFolderHandles,findMp3IndexFile,validateMp3FrameIndex})', {Blob,Uint8Array,DataView,TextEncoder,TextDecoder,crypto:webcrypto,setTimeout,clearTimeout});
     test('portable index survives a copied/renamed file and bypasses full audio scanning: '+file,async()=>{
         const blob=new Blob([frame(4),frame(14),frame(9)]);
         const first=await api.buildIndexedMp3(blob);const fingerprint=await api.fingerprintMp3File(blob);
@@ -131,6 +134,18 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']){
         const damaged=Buffer.from(await portable.arrayBuffer());damaged[damaged.length-1]^=128;
         await assert.rejects(api.decodeMp3Index(new Blob([damaged]),blob,hash));
         await assert.rejects(api.decodeMp3Index(new Blob([damaged.subarray(0,16)]),blob,hash));
+    });
+    test('validate a nineteen-hour index against original frame headers including the two-hour target: '+file,async()=>{
+        const header={version:3,sampleRate:44100,samples:1152,channels:2};
+        const count=Math.ceil(19*3600*44100/1152),packet=frame(9),sizes=Array(count).fill(packet.length);
+        const size=count*packet.length;let invalid=false,reads=0;
+        const audio={size,slice:(start,end)=>{assert.equal(end-start,4);assert.equal(start%packet.length,0);reads++;return new Blob([invalid?Buffer.from('BAD!'):packet.subarray(0,4)]);}};
+        const index={header,sizes,audioStart:0,audioEnd:size,encoderDelay:0,endPadding:0,hasGapless:false};
+        const result=await api.validateMp3FrameIndex(audio,index);
+        assert.equal(result.frameCount,count);assert.ok(result.duration>=19*3600);
+        assert.equal(reads,result.checkedFrames);assert.ok(reads>=16);
+        const target=result.points.find(p=>p.target===7500);assert.ok(target.offset>0);assert.ok(Math.abs(target.time-7500)<1152/44100);
+        invalid=true;await assert.rejects(api.validateMp3FrameIndex(audio,index),/原音框不符/);
     });
     test('cache unavailability never blocks playback; folder writes require existing grant: '+file,async()=>{
         assert.equal(await api.accessMp3IndexCache('test'),null);
