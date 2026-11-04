@@ -87,6 +87,43 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(failed.length, 1);
     });
 
+    test('a new target supersedes an unfinished old seek immediately: ' + file, () => {
+        const { api, player, advance } = setup();
+        player.seeking = true;
+        const located=[];
+        api.performVerifiedMediaSeek(player,7200,{isCurrent:()=>true,onLocated:t=>located.push(t),onFailure(){assert.fail();}});
+        assert.deepEqual(player.requests,[7200]);
+        advance(1600);
+        assert.equal(player.requests.length,2,'bounded stall retry without playing early');
+        assert.equal(located.length,0);assert.equal(player.paused,true);
+        player.actual=7200;player.seeking=false;player.emit('seeked');
+        assert.deepEqual(located,[7200]);
+    });
+
+    test('stalled media reloads once, restores rate and verifies after fresh metadata: ' + file, () => {
+        const { api, player, advance, timers } = setup();
+        let loads=0;const located=[],failures=[];
+        player.playbackRate=1.25;
+        player.load=()=>{loads++;player.actual=0;player.readyState=0;player.seeking=false;player.playbackRate=1;player.emit('emptied');};
+        api.performVerifiedMediaSeek(player,5400,{isCurrent:()=>true,onLocated:t=>located.push(t),onFailure:t=>failures.push(t)});
+        advance(5300);
+        assert.equal(loads,1);assert.equal(player.playbackRate,1.25);
+        assert.equal(located.length,0);assert.equal(failures.length,0);
+        player.readyState=1;player.emit('loadedmetadata');
+        assert.equal(player.requests.at(-1),5400);
+        player.actual=5400;player.seeking=false;player.readyState=4;player.emit('seeked');
+        assert.deepEqual(located,[5400]);assert.equal(timers.size,0);
+        advance(20000);assert.equal(loads,1);
+    });
+
+    test('cancelled recovery never reloads or publishes a late position: ' + file, () => {
+        const { api, player, advance, timers } = setup();let loads=0;
+        player.load=()=>loads++;
+        const cancel=api.performVerifiedMediaSeek(player,5400,{isCurrent:()=>true,onLocated(){assert.fail();},onFailure(){assert.fail();}});
+        cancel();advance(20000);player.actual=5400;player.seeking=false;player.emit('seeked');
+        assert.equal(loads,0);assert.equal(timers.size,0);
+    });
+
     test('time input supports hours, long minutes, seconds and decimals: ' + file, () => {
         const { api } = setup();
         for (const [input, expected] of [['1:23:45', 5025], ['90:00', 5400], ['5400', 5400], ['00:00:00', 0], ['1:02:03.5', 3723.5]]) {

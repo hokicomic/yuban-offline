@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.249 · reference-first-dictation";
+const APP_VERSION = "v5.250 · indexed-mp3-seeking";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3500,6 +3500,283 @@ const parsePlaybackTimeInput = (input) => {
     return Number.isFinite(seconds) ? seconds : null;
 };
 
+// MP3 Xing tables contain only 100 coarse byte offsets. Rewrap local MP3
+// frames in MP4/CAF with exact sample tables; keep compressed audio unchanged.
+const readMp3FrameHeader = (bytes, offset = 0) => {
+    if (offset + 4 > bytes.length || bytes[offset] !== 255 || (bytes[offset + 1] & 224) !== 224) return null;
+    const version = (bytes[offset + 1] >> 3) & 3;
+    const layer = (bytes[offset + 1] >> 1) & 3;
+    const bitrateIndex = bytes[offset + 2] >> 4;
+    const rateIndex = (bytes[offset + 2] >> 2) & 3;
+    if (version === 1 || layer !== 1 || bitrateIndex === 0 || bitrateIndex === 15 || rateIndex === 3) return null;
+    const rates = version === 3 ? [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320] : [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160];
+    const sampleRate = [44100,48000,32000][rateIndex] / (version === 3 ? 1 : version === 2 ? 2 : 4);
+    return { version, sampleRate, samples: version === 3 ? 1152 : 576,
+        channels: (bytes[offset + 3] >> 6) === 3 ? 1 : 2,
+        length: Math.floor((version === 3 ? 144000 : 72000) * rates[bitrateIndex] / sampleRate) + ((bytes[offset + 2] >> 1) & 1) };
+};
+
+const scanMp3Frames = async (file, { isCurrent = () => true, onProgress = () => {} } = {}) => {
+    const abort = () => { if (!isCurrent()) throw Object.assign(new Error('音檔已切換'), { name: 'AbortError' }); };
+    const read = async (start, end) => { abort(); const bytes = new Uint8Array(await file.slice(start, end).arrayBuffer()); abort(); return bytes; };
+    if (!Number.isFinite(file.size) || file.size < 8 || file.size > 0xfffffff0) throw new Error('MP3 超過索引容量或內容不完整');
+    const first = await read(0, Math.min(file.size, 10));
+    let position = first[0] === 73 && first[1] === 68 && first[2] === 51
+        ? 10 + ((first[6] & 127) * 2097152 + (first[7] & 127) * 16384 + (first[8] & 127) * 128 + (first[9] & 127)) + ((first[3] === 4 && (first[5] & 16)) ? 10 : 0) : 0;
+    let chunk = new Uint8Array(), chunkStart = -1;
+    const ensure = async (offset) => {
+        if (offset < chunkStart || offset + 4096 > chunkStart + chunk.length) {
+            chunkStart = offset; chunk = await read(offset, Math.min(file.size, offset + 2 * 1024 * 1024));
+            onProgress(Math.min(99, Math.floor(offset / file.size * 100)));
+        }
+        return offset - chunkStart;
+    };
+    const startSearch = position;
+    let header;
+    while (position + 4 <= file.size && position - startSearch < 65536) {
+        const index = await ensure(position);
+        header = readMp3FrameHeader(chunk, index);
+        const next = header && readMp3FrameHeader(chunk, index + header.length);
+        if (header && next && header.sampleRate === next.sampleRate && header.version === next.version) break;
+        position++;
+    }
+    if (!header || position - startSearch >= 65536) throw new Error('找不到可索引的 MP3 音框');
+    const initial = await ensure(position);
+    const tagOffset = initial + 4 + ((chunk[initial + 1] & 1) ? 0 : 2) + (header.version === 3 ? (header.channels === 1 ? 17 : 32) : (header.channels === 1 ? 9 : 17));
+    const tag = String.fromCharCode(...chunk.subarray(tagOffset, tagOffset + 4));
+    if (String.fromCharCode(...chunk.subarray(initial + 36, initial + 40)) === 'VBRI') throw new Error('此 MP3 使用尚未支援的 VBRI 索引');
+    let encoderDelay = 0, endPadding = 0, hasGapless = false;
+    if (tag === 'Xing' || tag === 'Info') {
+        const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        const flags = view.getUint32(tagOffset + 4);
+        const lame = tagOffset + 8 + ((flags & 1) ? 4 : 0) + ((flags & 2) ? 4 : 0) + ((flags & 4) ? 100 : 0) + ((flags & 8) ? 4 : 0);
+        const encoder = String.fromCharCode(...chunk.subarray(lame, lame + 4));
+        if (/^(LAME|Lavc|Lavf)/.test(encoder) && lame + 24 <= initial + header.length) {
+            encoderDelay = (chunk[lame + 21] << 4) | (chunk[lame + 22] >> 4);
+            endPadding = ((chunk[lame + 22] & 15) << 8) | chunk[lame + 23];
+            hasGapless = true;
+        }
+        position += header.length; // Xing/Info is metadata, not an audio sample.
+    }
+    const audioStart = position;
+    const sizes = [];
+    while (position + 4 <= file.size) {
+        let index = position - chunkStart;
+        if (index < 0 || index + 4096 > chunk.length) index = await ensure(position);
+        const frame = readMp3FrameHeader(chunk, index);
+        if (!frame) break;
+        if (frame.version !== header.version || frame.sampleRate !== header.sampleRate || frame.channels !== header.channels || position + frame.length > file.size) throw new Error('MP3 音框格式不連續');
+        sizes.push(frame.length); position += frame.length;
+        // Yield between blocks; no whole-file ArrayBuffer or PCM decode.
+        if (sizes.length % 16384 === 0) { await new Promise(resolve => setTimeout(resolve, 0)); abort(); }
+    }
+    const tail = await read(position, Math.min(file.size, position + 16));
+    const tailTag = String.fromCharCode(...tail.subarray(0, 8));
+    if (sizes.length < 2 || (position < file.size && !tailTag.startsWith('TAG') && tailTag !== 'APETAGEX')) throw new Error('MP3 中有不完整或無法辨識的音框');
+    return { header, sizes, audioStart, audioEnd: position, encoderDelay, endPadding, hasGapless };
+};
+
+const buildIndexedMp3 = async (file, { index = null, isCurrent = () => true, onProgress = () => {} } = {}) => {
+    const record = index || await scanMp3Frames(file, { isCurrent, onProgress });
+    const { header, sizes, audioStart, audioEnd: position, encoderDelay, endPadding, hasGapless } = record;
+    const abort = () => { if (!isCurrent()) throw Object.assign(new Error('音檔已切換'), { name: 'AbortError' }); };
+    abort();
+    const totalSamples = sizes.length * header.samples;
+    const trimStart = hasGapless ? encoderDelay + 529 : 0;
+    const playableSamples = totalSamples - (hasGapless ? encoderDelay + endPadding : 0);
+    if (playableSamples <= 0 || totalSamples > 0xffffffff || file.size > 0xfffffff0) throw new Error('MP3 超過索引容量');
+    const ascii = value => Uint8Array.from(value, char => char.charCodeAt(0));
+    const u32 = (...values) => { const b = new Uint8Array(values.length * 4); const v = new DataView(b.buffer); values.forEach((n,i) => v.setUint32(i * 4, n)); return b; };
+    const join = parts => { const b = new Uint8Array(parts.reduce((n,p) => n + p.length, 0)); let at = 0; for (const p of parts) { b.set(p, at); at += p.length; } return b; };
+    const box = (type, ...parts) => { const data = join(parts); return join([u32(data.length + 8), ascii(type), data]); };
+    const full = (type, flags, ...parts) => box(type, u32(flags), ...parts);
+    const matrix = u32(65536,0,0,0,65536,0,0,0,1073741824);
+    const movieDuration = Math.round(playableSamples / header.sampleRate * 1000);
+    const ftyp = box('ftyp', ascii('isom'), u32(512), ascii('isomiso2mp41'));
+    const descriptor = (tag, bytes) => { let n = bytes.length; const length = [n & 127]; while ((n >>>= 7)) length.unshift((n & 127) | 128); return join([new Uint8Array([tag, ...length]), bytes]); };
+    const esds = full('esds', 0, descriptor(3, join([new Uint8Array([0,1,0]), descriptor(4, join([new Uint8Array([header.version === 3 ? 107 : 105, 21, 0, 0, 0]), u32(0,0)])), descriptor(6, new Uint8Array([2]))])));
+    const audioEntry = box('mp4a', new Uint8Array(6), new Uint8Array([0,1]), new Uint8Array(8), new Uint8Array([0,header.channels,0,16,0,0,0,0]), u32(header.sampleRate * 65536), esds);
+    const makeMoov = offset => box('moov',
+        full('mvhd', 0, u32(0,0,1000,movieDuration,65536), new Uint8Array([1,0,0,0]), new Uint8Array(8), matrix, new Uint8Array(24), u32(2)),
+        box('trak', full('tkhd', 3, u32(0,0,1,0,movieDuration), new Uint8Array(8), new Uint8Array([0,0,0,0,1,0,0,0]), matrix, u32(0,0)),
+            box('edts', full('elst', 0, u32(1,movieDuration,trimStart,65536))),
+            box('mdia', full('mdhd', 0, u32(0,0,header.sampleRate,totalSamples), new Uint8Array([85,196,0,0])),
+                full('hdlr', 0, u32(0), ascii('soun'), new Uint8Array(12), ascii('SoundHandler\0')),
+                box('minf', full('smhd',0,u32(0)), box('dinf', full('dref',0,u32(1),full('url ',1))),
+                    box('stbl', full('stsd',0,u32(1),audioEntry), full('stts',0,u32(1,sizes.length,header.samples)),
+                        full('stsc',0,u32(1,1,sizes.length,1)), full('stsz',0,u32(0,sizes.length), (() => { const b = new Uint8Array(sizes.length * 4); const v = new DataView(b.buffer); sizes.forEach((size,i) => v.setUint32(i * 4,size)); return b; })()),
+                        full('stco',0,u32(1,offset)))))));
+    const moov = makeMoov(0);
+    const result = new Blob([ftyp, makeMoov(ftyp.length + moov.length + 8), u32(position - audioStart + 8), ascii('mdat'), file.slice(audioStart, position)], { type: 'audio/mp4' });
+    // WebKit/Core Audio supports MP3 in CAF rather than MP4. Its packet
+    // table carries the same exact frame sizes and encoder priming/trimming.
+    const u64 = value => u32(Math.floor(value / 4294967296), value >>> 0);
+    const cafChunk = (type, ...parts) => { const data = join(parts); return join([ascii(type), u64(data.length), data]); };
+    const rate = new Uint8Array(8); new DataView(rate.buffer).setFloat64(0, header.sampleRate);
+    const packetSizes = new Uint8Array(sizes.length * 2); let packetBytes = 0;
+    for (const size of sizes) {
+        if (size >= 128) packetSizes[packetBytes++] = (size >> 7) | 128;
+        packetSizes[packetBytes++] = size & 127;
+    }
+    const caf = new Blob([ascii('caff'), new Uint8Array([0,1,0,0]),
+        cafChunk('desc', rate, ascii('.mp3'), u32(0,0,header.samples,header.channels,0)),
+        cafChunk('pakt', u64(sizes.length), u64(playableSamples), u32(Math.min(trimStart, totalSamples - playableSamples), Math.max(0, totalSamples - playableSamples - trimStart)), packetSizes.subarray(0,packetBytes)),
+        ascii('data'), u64(position - audioStart + 4), u32(0), file.slice(audioStart, position)], { type: 'audio/x-caf' });
+    abort(); onProgress(100);
+    return { blob: result, caf, index: record, frames: sizes.length, duration: playableSamples / header.sampleRate, sampleRate: header.sampleRate };
+};
+
+const probeIndexedMp3 = (blob, { isCurrent = () => true, timeoutMs = 8000 } = {}) => new Promise((resolve, reject) => {
+    const probe = document.createElement('audio');
+    const url = URL.createObjectURL(blob);
+    const finish = error => {
+        clearTimeout(timer); probe.onloadedmetadata = null; probe.onerror = null;
+        probe.removeAttribute('src'); probe.load(); URL.revokeObjectURL(url);
+        if (error) reject(error); else resolve();
+    };
+    const timer = setTimeout(() => finish(new Error('瀏覽器未能開啟精準定位索引')), timeoutMs);
+    probe.preload = 'metadata';
+    probe.onloadedmetadata = () => finish(isCurrent() && Number.isFinite(probe.duration) ? null : new Error('索引已取消或無效'));
+    probe.onerror = () => finish(new Error('此瀏覽器不支援 MP3 精準索引容器'));
+    probe.src = url;
+});
+
+// Universal sidecars contain frame positions, never a device-specific URL.
+const mp3SourceFolderHandles = new WeakMap();
+const getMp3IndexFileName = file => `${file.name}.yuban-index`;
+const findMp3IndexFile = (media, files) => {
+    const filename=getMp3IndexFileName(media).toLowerCase();
+    const parent=file=>String(file.webkitRelativePath||'').split('/').slice(0,-1).join('/');
+    return files.find(file=>file.name.toLowerCase()===filename &&
+        (mp3SourceFolderHandles.has(media)&&mp3SourceFolderHandles.has(file)
+            ? mp3SourceFolderHandles.get(media)===mp3SourceFolderHandles.get(file) : parent(media)===parent(file)))||null;
+};
+const fingerprintMp3File = async file => {
+    if (!globalThis.crypto?.subtle) return null;
+    const sampleBytes = 16384, parts = [new TextEncoder().encode(`yuban-mp3-1:${file.size}:`)];
+    for (let i = 0; i < 16; i++) {
+        const start = Math.floor(Math.max(0, file.size - sampleBytes) * i / 15);
+        parts.push(new Uint8Array(await file.slice(start, Math.min(file.size, start + sampleBytes)).arrayBuffer()));
+    }
+    const bytes = new Uint8Array(parts.reduce((total,part) => total + part.length,0));
+    let at=0; for (const part of parts) { bytes.set(part,at); at+=part.length; }
+    const hash = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256',bytes));
+    return Array.from(hash,byte=>byte.toString(16).padStart(2,'0')).join('');
+};
+const checksumMp3Index = (metadata, packets) => {
+    let hash=2166136261;
+    for(const bytes of [new TextEncoder().encode(JSON.stringify(metadata)),packets])
+        for(const byte of bytes)hash=Math.imul(hash^byte,16777619)>>>0;
+    return hash;
+};
+const encodeMp3Index = (index, file, fingerprint) => {
+    const {sizes,...fields}=index;
+    const metadata={schema:1,fileSize:file.size,fingerprint,count:sizes.length,...fields};
+    const packets=new Uint8Array(sizes.length*2);const view=new DataView(packets.buffer);
+    sizes.forEach((size,i)=>view.setUint16(i*2,size,true));
+    const header=new TextEncoder().encode(JSON.stringify({...metadata,checksum:checksumMp3Index(metadata,packets)}));
+    const prefix=new Uint8Array(12);prefix.set(new TextEncoder().encode('YUBANIX1'));
+    new DataView(prefix.buffer).setUint32(8,header.length);
+    return new Blob([prefix,header,packets],{type:'application/octet-stream'});
+};
+const decodeMp3Index = async (blob, file, fingerprint) => {
+    if (!blob || blob.size > 32*1024*1024 || blob.size < 12 || !fingerprint) throw new Error('無效的索引檔');
+    const bytes = new Uint8Array(await blob.arrayBuffer()); const view = new DataView(bytes.buffer);
+    if (new TextDecoder().decode(bytes.subarray(0,8)) !== 'YUBANIX1') throw new Error('索引格式不符');
+    const headerSize = view.getUint32(8);
+    if (headerSize > 4096 || headerSize + 12 > bytes.length) throw new Error('索引標頭不完整');
+    const metadata = JSON.parse(new TextDecoder().decode(bytes.subarray(12,12+headerSize)));
+    const {checksum,...payload}=metadata;
+    if(!Number.isInteger(checksum)||checksumMp3Index(payload,bytes.subarray(12+headerSize))!==checksum)throw new Error('索引校驗失敗');
+    const {header,count,audioStart,audioEnd,encoderDelay,endPadding,hasGapless} = metadata;
+    if (metadata.schema !== 1 || metadata.fileSize !== file.size || metadata.fingerprint !== fingerprint ||
+        !Number.isSafeInteger(count) || count < 2 || bytes.length !== 12+headerSize+count*2 ||
+        !header || ![0,2,3].includes(header.version) || ![1,2].includes(header.channels) ||
+        ![8000,11025,12000,16000,22050,24000,32000,44100,48000].includes(header.sampleRate) ||
+        header.samples !== (header.version === 3 ? 1152 : 576) ||
+        !Number.isSafeInteger(audioStart) || !Number.isSafeInteger(audioEnd) || audioStart < 0 || audioEnd > file.size || audioEnd <= audioStart ||
+        !Number.isSafeInteger(encoderDelay) || encoderDelay < 0 || encoderDelay > 4095 ||
+        !Number.isSafeInteger(endPadding) || endPadding < 0 || endPadding > 4095 || typeof hasGapless !== 'boolean') throw new Error('索引與音檔不符');
+    const sizes=[]; let sum=0;
+    for(let i=0;i<count;i++) { const size=view.getUint16(12+headerSize+i*2,true); if(size<4||size>4096) throw new Error('索引音框尺寸無效');sizes.push(size);sum+=size; }
+    if(sum!==audioEnd-audioStart) throw new Error('索引音框總長度不符');
+    return {header,sizes,audioStart,audioEnd,encoderDelay,endPadding,hasGapless};
+};
+const accessMp3IndexCache = async (key, blob = null) => {
+    if (typeof indexedDB === 'undefined' || !key) return blob ? false : null;
+    return new Promise(resolve => {
+        let settled=false, db=null;
+        const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);db?.close();resolve(value);};
+        const timer=setTimeout(()=>finish(blob?false:null),2500);
+        let request;
+        try { request=indexedDB.open('yuban-media-index-v1',1); } catch (_) { finish(blob?false:null);return; }
+        request.onupgradeneeded=()=>{request.result.createObjectStore('mp3',{keyPath:'key'});};
+        request.onerror=request.onblocked=()=>finish(blob?false:null);
+        request.onsuccess=()=>{
+            db=request.result;if(settled){db.close();return;}
+            const transaction=db.transaction('mp3',blob?'readwrite':'readonly'); const store=transaction.objectStore('mp3');
+            transaction.onabort=transaction.onerror=()=>finish(blob?false:null);
+            if(!blob){ const read=store.get(key);read.onsuccess=()=>finish(read.result?.blob||null);read.onerror=()=>finish(null); }
+            else {
+                store.put({key,blob,at:Date.now()});
+                // Keep browser cache bounded; portable sidecars remain reusable.
+                const all=store.getAll();all.onsuccess=()=>{
+                    const records=all.result.sort((a,b)=>b.at-a.at);let bytes=0;
+                    records.forEach((record,i)=>{bytes+=record.blob.size;if(i>=20||bytes>64*1024*1024)store.delete(record.key);});
+                };
+                transaction.oncomplete=()=>finish(true);
+            }
+        };
+    });
+};
+const saveMp3IndexBesideMedia = async (file, blob, fallbackFolder, isCurrent) => {
+    const folder=mp3SourceFolderHandles.get(file)||fallbackFolder;
+    if(!folder||!blob||!isCurrent())return false;
+    try {
+        if(typeof folder.queryPermission === 'function' && await folder.queryPermission({mode:'readwrite'}) !== 'granted')return false;
+        if(!isCurrent())return false;
+        const handle=await folder.getFileHandle(getMp3IndexFileName(file),{create:true});
+        const writable=await handle.createWritable();
+        if(!isCurrent()){await writable.abort();return false;}
+        await writable.write(blob);await writable.close();return true;
+    } catch (_) { return false; }
+};
+
+const prepareIndexedMp3 = async (file, options) => {
+    const preparationStarted=Date.now();
+    let fingerprint=null,index=null,indexBlob=null,indexSource='scan';
+    try { fingerprint=await fingerprintMp3File(file); } catch (_) { /* Cache is optional. */ }
+    const isCurrent=()=>options.isCurrent();
+    if(fingerprint){
+        const candidates=[['folder',options.indexFile],['cache',null]];
+        for(const [kind,sidecar] of candidates){
+            if(!isCurrent())throw Object.assign(new Error('音檔已切換'),{name:'AbortError'});
+            try {
+                const blob=sidecar || (kind==='cache' ? await accessMp3IndexCache(fingerprint) : null);
+                if(!blob)continue;
+                index=await decodeMp3Index(blob,file,fingerprint);indexBlob=blob;indexSource=kind;break;
+            }catch(_){ /* Changed/corrupt/stale indexes must be rebuilt. */ }
+        }
+    }
+    if(index)options.onReuse?.(indexSource);
+    const started=Date.now();
+    const indexed=await buildIndexedMp3(file,{...options,index});
+    const buildMs=Date.now()-started;
+    if(!indexBlob&&fingerprint)indexBlob=encodeMp3Index(indexed.index,file,fingerprint);
+    const preferCaf=Boolean(document.createElement('audio').canPlayType('audio/x-caf'));
+    const candidates=preferCaf?[indexed.caf,indexed.blob]:[indexed.blob,indexed.caf];
+    for(const blob of candidates){
+        if(!isCurrent())throw Object.assign(new Error('音檔已切換'),{name:'AbortError'});
+        try {
+            await probeIndexedMp3(blob,options);
+            const cacheSaved=Boolean(indexBlob&&await accessMp3IndexCache(fingerprint,indexBlob));
+            if(!isCurrent())throw Object.assign(new Error('音檔已切換'),{name:'AbortError'});
+            return {...indexed,blob,container:blob.type,indexBlob,indexSource,cacheSaved,buildMs,prepareMs:Date.now()-preparationStarted};
+        }catch(error){if(!isCurrent())throw error;}
+    }
+    throw new Error('此瀏覽器不支援精準索引容器，改用原始 MP3');
+};
+
 // Only reuse the light replay path when the entire selected sentence is cached.
 const isMediaReplayBuffered = (player, start, end) => {
     if (!player || player.error || player.seeking || player.readyState < 2 ||
@@ -3513,12 +3790,11 @@ const isMediaReplayBuffered = (player, start, end) => {
 };
 
 // A seek request is not proof that audio decoding has reached the target.
-const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, timeoutMs = 15000 }) => {
-    let timer = null;
-    let finished = false;
-    let attempts = 0;
-    let observedCompletion = Math.abs(Number(player.currentTime) - target) <= 0.15;
+const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, onDiagnostic = () => {}, timeoutMs = 15000 }) => {
+    let timer = null, finished = false, attempts = 0, reloaded = false, recovering = false;
+    let observedCompletion = !player.seeking && Math.abs(Number(player.currentTime) - target) <= 0.15;
     const started = Date.now();
+    let lastAssignment = started, lastProgress = started, lastState = '';
     const source = player.src;
     const events = ['seeked', 'timeupdate', 'canplay', 'loadeddata', 'loadedmetadata', 'progress'];
     const cleanup = () => {
@@ -3526,46 +3802,59 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
         if (timer != null) clearTimeout(timer);
         events.forEach(name => player.removeEventListener(name, check));
         player.removeEventListener('error', fail);
-        player.removeEventListener('emptied', fail);
+        player.removeEventListener('emptied', emptied);
     };
     const cancel = () => { cleanup(); };
+    const report = stage => onDiagnostic({ stage, target, actual: Number(player.currentTime) || 0,
+        elapsedMs: Date.now() - started, readyState: player.readyState, seeking: Boolean(player.seeking), attempts });
     const fail = () => {
         if (finished) return;
         const current = isCurrent() && player.src === source;
         cleanup();
-        if (current) {
-            player.pause();
-            onFailure(Number(player.currentTime) || 0);
-        }
+        if (current) { player.pause(); report('failed'); onFailure(Number(player.currentTime) || 0); }
     };
-    const assignTarget = () => {
-        if (player.readyState < 1 || player.seeking || attempts >= 3) return;
-        if (Math.abs(Number(player.currentTime) - target) <= 0.15) return;
-        attempts += 1;
-        try { player.currentTime = target; } catch (_) { /* Retry after metadata is available. */ }
+    const emptied = () => { if (!recovering) fail(); };
+    const assignTarget = (force = false) => {
+        if (player.readyState < 1 || (!force && player.seeking) || attempts >= 3) return;
+        if (!force && Math.abs(Number(player.currentTime) - target) <= 0.15) return;
+        attempts++; lastAssignment = Date.now(); observedCompletion = false;
+        try { player.currentTime = target; } catch (_) { /* Metadata/data events can retry. */ }
     };
     const check = (event) => {
         if (finished) return;
         if (!isCurrent() || player.src !== source) { cleanup(); return; }
         if (event && ['seeked', 'timeupdate', 'canplay', 'loadeddata'].includes(event.type)) observedCompletion = true;
         const actual = Number(player.currentTime);
+        const state = `${actual}:${player.readyState}:${Boolean(player.seeking)}`;
+        if (state !== lastState) { lastState = state; lastProgress = Date.now(); }
         if (observedCompletion && !player.seeking && player.readyState >= 2 && Math.abs(actual - target) <= 0.15) {
-            cleanup();
-            onLocated(actual);
-            return;
+            cleanup(); report('located'); onLocated(actual); return;
         }
         if (Date.now() - started >= timeoutMs) { fail(); return; }
         if (!player.seeking && Math.abs(actual - target) > 0.15) assignTarget();
+        if (finished) return;
+        // A superseded/stalled iOS seek must not hold the new target hostage.
+        // Retry only after a real stall, never on ordinary buffered repeats.
+        if (Date.now() - lastProgress >= 1500 && Date.now() - lastAssignment >= 1500 && attempts < 3) {
+            report('retry'); assignTarget(true);
+        }
+        if (!reloaded && Date.now() - lastProgress >= 5000 && typeof player.load === 'function') {
+            reloaded = true; recovering = true; attempts = 0; observedCompletion = false;
+            const rate = player.playbackRate;
+            report('reload');
+            try { player.load(); if (Number.isFinite(rate)) player.playbackRate = rate; }
+            catch (_) { fail(); }
+            // Keep accepting the same source's asynchronous emptied/metadata.
+            lastProgress = Date.now(); lastAssignment = Date.now();
+        }
     };
-    const poll = () => {
-        check();
-        if (!finished) timer = setTimeout(poll, 250);
-    };
+    const poll = () => { check(); if (!finished) timer = setTimeout(poll, 100); };
     events.forEach(name => player.addEventListener(name, check));
     player.addEventListener('error', fail);
-    player.addEventListener('emptied', fail);
+    player.addEventListener('emptied', emptied);
     player.pause();
-    assignTarget();
+    // Always supersede an old seek, including when it never emitted seeked.
+    if (player.seeking || Math.abs(Number(player.currentTime) - target) > 0.15) assignTarget(true);
     poll();
     return cancel;
 };
@@ -9260,6 +9549,9 @@ export default function GeminiPlayer() {
         if (String(mediaSrc || '').startsWith('blob:')) URL.revokeObjectURL(mediaSrc);
     }, [mediaSrc]);
     const [seekNotice, setSeekNotice] = useState("");
+    const [mediaSeekMode, setMediaSeekMode] = useState('');
+    const [mediaIndexStorage, setMediaIndexStorage] = useState('');
+    const mediaIndexExportRef = useRef(null);
     const [seekTimeInput, setSeekTimeInput] = useState("");
     useEffect(() => {
         mediaSeekRef.current.cancel?.();
@@ -9902,6 +10194,7 @@ export default function GeminiPlayer() {
                 if (!shouldPlay) return;
                 requestMediaPlay();
             },
+            onDiagnostic: details => recordPCloudDebug('media.seek', details),
             onFailure: (actual) => {
                 session.active = false;
                 syncActual(actual);
@@ -10145,6 +10438,7 @@ export default function GeminiPlayer() {
                 if (entry.kind === 'file') {
                     try {
                         const file = await entry.getFile();
+                        mp3SourceFolderHandles.set(file, handle);
                         out.push(file);
                     } catch (_) { }
                 } else if (entry.kind === 'directory') {
@@ -10735,10 +11029,11 @@ export default function GeminiPlayer() {
         const newPlaylist = [];
         files.forEach(f => {
             const name = f.name.toLowerCase();
+            if (name.endsWith('.yuban-index')) return;
             if (f.type.startsWith('video/') || f.type.startsWith('audio/') || mediaExts.some(ext => name.endsWith(ext))) {
                 const candidates = getMatchingSubtitleFiles(f, files);
                 const subFile = pickSubtitleFile(candidates);
-                newPlaylist.push({ name: f.name, mediaFile: f, subFile: subFile || null, subtitleFiles: candidates });
+                newPlaylist.push({ name: f.name, mediaFile: f, subFile: subFile || null, subtitleFiles: candidates, indexFile: findMp3IndexFile(f, files) });
             }
         });
         newPlaylist.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
@@ -10926,6 +11221,9 @@ export default function GeminiPlayer() {
         setCurrentIndex(-1);
         setMediaError("");
         setSeekNotice('正在載入媒體…');
+        setMediaSeekMode('');
+        setMediaIndexStorage('');
+        mediaIndexExportRef.current = null;
         const prevTrack = (currentTrackIndexRef.current >= 0 && (playlistRef.current || [])[currentTrackIndexRef.current])
             ? (playlistRef.current || [])[currentTrackIndexRef.current]
             : null;
@@ -10942,9 +11240,36 @@ export default function GeminiPlayer() {
             if (track?.mediaFile?.isRemotePCloud) {
                 recordPCloudDebug("media.stream.begin", { track: String(track?.name || ""), apiHost: String(track?.mediaFile?.pCloudConnection?.apiHost || ""), fileid: Number(track?.mediaFile?.pCloudFileId ?? -1) });
             }
+            let indexed = null;
+            const localMp3 = !track?.mediaFile?.isRemotePCloud && /\.mp3$/i.test(track?.mediaFile?.name || '') && typeof track.mediaFile.slice === 'function';
+            if (localMp3) {
+                try {
+                    indexed = await prepareIndexedMp3(track.mediaFile, {
+                        isCurrent: () => loadToken === trackLoadRef.current.token,
+                        indexFile: track.indexFile,
+                        onReuse: source => { if (loadToken === trackLoadRef.current.token) setSeekNotice(source === 'folder' ? '正在重用同目錄的時間索引…' : '正在重用已快取的時間索引…'); },
+                        onProgress: percent => { if (loadToken === trackLoadRef.current.token) setSeekNotice(`正在建立精準時間索引… ${percent}%`); }
+                    });
+                    if (loadToken !== trackLoadRef.current.token) return;
+                    setMediaSeekMode('indexed');
+                    setMediaIndexStorage(indexed.indexSource === 'folder' ? 'folder' : indexed.indexSource === 'cache' ? 'reused-cache' : indexed.cacheSaved ? 'cache' : 'memory');
+                    mediaIndexExportRef.current = indexed.indexBlob ? { blob: indexed.indexBlob, filename: getMp3IndexFileName(track.mediaFile) } : null;
+                    recordPCloudDebug('media.index.ready', { frames: indexed.frames, duration: indexed.duration, container: indexed.container, source: indexed.indexSource, buildMs: indexed.buildMs, prepareMs: indexed.prepareMs });
+                    if (indexed.indexBlob && indexed.indexSource !== 'folder') {
+                        void saveMp3IndexBesideMedia(track.mediaFile, indexed.indexBlob, openedFolderHandleRef.current, () => loadToken === trackLoadRef.current.token).then(saved => {
+                            if (saved && loadToken === trackLoadRef.current.token) setMediaIndexStorage('folder');
+                        });
+                    }
+                } catch (error) {
+                    if (loadToken !== trackLoadRef.current.token) return;
+                    setMediaSeekMode('original');
+                    recordPCloudDebug('media.index.fallback', { message: String(error?.message || error) });
+                }
+            } else if (/\.mp3$/i.test(track?.mediaFile?.name || '')) setMediaSeekMode('stream');
+            if (loadToken !== trackLoadRef.current.token) return;
             const source = track?.mediaFile?.isRemotePCloud
                 ? await track.mediaFile.getStreamUrl()
-                : URL.createObjectURL(track.mediaFile);
+                : URL.createObjectURL(indexed?.blob || track.mediaFile);
             if (loadToken !== trackLoadRef.current.token) {
                 if (String(source).startsWith('blob:')) URL.revokeObjectURL(source);
                 return;
@@ -21070,7 +21395,7 @@ ${userQ}`;
                     autoComplete="off" spellCheck={false}
                     className="w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-mono text-gray-800" />
             </label>
-            <button type="submit" disabled={!mediaSrc} data-subtitle-focus-restore className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
+            <button type="submit" disabled={!mediaSrc || (trackLoadRef.current.active && !trackLoadRef.current.metadataReady)} data-subtitle-focus-restore className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 disabled:opacity-40">起播</button>
         </form>
     );
 
@@ -21639,6 +21964,12 @@ ${userQ}`;
                             </div>
                         )}
                     </div>
+                    {mediaSeekMode && <div className="w-full flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-0.5 text-[10px] text-slate-500" aria-label="播放時間索引狀態">
+                        <span>{mediaSeekMode === 'indexed' ? `精準時間索引已就緒 · ${mediaIndexStorage === 'folder' ? '已存同目錄，可跨設備重用' : mediaIndexStorage === 'reused-cache' ? '已重用快取，免重新掃描' : mediaIndexStorage === 'cache' ? '已快取，下次開啟可重用' : '本次暫存'}` : mediaSeekMode === 'stream' ? 'MP3 串流使用原始時間索引；下載後選取本機檔可建立精準索引' : '使用原始 MP3 索引；此檔案或瀏覽器無法建立精準索引'}</span>
+                        {mediaSeekMode === 'indexed' && mediaIndexExportRef.current && <button type="button" data-subtitle-focus-restore
+                            className="rounded border border-blue-200 px-1.5 py-0.5 text-blue-700" title="將索引檔放在音檔旁，連同音檔複製到其他設備即可重用"
+                            onClick={() => { const record=mediaIndexExportRef.current;if(record)saveBlobByBrowserDownload(record.blob,record.filename); }}>下載索引</button>}
+                    </div>}
                     {seekNotice && <div role="status" aria-live="polite" className="w-full px-3 py-1 text-xs text-amber-800">{seekNotice}</div>}
                     {mediaError && (
                         <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 space-y-3">
@@ -21757,6 +22088,7 @@ ${userQ}`;
                         {renderSentenceTimeline()}
                         {!isEchoMode && <div className="px-4 pt-3 pb-1">
                             <input type="range" min="0" max={duration || 0} step="0.1" value={progressPreview ?? currentTime}
+                                disabled={trackLoadRef.current.active && !trackLoadRef.current.metadataReady}
                                 aria-label="整檔播放位置"
                                 onPointerDown={beginProgressSeek}
                                 onInput={handleProgressInput}

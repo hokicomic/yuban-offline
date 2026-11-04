@@ -100,7 +100,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             currentRepeatRef: { current: 0 }, suppressNextAutoWatchRef: { current: false },
             tailMarkedRef: { current: false }, isWaitingShadowRef: { current: false },
             autoplayOnLoadRef: { current: false },
-            cancelWorkerTimer() {}, setIsPlaying() {}, setMediaError() {}, setSeekNotice() {},
+            cancelWorkerTimer() {}, setIsPlaying() {}, setMediaError() {}, setSeekNotice() {}, setMediaSeekMode() {}, setMediaIndexStorage() {}, mediaIndexExportRef: { current: null },
             setWatchedSegments() {}, setCurrentTime() {}, setCurrentTrackIndex() {},
             setMediaSrc: src => sources.push(src), recordPCloudDebug() {},
             setRawSubtitles: subs => { if (subs.length) captions.push(subs); }, setSubtitles() {}, setCurrentIndex() {},
@@ -155,6 +155,23 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(captions.at(-1)[0], 'current captions');
         assert.equal(c.trackLoadRef.current.token, 3);
     });
+    test('local MP3 indexes before attaching a source; obsolete indexing cannot replace a newer track: ' + file, async () => {
+        const tracks=[{name:'book',mediaFile:{name:'book.mp3',slice(){}}},{name:'other',mediaFile:{name:'other.m4a'}}];
+        const {api,c,sources}=setup(tracks);let complete;
+        c.prepareIndexedMp3=()=>new Promise(resolve=>{complete=resolve;});
+        const pending=api.loadTrack(0);
+        assert.equal(sources.length,0);
+        await api.loadTrack(1);
+        complete({blob:{name:'indexed.mp4'},frames:100,duration:10,container:'audio/mp4'});await pending;
+        assert.deepEqual(sources,['blob:other.m4a']);
+        c.prepareIndexedMp3=async()=>({blob:{name:'indexed.mp4'},frames:100,duration:10,container:'audio/mp4'});
+        await api.loadTrack(0);
+        assert.equal(sources.at(-1),'blob:indexed.mp4');
+        c.prepareIndexedMp3=async()=>{throw Error('format not supported');};
+        await api.loadTrack(0);
+        assert.equal(sources.at(-1),'blob:book.mp3','original remains playable on unsupported browsers');
+    });
+
     test('native local-media errors are recorded with the browser failure details: ' + file, () => {
         const records = [];
         const c = { trackLoadRef: { current: { active: true } }, autoplayOnLoadRef: { current: true },
