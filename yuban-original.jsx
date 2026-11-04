@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.253 · mobile-seek-events";
+const APP_VERSION = "v5.254 · durable-mobile-index-cache";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3713,6 +3713,10 @@ const decodeMp3Index = async (blob, file, fingerprint) => {
 };
 const accessMp3IndexCache = async (key, blob = null) => {
     if (typeof indexedDB === 'undefined' || !key) return blob ? false : null;
+    // WebKit may restore an IndexedDB Blob whose temporary backing object is
+    // gone after Chrome restarts (NotFoundError). Persist owned bytes instead.
+    let bytes = null;
+    if (blob) { try { bytes = await blob.arrayBuffer(); } catch (_) { return false; } }
     return new Promise(resolve => {
         let settled=false, db=null;
         const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);db?.close();resolve(value);};
@@ -3725,13 +3729,13 @@ const accessMp3IndexCache = async (key, blob = null) => {
             db=request.result;if(settled){db.close();return;}
             const transaction=db.transaction('mp3',blob?'readwrite':'readonly'); const store=transaction.objectStore('mp3');
             transaction.onabort=transaction.onerror=()=>finish(blob?false:null);
-            if(!blob){ const read=store.get(key);read.onsuccess=()=>finish(read.result?.blob||null);read.onerror=()=>finish(null); }
+            if(!blob){ const read=store.get(key);read.onsuccess=()=>finish(read.result?.bytes ? new Blob([read.result.bytes],{type:'application/octet-stream'}) : read.result?.blob||null);read.onerror=()=>finish(null); }
             else {
-                store.put({key,blob,at:Date.now()});
+                store.put({key,bytes,at:Date.now()});
                 // Keep browser cache bounded; portable sidecars remain reusable.
                 const all=store.getAll();all.onsuccess=()=>{
                     const records=all.result.sort((a,b)=>b.at-a.at);let bytes=0;
-                    records.forEach((record,i)=>{bytes+=record.blob.size;if(i>=20||bytes>64*1024*1024)store.delete(record.key);});
+                    records.forEach((record,i)=>{bytes+=record.bytes?.byteLength||record.blob?.size||0;if(i>=20||bytes>64*1024*1024)store.delete(record.key);});
                 };
                 transaction.oncomplete=()=>finish(true);
             }
