@@ -89,6 +89,16 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         c.mediaSeekRef.current.cancel(); player.paused = true; locate(20); await flush();
         assert.equal(plays.length, 0); assert.equal(timers.size, 0);
     });
+    test('buffered startup deadline never interrupts a long sentence when native events are missing: ' + file, async () => {
+        const { api, c, player, plays, timers, requests, notices } = setup();
+        player.paused = false;
+        api.seekThenMaybePlay(10, true, null, { bufferedEnd: 40 });
+        player.actual = 25; player.seeking = false; // 15 seconds of speech, no native startup events
+        [...timers.values()][0].fn(); await flush();
+        assert.equal(player.paused, false); assert.equal(c.playing, true);
+        assert.equal(plays.length, 0); assert.deepEqual(requests, [10]);
+        assert.ok(notices.every(value => value === '')); assert.equal(timers.size, 0);
+    });
     test('timed-out buffered playback retires a late play promise before showing failure: ' + file, async () => {
         const { api, c, player, requests, plays, notices, timers, locate } = setup();
         api.seekThenMaybePlay(10, true, null, { bufferedEnd: 15 }); locate(10);

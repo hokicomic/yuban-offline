@@ -22,7 +22,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             pause() { this.paused = true; },
             addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); },
             removeEventListener(name, fn) { listeners.get(name)?.delete(fn); },
-            emit(name) { for (const fn of [...(listeners.get(name) || [])]) fn(); } };
+            emit(name) { for (const fn of [...(listeners.get(name) || [])]) fn({ type: name }); } };
         const start = () => api(player, { isCurrent: () => true,
             onPlaying: () => events.push('playing'), onFailure: err => events.push(err.name) });
         return { player, calls, events, timers, listeners, start };
@@ -37,6 +37,38 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.deepEqual(events, ['playing']);
         assert.equal(timers.size, 0);
         assert.ok([...listeners.values()].every(set => set.size === 0));
+    });
+    test('a long sentence keeps playing when native playback starts before the play promise settles: ' + file, async () => {
+        const { player, calls, events, timers, start } = setup();
+        player.currentTime = 10768.78; player.readyState = 4; start();
+        const oldDeadline = [...timers.values()][0];
+        player.emit('playing');
+        assert.deepEqual(events, ['playing']);
+        assert.equal(timers.size, 0, 'actual playback must retire the startup timeout and pending control lock');
+        player.currentTime = 10783.78; oldDeadline();
+        assert.equal(player.paused, false, '15 seconds is not a maximum sentence length');
+        calls[0].reject({ name: 'AbortError' }); await flush();
+        assert.equal(player.paused, false, 'a late promise rejection must not stop speech that already started');
+        assert.deepEqual(events, ['playing']);
+    });
+    test('an advancing native clock confirms playback even if the playing event was missed: ' + file, () => {
+        const { player, events, timers, start } = setup(); player.readyState = 4; start();
+        player.emit('timeupdate'); assert.deepEqual(events, [], 'an unchanged requested time is not playback');
+        player.currentTime += 0.5; player.emit('timeupdate');
+        assert.deepEqual(events, ['playing']); assert.equal(timers.size, 0);
+    });
+    test('a stale native event during a seek or pause cannot release the playback lock: ' + file, () => {
+        const { player, events, start } = setup(); player.readyState = 4; start();
+        player.seeking = true; player.emit('playing');
+        player.seeking = false; player.paused = true; player.emit('playing');
+        assert.deepEqual(events, []);
+        player.paused = false; player.emit('playing'); assert.deepEqual(events, ['playing']);
+    });
+    test('the deadline cannot pause a progressing player even without startup events: ' + file, () => {
+        const { player, events, timers, start } = setup(); player.readyState = 4; start();
+        player.currentTime += 15;
+        [...timers.values()][0]();
+        assert.deepEqual(events, ['playing']); assert.equal(player.paused, false);
     });
     test('one interrupted play retries only when data is ready: ' + file, async () => {
         const { player, calls, events, start } = setup(); start();

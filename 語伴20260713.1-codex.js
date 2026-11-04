@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.255 · resilient-sentence-playback";
+const APP_VERSION = "v5.256 · long-sentence-startup";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -3865,8 +3865,13 @@ const observeBufferedMediaSeek = (player, target, { isCurrent, onRunning, onResu
     const fail = () => {
         if (finished) return;
         const current = valid();
+        // Hidden native players can omit startup events. An elapsed startup
+        // deadline must never pause audio whose clock has already advanced.
+        const started = current && !player.paused && !player.seeking && player.readyState >= 2 &&
+            Number(player.currentTime) > target + 0.025;
         cleanup();
-        if (current) onFailure();
+        if (started) onRunning();
+        else if (current) onFailure();
     };
     const check = event => {
         if (finished) return;
@@ -4011,16 +4016,22 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
     let retries = 0;
     let timer = null;
     const source = player.src;
+    const startTime = Number(player.currentTime) || 0;
     const current = () => isCurrent() && player.src === source;
     const cleanup = () => {
         finished = true;
         if (timer != null) clearTimeout(timer);
         ['canplay', 'loadeddata'].forEach(name => player.removeEventListener(name, retry));
         player.removeEventListener('error', mediaError);
-        ['seeked', 'playing', 'canplay'].forEach(name => player.removeEventListener(name, finishPlaying));
+        ['seeked', 'playing', 'canplay', 'timeupdate'].forEach(name => player.removeEventListener(name, finishPlaying));
     };
-    const finishPlaying = () => {
-        if (finished || !playResolved || player.seeking || player.paused || player.readyState < 2) return;
+    const finishPlaying = event => {
+        if (finished || player.seeking || player.paused || player.readyState < 2) return;
+        // WebKit may start native audio before settling play(). Trust actual
+        // playback evidence too, so a long sentence cannot hit a startup timeout.
+        const observedPlayback = event?.type === 'playing' ||
+            (event?.type === 'timeupdate' && Number(player.currentTime) > startTime + 0.025);
+        if (!playResolved && !observedPlayback) return;
         const valid = current();
         cleanup();
         if (valid) onPlaying();
@@ -4059,8 +4070,12 @@ const performManagedMediaPlay = (player, { isCurrent, onPlaying, onFailure, time
     const mediaError = () => fail({ name: 'MediaError', code: player.error?.code, message: player.error?.message || '媒體讀取失敗' });
     ['canplay', 'loadeddata'].forEach(name => player.addEventListener(name, retry));
     player.addEventListener('error', mediaError);
-    ['seeked', 'playing', 'canplay'].forEach(name => player.addEventListener(name, finishPlaying));
-    timer = setTimeout(() => fail({ name: 'TimeoutError', message: '等待媒體資料逾時' }), timeoutMs);
+    ['seeked', 'playing', 'canplay', 'timeupdate'].forEach(name => player.addEventListener(name, finishPlaying));
+    timer = setTimeout(() => {
+        // Check the native clock once more if startup events were lost.
+        finishPlaying({ type: 'timeupdate' });
+        if (!finished) fail({ name: 'TimeoutError', message: '等待媒體資料逾時' });
+    }, timeoutMs);
     // This call stays in the original click handler whenever no seek is needed.
     attempt();
     return ({ pause = true } = {}) => {
@@ -11026,13 +11041,13 @@ export default function App() {
         const entry = { at: new Date().toISOString(), event, ...details };
         const entries = [...(pCloudDebugLogRef.current || []), entry].slice(-160);
         pCloudDebugLogRef.current = entries;
-        setPCloudDebugLogText(JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2));
+        setPCloudDebugLogText(JSON.stringify({ appVersion: APP_VERSION, generatedAt: new Date().toISOString(), entries }, null, 2));
         console.info("[Yuban pCloud]", entry);
     }, []);
 
     const copyPCloudDebugLog = useCallback(async () => {
         const entries = pCloudDebugLogRef.current || [];
-        const text = pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2);
+        const text = pCloudDebugLogText || JSON.stringify({ appVersion: APP_VERSION, generatedAt: new Date().toISOString(), entries }, null, 2);
         if (!entries.length) {
             setPCloudDebugLogNotice("尚未有播放或 pCloud 操作紀錄");
             return;
@@ -11498,12 +11513,14 @@ export default function App() {
             }
             return;
         }
-        if (mediaPlayRef.current.active) {
-            setSeekNotice('正在準備播放，請稍候…');
-            return;
-        }
-        if (mediaSeekRef.current.active) {
-            setSeekNotice('正在定位，完成後才會播放。');
+        if (mediaPlayRef.current.active || mediaSeekRef.current.active) {
+            // A pending browser promise/seek must not disable the user's stop
+            // control. Retire it so late completion cannot restart playback.
+            cancelWorkerTimer();
+            autoplayOnLoadRef.current = false;
+            playerRef.current?.pause();
+            setIsPlaying(false);
+            setSeekNotice('');
             return;
         }
         const player = playerRef.current;
@@ -22182,7 +22199,7 @@ ${userQ}`;
                             </div>
                             <details open className="rounded-lg border border-amber-200 bg-white/70 px-3 py-2">
                                 <summary className="cursor-pointer font-medium text-xs text-amber-900">播放診斷 Log（可手動全選複製）</summary>
-                                <textarea readOnly value={pCloudDebugLogText || JSON.stringify({ generatedAt: new Date().toISOString(), entries: pCloudDebugLogRef.current || [] }, null, 2)} className="mt-2 w-full min-h-48 max-h-80 resize-y rounded border border-amber-200 bg-white p-2 font-mono text-[11px] leading-relaxed text-slate-700" onFocus={(e) => e.currentTarget.select()} aria-label="播放診斷 Log" />
+                                <textarea readOnly value={pCloudDebugLogText || JSON.stringify({ appVersion: APP_VERSION, generatedAt: new Date().toISOString(), entries: pCloudDebugLogRef.current || [] }, null, 2)} className="mt-2 w-full min-h-48 max-h-80 resize-y rounded border border-amber-200 bg-white p-2 font-mono text-[11px] leading-relaxed text-slate-700" onFocus={(e) => e.currentTarget.select()} aria-label="播放診斷 Log" />
                             </details>
                         </div>
                     )}
