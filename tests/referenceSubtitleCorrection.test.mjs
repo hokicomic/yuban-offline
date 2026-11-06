@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
     test('damaged ebook contractions, joined words and attached footnotes cannot corrupt caption answers: ' + file, () => {
         const fixtures = [
@@ -41,6 +41,27 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const typo = "The researcher doesn't know why the visible univerze appears so distant to everyone today.";
         const damaged = 'The researcher doesn t know why the visible7 universe appears so distant to everyone today.';
         assert.equal(api.applySubtitleReferencePreference(resolver(damaged).resolve({text: typo})).text, typo.replace('univerze','universe'));
+    });
+    test('legacy ebook apostrophes are format equivalence, never two replacement answers: ' + file, () => {
+        const raw="For the month or so that they are visible, all that distinguishes them from the other stars in the sky is that they occupy a point of space that wasn't filled before.";
+        for (const damaged of ['wasn\u0092t','wasn\u0091t','wasnʼt','wasn＇t','wasn‘t','wasn`t','wasn´t','wasn\uFFFDt','wasn\u200Bt','wasn t','wasnt']) {
+            const ref=raw.replace("wasn't",damaged);
+            const result=resolver(ref).resolve({text:raw,start:20,end:25});
+            assert.equal(result.aligned,true,JSON.stringify(damaged));
+            assert.equal(result.text,raw,JSON.stringify(damaged));
+            assert.equal(result.changed,false,JSON.stringify(damaged));
+            assert.equal(result.reviewDifferences?.length || 0,0,JSON.stringify(damaged));
+            assert.equal(result.boundaryOmissions?.length || 0,0,JSON.stringify(damaged));
+            assert.equal(api.applySubtitleReferencePreference(result).text,raw);
+            const tokens=api.buildSubtitlePracticeDualTokens(raw,'en-US',[],result);
+            assert.equal(tokens.some(token=>token.corrected),false,'format noise cannot create red dual-answer blanks');
+            assert.ok(tokens.some(token=>token.kind==='word'&&token.parts.map(part=>part.text).join('')==="wasn't"));
+            assert.equal(ref.slice(result.ranges[0].start,result.ranges[0].end),result.ranges[0].text,'document offsets remain exact');
+        }
+        const damaged=raw.replace("wasn't",'wasn\u0092t').replace('distinguishes','distinguish');
+        const result=resolver(damaged).resolve({text:raw});
+        assert.equal(result.aligned,true);assert.ok(result.edits.length || result.reviewDifferences?.length,'a real neighbouring wording difference is still compared');
+        assert.ok(!(api.applySubtitleReferencePreference(result).text.includes('wasn t')));
     });
     test('source quality rules retain genuine standalone numbers, percentages and model identifiers: ' + file, () => {
         for (const value of ['300', '7%', 'COVID19', 'B12', 'chapter7', 'phase2']) {

@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.266 · dual-correction-answers";
+const APP_VERSION = "v5.267 · ebook-apostrophe-equivalence";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6740,20 +6740,28 @@ const normalizeSubtitleReferenceNumbers = (words, text) => {
 
 const tokenizeSubtitleReferenceWords = (value, { reference = false } = {}) => {
     const text = String(value || '');
-    const masked = text.replace(/\[[^\]]*\]|［[^］]*］|<[^>]*>|\*+|\{\{|\}\}/gu, match => ' '.repeat(match.length));
+    const masked = text.replace(/\[[^\]]*\]|［[^］]*］|<[^>]*>|\*+|\{\{|\}\}/gu, match => ' '.repeat(match.length))
+        .replace(/[\u0091\u0092\u2018\u02bc\uff07`´]/gu, "'");
     const words = Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,]\d+)*/gu), match => ({
         text: match[0], key: match[0].normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/’/g, "'"),
         start: match.index, end: match.index + match[0].length
     }));
-    if (!reference) return normalizeSubtitleReferenceNumbers(words, text);
     // Repair only known contractions in the comparison tokens. Original TXT
     // offsets stay intact for highlighting; malformed TXT never becomes an answer.
     const contractions = new Set(["don't", "doesn't", "didn't", "can't", "couldn't", "won't", "wouldn't", "shouldn't", "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't", "mustn't", "needn't"]);
+    // Restore only unambiguous known negatives when the apostrophe vanished
+    // completely. Keep real words such as "cant" and "wont" distinct.
+    const compactContractions = new Map([...contractions].filter(value => !["can't", "won't"].includes(value)).map(value => [value.replace("'", ''), value]));
+    for (const word of words) {
+        const canonical = compactContractions.get(word.key);
+        if (canonical) { word.key = canonical; if (reference) word.text = canonical; }
+    }
+    if (!reference) return normalizeSubtitleReferenceNumbers(words, text);
     const repaired = [];
     for (let i = 0; i < words.length; i++) {
         const word = words[i], next = words[i + 1];
         const contraction = next && word.key + "'" + next.key;
-        if (contractions.has(contraction) && /^[\s'’]+$/u.test(text.slice(word.end, next.start))) {
+        if (contractions.has(contraction) && /^[\s'’\u0091\u0092\u02bc\uff07\uFFFD\u200B\u200C\u200D\uFEFF\u00AD]+$/u.test(text.slice(word.end, next.start))) {
             repaired.push({...word, key: contraction, text: contraction, end: next.end}); i++; continue;
         }
         const previous = words[i - 1];
