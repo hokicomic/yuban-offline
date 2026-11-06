@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.259 · long-mp3-container";
+const APP_VERSION = "v5.260 · preserve-subtitle-clauses";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6816,6 +6816,21 @@ const findSubtitleReferenceNameMatch = (words, i, tokens, j, lineTexts) => {
             if (!Array.from({length:rightCount},(_,offset)=>offset).every(offset=>words[i+rawCount+offset]?.key === tokens[j+refCount+offset]?.key)) continue;
             // A short right-hand anchor is allowed only at the actual cue end.
             if (rightCount === 1 && i+rawCount+1 !== words.length) continue;
+            // A name may have a very different ASR spelling/word count, but
+            // cannot absorb ordinary context that already matches before it.
+            // Without this check, a nearby candidate starting at Dicke could
+            // replace "Still unaware ... phoned Dickie" as one cheap name edit.
+            // Keep the same two-word context evidence used at name boundaries;
+            // punctuation/capitalization and name length are not vetoes.
+            const precedingContext = tokens.slice(Math.max(0, j - 12), j);
+            const consumesContext = rawWords.some((first, rawOffset) => {
+                const second = rawWords[rawOffset + 1];
+                if (!second || (KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(first.key) && KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(second.key))) return false;
+                return precedingContext.some((ref, refOffset) => ref.sourceLine === refLine &&
+                    precedingContext[refOffset + 1]?.sourceLine === refLine &&
+                    first.key === ref.key && second.key === precedingContext[refOffset + 1].key);
+            });
+            if (consumesContext) continue;
             const refs = tokens.slice(j,j+refCount);
             const text = lineTexts.get(refLine).slice(refs[0].start,refs[refs.length-1].end);
             if (rawWords.map(word=>word.key).join(' ') === refs.map(word=>word.key).join(' ')) continue;

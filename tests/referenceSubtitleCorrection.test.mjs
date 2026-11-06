@@ -157,6 +157,41 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.ok(api.findKnowledgePreciseSubtitleRanges(ref,raw).length);
         }
     });
+    test('sequential name correction never consumes the spoken clause before Dicke: ' + file, () => {
+        const previous = "Penzias and Wilson’s finding pushed our acquaintance with the visible7 universe to within half an inch of the lobby floor.";
+        const ref = 'Still unaware of what caused the noise, Wilson and Penzias phoned Dicke at Princeton and described their problem to him in the hope that he might suggest a solution.';
+        const raw = ref.replace('Penzias', 'Penzius').replace('Dicke', 'Dickie');
+        const engine = resolver(previous + '\n' + ref);
+        const cue = { start: 1455.05, end: 1465.9, text: raw };
+        for (const context of [{}, {sourceLine: 1, sequential: true}, {sourceLine: 2, sequential: true}]) {
+            const result = engine.resolve(cue, context);
+            assert.equal(result.text, ref);
+            assert.equal(result.ranges[0].text, ref.slice(0, -1));
+            assert.ok(result.edits.every(edit => edit.from === 'Penzius' || edit.from === 'Dickie'));
+            assert.equal(api.applySubtitleReferencePreference(result).text, ref);
+        }
+        assert.equal(cue.text, raw);
+        assert.equal(cue.start, 1455.05); assert.equal(cue.end, 1465.9);
+        for (const punctuation of [',', '', '—', '.']) {
+            const variant = raw.replace('noise,', 'noise' + punctuation);
+            const result = engine.resolve({text: variant}, {sourceLine: 2, sequential: true});
+            assert.equal(result.text, variant.replace('Penzius', 'Penzias').replace('Dickie', 'Dicke'));
+        }
+        // Even when other ASR errors prevent a complete match, a shorter name
+        // candidate cannot win by deleting the still-correct spoken prefix.
+        const damaged = raw.replace('unaware', 'ignorant').replace('caused', 'produced').replace('noise', 'sound');
+        const result = engine.resolve({text: damaged}, {sourceLine: 2, sequential: true});
+        assert.ok(result.text.startsWith('Still ignorant of what produced the sound, Wilson and '));
+    });
+    test('name replacement keeps even a short matching clause before the actual name: ' + file, () => {
+        for (const prefix of ['We called', 'Yesterday we called', 'The researchers called']) {
+            const ref = prefix + ' Dicke at Princeton and described their problem to him in the hope that he might suggest a solution.';
+            const raw = ref.replace('Dicke', 'Dickie');
+            const result = resolver(ref).resolve({text: raw}, {sourceLine: 1, sequential: true});
+            assert.equal(result.text, ref);
+            assert.ok(result.edits.every(edit => edit.from === 'Dickie'));
+        }
+    });
     test('equivalent first-name and full-name candidates do not reject a long paragraph cue: ' + file, () => {
         const ref='Our heads spin from distraction politics, the body count increases, and our brains break, as contributor and previous guest editor Jia Tolentino puts it, from absorbing the unbelievable acts of cruelty that come across our transoms with no hope of abating.';
         const raw='Our heads spin from distraction politics, the body count increases, and our brains break, as contributor and previous guest editor, Gia Tolentino, puts it, from absorbing the unbelievable acts of cruelty that come across our transoms, with no hope of abating.';
