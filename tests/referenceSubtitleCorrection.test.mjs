@@ -15,6 +15,45 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
     const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + '\n({createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
+    test('damaged ebook contractions, joined words and attached footnotes cannot corrupt caption answers: ' + file, () => {
+        const fixtures = [
+            ["The researcher doesn t know why we don t see the visible7 universe clearly today.", "The researcher doesn't know why we don't see the visible universe clearly today."],
+            ['The researchers examined thevisible universe and described all the evidence carefully today.', 'The researchers examined the visible universe and described all the evidence carefully today.'],
+            ['The researchers examined the visible7 universe and described all the evidence carefully today.', 'The researchers examined the visible universe and described all the evidence carefully today.'],
+            ["The researcher doesn t know why thevisible7 universe appears so distant to everyone today.", "The researcher doesn't know why the visible universe appears so distant to everyone today."]
+        ];
+        for (const [ref, raw] of fixtures) {
+            const engine = resolver(ref);
+            const cue = {text: raw, start: 12, end: 18};
+            const result = engine.resolve(cue);
+            assert.equal(result.aligned, true, ref);
+            assert.equal(api.applySubtitleReferencePreference(result).text, raw, ref);
+            assert.equal(cue.text, raw); assert.equal(cue.start, 12); assert.equal(cue.end, 18);
+            assert.ok(api.findKnowledgePreciseSubtitleRanges(ref, raw).length, ref);
+            for (const range of result.ranges) assert.equal(ref.slice(range.start, range.end), range.text);
+        }
+        // A quality defect must not disable a separate, reliable correction.
+        const ref = 'The signatories don t know why thevisible7 universe appears so distant to everyone today.';
+        const raw = "The sinatures don't know why the visible universe appears so distant to everyone today.";
+        const result = resolver(ref).resolve({text: raw});
+        assert.equal(api.applySubtitleReferencePreference(result).text, raw.replace('sinatures','signatories'));
+        assert.equal(result.changed, true);
+        const typo = "The researcher doesn't know why the visible univerze appears so distant to everyone today.";
+        const damaged = 'The researcher doesn t know why the visible7 universe appears so distant to everyone today.';
+        assert.equal(api.applySubtitleReferencePreference(resolver(damaged).resolve({text: typo})).text, typo.replace('univerze','universe'));
+    });
+    test('source quality rules retain genuine standalone numbers, percentages and model identifiers: ' + file, () => {
+        for (const value of ['300', '7%', 'COVID19', 'B12', 'chapter7', 'phase2']) {
+            const text = 'The researchers carefully examined ' + value + ' and described all the evidence in their final report.';
+            const result = resolver(text).resolve({text});
+            assert.equal(result.aligned, true, value); assert.equal(result.text, text);
+        }
+        const ref = 'The researchers carefully examined 300 samples and described all the evidence in their final report.';
+        const raw = ref.replace('300', '200');
+        const result = resolver(ref).resolve({text: raw});
+        assert.ok(result.reviewDifferences.length); assert.equal(result.changed, false);
+        assert.equal(api.applySubtitleReferencePreference(result).text, ref);
+    });
     test('context corrects ASR spelling without changing timing, punctuation or the original subtitle: ' + file, () => {
         const cue = { id: 7, start: 10, end: 15, text: 'All the sinatures agreed to join the block tomorrow.' };
         const original = JSON.stringify(cue);

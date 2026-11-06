@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.261 · same-folder-subtitles";
+const APP_VERSION = "v5.262 · reference-text-quality";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6717,20 +6717,51 @@ const normalizeSubtitleReferenceNumbers = (words, text) => {
         // A word such as "one" and a digit such as "1" share a key; keep
         // original text/offsets for display and dictation, including "100" vs
         // "one hundred". Values and percent units must match exactly.
-        result.push({ text: text.slice(word.start, charEnd), key: `#number:${numeric.value}${unit}`, start: signed ? word.start - signed[0].length + (/[\s(=:]/u.test(signed[0][0]) ? 1 : 0) : word.start, end: charEnd, numeric: true });
+        result.push({ text: text.slice(word.start, charEnd), key: `#number:${numeric.value}${unit}`, start: signed ? word.start - signed[0].length + (/[\s(=:]/u.test(signed[0][0]) ? 1 : 0) : word.start, end: charEnd, numeric: true, possibleFootnote: Boolean(word.possibleFootnote) });
         i = end;
     }
     return result;
 };
 
-const tokenizeSubtitleReferenceWords = value => {
+const tokenizeSubtitleReferenceWords = (value, { reference = false } = {}) => {
     const text = String(value || '');
     const masked = text.replace(/\[[^\]]*\]|［[^］]*］|<[^>]*>|\*+|\{\{|\}\}/gu, match => ' '.repeat(match.length));
     const words = Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,]\d+)*/gu), match => ({
         text: match[0], key: match[0].normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/’/g, "'"),
         start: match.index, end: match.index + match[0].length
     }));
-    return normalizeSubtitleReferenceNumbers(words, text);
+    if (!reference) return normalizeSubtitleReferenceNumbers(words, text);
+    // Repair only known contractions in the comparison tokens. Original TXT
+    // offsets stay intact for highlighting; malformed TXT never becomes an answer.
+    const contractions = new Set(["don't", "doesn't", "didn't", "can't", "couldn't", "won't", "wouldn't", "shouldn't", "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't", "mustn't", "needn't"]);
+    const repaired = [];
+    for (let i = 0; i < words.length; i++) {
+        const word = words[i], next = words[i + 1];
+        const contraction = next && word.key + "'" + next.key;
+        if (contractions.has(contraction) && /^[\s'’]+$/u.test(text.slice(word.end, next.start))) {
+            repaired.push({...word, key: contraction, text: contraction, end: next.end}); i++; continue;
+        }
+        const previous = words[i - 1];
+        const possibleFootnote = /^\d{1,4}$/u.test(word.key) && previous && previous.end === word.start &&
+            /^[a-z]{4,}$/u.test(previous.key) && !/^[A-Z]+$/u.test(previous.text) && !/^(chapter|section|figure|table|phase|version|model|type|level|grade|vitamin)$/u.test(previous.key) &&
+            !/^[A-Za-z]/u.test(text.slice(word.end)) && !/^\s*%/u.test(text.slice(word.end));
+        repaired.push({...word, possibleFootnote: Boolean(possibleFootnote)});
+    }
+    return normalizeSubtitleReferenceNumbers(repaired, text);
+};
+// A joined ebook token can locate the caption, but must not remove its spaces.
+// This is comparison-only and requires exact letters, never a spelling guess.
+const countSubtitleReferenceJoinedWords = (words, start, ref, raw) => {
+    if (!ref || ref.numeric || !/^[a-z]{5,}$/u.test(ref.key)) return 0;
+    let key = '';
+    for (let count = 1; count <= 4 && start + count <= words.length; count++) {
+        const word = words[start + count - 1];
+        if (word.numeric || !/^[a-z]+$/u.test(word.key) || (count > 1 && !/^\s+$/u.test(raw.slice(words[start + count - 2].end, word.start)))) return 0;
+        key += word.key;
+        if (count > 1 && key === ref.key) return count;
+        if (!ref.key.startsWith(key)) return 0;
+    }
+    return 0;
 };
 const SUBTITLE_REFERENCE_PROTECTED_WORDS = new Set(['not', 'no', 'never', 'without', 'with', 'before', 'after', 'more', 'less', 'increase', 'decrease', 'increased', 'decreased', 'increases', 'decreases', 'million', 'billion', 'may', 'must']);
 // Common emphatic/grammatical repetitions cannot be disambiguated by text alone.
@@ -6867,7 +6898,13 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
         const relax=(i,j,value,path)=>{const at=i*width+j;if(value<costs[at]){costs[at]=value;paths[at]=path;}};
         for(let i=0;i<=n;i++) for(let j=Math.max(0,i-band);j<=Math.min(m,i+band);j++) {
             const value=costs[i*width+j];if(value>maxCost)continue;
-            if(i<n && j<m) relax(i+1,j+1,value+(words[i].key===tokens[start+j].key?0:1),1);
+            if(i<n && j<m) {
+                const ref=tokens[start+j];
+                relax(i+1,j+1,value+(words[i].key===ref.key?0:1),1);
+                const joined=countSubtitleReferenceJoinedWords(words,i,ref,raw);
+                if(joined) relax(i+joined,j+1,value,joined+2);
+                if(i>0 && ref.possibleFootnote && !words[i].numeric) relax(i,j+1,value,7);
+            }
             if(i>0 && i<n && j<m) relax(i,j+1,value+1,2);
             if(i>0 && i<n-1) relax(i+1,j,value+1,3);
         }
@@ -6877,7 +6914,9 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
         const operations=[];let i=n,j=end;
         while(i||j){const path=paths[i*width+j];if(path===1){operations.push({kind:words[i-1].key===tokens[start+j-1].key?'equal':'replace',i:i-1,j:start+j-1});i--;j--;}
             else if(path===2){operations.push({kind:'missing',i,j:start+j-1});j--;}
-            else if(path===3){operations.push({kind:'extra',i:i-1,j:start+j});i--;}else break;}
+            else if(path===3){operations.push({kind:'extra',i:i-1,j:start+j});i--;}
+            else if(path>=4 && path<=6){const count=path-2;for(let k=0;k<count;k++)operations.push({kind:'equal',i:i-1-k,j:start+j-1});i-=count;j--;}
+            else if(path===7){operations.push({kind:'artifact',i,j:start+j-1});j--;}else break;}
         if(i||j)continue;
         operations.reverse();
         const exact=operations.filter(op=>op.kind==='equal').length;
@@ -6891,7 +6930,7 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
         ranges.forEach(range=>{range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end);});
         const edits=[],reviewDifferences=[];
         for(let pos=0;pos<operations.length;pos++){
-            const op=operations[pos];if(op.kind==='equal')continue;
+            const op=operations[pos];if(op.kind==='equal' || op.kind==='artifact')continue;
             const word=words[op.i],ref=tokens[op.j];
             let left=0,right=0;
             for(let k=pos-1;k>=0 && operations[k].kind==='equal';k--)left++;
@@ -6950,7 +6989,7 @@ const createSubtitleReferenceResolver = searchIndex => {
     for (const entry of searchIndex?.entries || []) {
         lineTexts.set(entry.sourceLine, entry.raw);
         if (/[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)) continue;
-        for (const word of tokenizeSubtitleReferenceWords(entry.raw)) {
+        for (const word of tokenizeSubtitleReferenceWords(entry.raw, {reference: true})) {
             const position = tokens.length;
             if (!lineStarts.has(entry.sourceLine)) lineStarts.set(entry.sourceLine, position);
             tokens.push({ ...word, sourceLine: entry.sourceLine });
@@ -7027,6 +7066,11 @@ const createSubtitleReferenceResolver = searchIndex => {
                 const word = words[i], ref = tokens[j];
                 if (consumed.length && ref.sourceLine - consumed[consumed.length - 1].sourceLine > 4) break;
                 if (word.key === ref.key) { exact++; consumed.push(ref); i++; j++; continue; }
+                if (ref.possibleFootnote && consumed.length && !word.numeric) {
+                    consumed.push(ref); j++; continue;
+                }
+                const joinedCount = countSubtitleReferenceJoinedWords(words, i, ref, raw);
+                if (joinedCount && words.length >= 8) { exact += joinedCount; consumed.push(ref); i += joinedCount; j++; continue; }
                 if (i > 0 && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key) && !SUBTITLE_REFERENCE_KEEP_REPETITIONS.has(word.key) && !/\d/u.test(word.key) && word.key === words[i - 1].key && consumed.length &&
                     word.key === consumed[consumed.length - 1].key && isSubtitleReferenceDuplicateGap(raw, words, i, tokens, j) && duplicates < 2) {
                     edits.push({ start: words[i - 1].end, end: word.end, text: '', from: word.text, to: '', kind: 'duplicate' });
