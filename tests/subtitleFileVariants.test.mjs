@@ -5,7 +5,8 @@ import vm from 'node:vm';
 
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
-    const { match, label } = vm.runInNewContext(source.slice(source.indexOf('    const getMatchingSubtitleFiles ='), source.indexOf('    const pickSubtitleFile =')) + '\n({ match: getMatchingSubtitleFiles, label: getSubtitleVariantLabel })');
+    const sourceFolders = new WeakMap();
+    const { match, label } = vm.runInNewContext(source.slice(source.indexOf('    const getMatchingSubtitleFiles ='), source.indexOf('    const pickSubtitleFile =')) + '\n({ match: getMatchingSubtitleFiles, label: getSubtitleVariantLabel })', {mp3SourceFolderHandles: sourceFolders});
     const make = name => ({ name });
     test('pairs complete media names with exact, language and arbitrary subtitle suffixes: ' + file, () => {
         const media = make('Amazing Anna - SNL [3CQ4Qm6O58A].mp4');
@@ -31,6 +32,48 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const good = { name: 'CAFE\u0301.EN-US.SRT', webkitRelativePath: 'root/A/CAFE\u0301.EN-US.SRT' };
         const other = { ...good, webkitRelativePath: 'root/B/CAFE\u0301.EN-US.SRT' };
         assert.deepEqual(Array.from(match(media, [media, good, other])), [good]);
+    });
+
+    test('native directory handles isolate same-name backup captions regardless of scan order: ' + file, async () => {
+        const collect = vm.runInNewContext(source.slice(source.indexOf('    const collectFilesFromDirectoryHandle ='),
+            source.indexOf('    // Uses only the current file-map ref')) + '\ncollectFilesFromDirectoryHandle', {mp3SourceFolderHandles: sourceFolders});
+        const timing = vm.runInNewContext(
+            source.slice(source.indexOf('const clampSubtitles ='), source.indexOf('const normalizeSentenceTimelineBuffers =')) +
+            source.slice(source.indexOf('const parseLRC ='), source.indexOf('const extractJsonObjectFromText =')) +
+            '\n({parseLRC, generateSmartSubtitles})');
+        const currentLrc = '[24:59.51]they received\n[25:00.44]the 1978 Nobel Prize in Physics.\n[25:03.74]The Princeton researchers got only sympathy.';
+        const oldLrc = '[24:57.11]its character in any paper. They received the 1978 Nobel Prize.\n[25:05.51]only sympathy.';
+        const oldCue = timing.generateSmartSubtitles(timing.parseLRC(oldLrc), 0, 3, 16, 'en-US', 'covered')[1];
+        assert.ok(Math.abs(oldCue.start - 1501.1146511627906) < 0.000001, 'old backup reproduces the reported 25:01 start');
+        for (const backupFirst of [true, false]) {
+            // getFile() objects from showDirectoryPicker have no relative path.
+            const media = {name: 'Audiobook.mp3', webkitRelativePath: ''};
+            const current = {name: 'Audiobook.lrc', webkitRelativePath: '', text: async () => currentLrc};
+            const variant = {name: 'Audiobook.en.srt', webkitRelativePath: ''};
+            const backup = {name: 'Audiobook.lrc', webkitRelativePath: '', text: async () => oldLrc};
+            const childMedia = {name: 'Audiobook - extra.mp3', webkitRelativePath: ''};
+            const asEntry = value => value.kind === 'directory' ? value : {kind: 'file', getFile: async () => value};
+            const directory = (name, values) => ({kind: 'directory', name, async *entries() {
+                for (const value of values) yield [value.name, asEntry(value)];
+            }});
+            const nested = directory('backup', [backup, childMedia]);
+            const root = directory('root', backupFirst ? [nested, media, current, variant] : [media, current, variant, nested]);
+            const files = await collect(root);
+            assert.equal(sourceFolders.get(current), root);
+            assert.equal(sourceFolders.get(backup), nested);
+            assert.deepEqual(Array.from(match(media, files)), [current, variant]);
+            const chosen = match(media, files)[0];
+            const parsed = timing.parseLRC(await chosen.text());
+            assert.equal(parsed[0].start, 1499.51);
+            assert.equal(parsed[1].start, 1500.44);
+            for (const mode of ['covered', 'cue-merged']) {
+                const sentence = timing.generateSmartSubtitles(parsed, 0, 3, 16, 'en-US', mode)[0];
+                assert.equal(sentence.start, 1499.51, 'an observed cue start is never redistributed');
+                assert.equal(sentence.end, 1503.74);
+                assert.equal(sentence.text, 'they received the 1978 Nobel Prize in Physics.');
+            }
+            assert.deepEqual(Array.from(match(media, [media, backup])), [], 'never substitute a backup if this folder has no captions');
+        }
     });
 
     const setup = () => {

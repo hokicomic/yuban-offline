@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.260 · preserve-subtitle-clauses";
+const APP_VERSION = "v5.261 · same-folder-subtitles";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10635,7 +10635,15 @@ export default function GeminiPlayer() {
         const folder = file => String(file?.webkitRelativePath || '').replace(/[^/]*$/, '');
         const mediaStem = stem(mediaFile);
         if (!mediaStem) return [];
-        const sameFolder = file => folder(file) === folder(mediaFile);
+        const sameFolder = file => {
+            // showDirectoryPicker's getFile() has an empty webkitRelativePath,
+            // including for files recursively read from backup subdirectories.
+            // Use the actual parent handles retained by the directory walker.
+            const mediaFolder = mp3SourceFolderHandles.get(mediaFile);
+            const subtitleFolder = mp3SourceFolderHandles.get(file);
+            if (mediaFolder || subtitleFolder) return Boolean(mediaFolder && mediaFolder === subtitleFolder);
+            return folder(file) === folder(mediaFile);
+        };
         const matches = (subtitleStem, base) => subtitleStem === base ||
             (subtitleStem.startsWith(base) && /^[. _-]/.test(subtitleStem.slice(base.length)));
         // A suffix belongs to the longest matching media filename, so e.g.
