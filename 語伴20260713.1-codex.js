@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.264 · reverse-search-retry";
+const APP_VERSION = "v5.265 · reverse-selection-controls";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -22393,8 +22393,8 @@ ${userQ}`;
                         {!isVideoMasked && isTopPanelDocumentMode && (
                             <div className="w-full h-full flex flex-col bg-white">
                                 <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-gray-200 bg-gray-50 shrink-0">
-                                    <div className="min-w-0 flex-1">
-                                        <div className="text-xs font-bold text-gray-700">文件對照</div>
+                                    <div className="min-w-28 flex-1">
+                                        <div className="text-xs font-bold text-gray-700 whitespace-nowrap">文件對照</div>
                                         <div className="text-[11px] text-gray-500 truncate">{embeddedKnowledgeFileInfo?.filename || '文字檔'}</div>
                                     </div>
                                     {!isAudioOnlyTrack && (
