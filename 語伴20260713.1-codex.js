@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.263 · selected-text-playback";
+const APP_VERSION = "v5.264 · reverse-search-retry";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7490,8 +7490,90 @@ const captureKnowledgeReverseSelection = (container, selection, sourceLines) => 
     return cleanKnowledgeReverseSelection(fragments.join('\n'));
 };
 
+const getKnowledgeReverseReadingView = (next, previous, selecting) =>
+    selecting && previous?.content === next.content ? previous : next;
+
+const installKnowledgeReverseSelectionCapture = (container, sourceLines, onBegin, onSelection) => {
+    const doc = container?.ownerDocument, win = doc?.defaultView;
+    if (!win) return () => {};
+    let timer;
+    const capture = () => {
+        const selection = win.getSelection();
+        if (!selection?.rangeCount || selection.isCollapsed) return;
+        onSelection(captureKnowledgeReverseSelection(container, selection, sourceLines));
+    };
+    const changed = () => {
+        const selection = win.getSelection();
+        if (!selection?.rangeCount || selection.isCollapsed) return;
+        if (container.contains(selection.getRangeAt(0).commonAncestorContainer)) onBegin();
+        win.clearTimeout(timer);
+        // Do not resize the header while a drag or mobile selection handle moves.
+        timer = win.setTimeout(capture, 120);
+    };
+    const finished = () => { win.clearTimeout(timer); capture(); };
+    doc.addEventListener('selectionchange', changed);
+    doc.addEventListener('pointerup', finished);
+    doc.addEventListener('keyup', finished);
+    return () => {
+        win.clearTimeout(timer);
+        doc.removeEventListener('selectionchange', changed);
+        doc.removeEventListener('pointerup', finished);
+        doc.removeEventListener('keyup', finished);
+    };
+};
+
 const createKnowledgeReverseLookup = subtitles => {
-    const resolver = createSubtitleReferenceResolver({entries: subtitles.map((cue, sourceLine) => ({sourceLine, raw: String(cue.text || '')}))});
+    const entries = subtitles.map((cue, sourceLine) => ({sourceLine, raw: String(cue.text || '')}));
+    const resolver = createSubtitleReferenceResolver({entries});
+    // Reverse queries often contain only ordinary prose. Forward highlighting's
+    // rare-word cap must not hide a unique phrase made of frequent words.
+    const tokens = [], postings = new Map();
+    for (const entry of entries) for (const word of tokenizeSubtitleReferenceWords(entry.raw, {reference: true})) {
+        const position = tokens.length; tokens.push({...word, sourceLine: entry.sourceLine});
+        if (!postings.has(word.key)) postings.set(word.key, []);
+        postings.get(word.key).push(position);
+    }
+    const resolveChunk = query => {
+        const words = tokenizeSubtitleReferenceWords(query);
+        const anchors = words.map((word, index) => ({index, positions: postings.get(word.key) || []}))
+            .filter(anchor => anchor.positions.length).sort((a,b) => a.positions.length - b.positions.length);
+        if (!anchors.length) return {reason: 'missing'};
+        const anchor = anchors[0], exact = [];
+        for (const position of anchor.positions) {
+            const start = position - anchor.index;
+            if (start < 0 || !words.every((word, index) => tokens[start + index]?.key === word.key)) continue;
+            exact.push({sourceLine: tokens[start].sourceLine, endLine: tokens[start + words.length - 1].sourceLine});
+            if (exact.length > 1) return {reason: 'ambiguous'};
+        }
+        if (exact.length) return {aligned: true, ranges: [{sourceLine: exact[0].sourceLine}, {sourceLine: exact[0].endLine}]};
+        const global = resolver.resolve(query);
+        if (global.aligned || global.trusted || /ambiguous/.test(global.reason || '')) return global;
+        // Fuzzy recovery is also track-wide: narrow by ordered word evidence,
+        // then run the established verifier in each independent local window.
+        if (anchor.positions.length > 2048) return {reason: 'ambiguous'};
+        const windows = new Map();
+        for (const position of anchor.positions) {
+            const start = Math.max(0, position - anchor.index);
+            let evidence = 0;
+            for (let i = 0; i < words.length; i++) {
+                if ([-3,-2,-1,0,1,2,3].some(delta => tokens[start + i + delta]?.key === words[i].key)) evidence++;
+            }
+            if (evidence < Math.ceil(words.length * 0.75)) continue;
+            const first = tokens[Math.max(0,start - 4)].sourceLine;
+            const last = tokens[Math.min(tokens.length - 1,start + words.length + 4)].sourceLine;
+            windows.set(first + ':' + last, {first,last});
+            if (windows.size > 32) return {reason: 'ambiguous'};
+        }
+        const hits = new Map();
+        for (const {first,last} of windows.values()) {
+            const hit = createSubtitleReferenceResolver({entries: entries.slice(first,last + 1)}).resolve(query);
+            if (!(hit.aligned || hit.trusted) || !hit.ranges?.length) continue;
+            const key = hit.ranges.map(range => [range.sourceLine,range.start,range.end].join(':')).join('/');
+            hits.set(key,hit);
+            if (hits.size > 1) return {reason: 'ambiguous'};
+        }
+        return hits.values().next().value || global;
+    };
     return {subtitles, find(text) {
         const clean = cleanKnowledgeReverseSelection(text);
         const words = tokenizeSubtitleReferenceWords(clean, {reference: true}).filter(word => !word.possibleFootnote);
@@ -7503,7 +7585,7 @@ const createKnowledgeReverseLookup = subtitles => {
         for (let start = 0; start < words.length;) {
             const end = Math.min(words.length, start + 100);
             const query = words.slice(start, end).map(word => word.text).join(' ');
-            const result = resolver.resolve(query);
+            const result = resolveChunk(query);
             if (!(result.aligned || result.trusted) || !result.ranges.length) return {
                 status: /ambiguous/.test(result.reason || '') ? 'ambiguous' : 'missing'
             };
@@ -9280,6 +9362,8 @@ export default function App() {
     const embeddedKnowledgeTxtInputRef = useRef(null);
     const embeddedKnowledgeContentRef = useRef(null);
     const [knowledgeReverseSelection, setKnowledgeReverseSelection] = useState('');
+    const [knowledgeReverseSelecting, setKnowledgeReverseSelecting] = useState(false);
+    const knowledgeReverseReadingViewRef = useRef(null);
     const [knowledgeReverseNotice, setKnowledgeReverseNotice] = useState('');
     const knowledgeReverseLookupRef = useRef(null);
     const knowledgePreviewManualOverrideRef = useRef({ documentKey: "", subtitleIndex: -1 });
@@ -19830,7 +19914,7 @@ ${userQ}`;
         // often stayed outside the viewport.  Use an immediate, deterministic
         // scroll rather than smooth scrolling: LRC cues can change before a
         // previous smooth animation ends, leaving the new highlight offscreen.
-        if (topPanelMode !== 'document' || embeddedKnowledgeSourceLines.length === 0 || !embeddedKnowledgeContentRef.current) return;
+        if (knowledgeReverseSelecting || topPanelMode !== 'document' || embeddedKnowledgeSourceLines.length === 0 || !embeddedKnowledgeContentRef.current) return;
         let outerFrame = 0;
         let revealFrame = 0;
         const revealActiveLine = () => {
@@ -19855,7 +19939,7 @@ ${userQ}`;
             cancelAnimationFrame(outerFrame);
             cancelAnimationFrame(revealFrame);
         };
-    }, [topPanelMode, embeddedKnowledgeRenderIndex, embeddedKnowledgeSourceLines]);
+    }, [knowledgeReverseSelecting, topPanelMode, embeddedKnowledgeRenderIndex, embeddedKnowledgeSourceLines]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
         const source = String(text || "");
@@ -20233,17 +20317,16 @@ ${userQ}`;
         setEmbeddedKnowledgeAlignmentLogNotice(`已指定第 ${sourceLine + 1} 行為目前字幕對應。`);
     }, [embeddedKnowledgeDocumentKey, embeddedKnowledgeRenderIndex]);
     useEffect(() => {
+        setKnowledgeReverseSelection(''); setKnowledgeReverseNotice(''); setKnowledgeReverseSelecting(false);
+        return installKnowledgeReverseSelectionCapture(embeddedKnowledgeContentRef.current,
+            embeddedKnowledgeAlignmentIndex.entries.map(entry => entry.sourceLine),
+            () => setKnowledgeReverseSelecting(true), setKnowledgeReverseSelection);
+    }, [embeddedKnowledgeAlignmentIndex, subtitles, currentTrackIndex, topPanelMode, isVideoMasked]);
+    const resetKnowledgeReverseSelection = (resumeFollowing = false) => {
+        window.getSelection()?.removeAllRanges();
         setKnowledgeReverseSelection(''); setKnowledgeReverseNotice('');
-        const capture = () => {
-            const selection = window.getSelection();
-            if (!selection?.rangeCount || selection.isCollapsed) return;
-            const text = captureKnowledgeReverseSelection(embeddedKnowledgeContentRef.current, selection,
-                embeddedKnowledgeAlignmentIndex.entries.map(entry => entry.sourceLine));
-            setKnowledgeReverseSelection(text);
-        };
-        document.addEventListener('selectionchange', capture);
-        return () => document.removeEventListener('selectionchange', capture);
-    }, [embeddedKnowledgeAlignmentIndex, subtitles, currentTrackIndex]);
+        setKnowledgeReverseSelecting(!resumeFollowing);
+    };
     const playKnowledgeReverseSelection = () => {
         const text = knowledgeReverseSelection;
         const cues = subtitles;
@@ -20259,11 +20342,14 @@ ${userQ}`;
             return;
         }
         if (isEchoMode) stopEchoMode();
+        window.getSelection()?.removeAllRanges();
+        setKnowledgeReverseSelecting(false);
         sentenceRangeRef.current = null;
         jumpToSubtitle(result.index);
         setKnowledgeReverseNotice(`已定位 ${formatTime(result.start)} · 第 ${result.index + 1} 句，開始播放。`);
     };
-    const embeddedKnowledgeViewProps = useMemo(() => ({
+    const embeddedKnowledgeViewProps = useMemo(() => {
+        const next = {
         content: embeddedKnowledgeText || "（文件內容為空）",
         fontSize: embeddedKnowledgeFontSize,
         trackLanguage,
@@ -20278,7 +20364,11 @@ ${userQ}`;
         treatWholeDocumentAsOriginal: embeddedKnowledgeAlignmentIndex.useWholeDocument,
         manualKnowledgeAnchorMode: embeddedKnowledgeManualAnchorMode,
         onKnowledgeSourceLineConfirm: handleEmbeddedKnowledgeSourceLineConfirm
-    }), [embeddedKnowledgeText, embeddedKnowledgeFontSize, trackLanguage, embeddedKnowledgeFileInfo?.targetLanguage,
+        };
+        const view = getKnowledgeReverseReadingView(next, knowledgeReverseReadingViewRef.current, knowledgeReverseSelecting);
+        knowledgeReverseReadingViewRef.current = view;
+        return view;
+    }, [knowledgeReverseSelecting, embeddedKnowledgeText, embeddedKnowledgeFontSize, trackLanguage, embeddedKnowledgeFileInfo?.targetLanguage,
         embeddedKnowledgeIsDirectBookText, embeddedKnowledgeTermEntries, handleKnowledgePreviewTermClick,
         syncOpenKnowledgePreviewToActiveTerm, embeddedKnowledgeSourceLines, subtitles, embeddedKnowledgeRenderIndex,
         embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm, referenceDocumentProjection, embeddedKnowledgeLineTexts]);
@@ -21643,7 +21733,7 @@ ${userQ}`;
         }
     }, [openEmbeddedKnowledgeTxtByName, openKnowledgeTxtInModal]);
     useEffect(() => {
-        if (!embeddedKnowledgeAutoFollow || topPanelMode !== 'document' || isVideoMasked ||
+        if (knowledgeReverseSelecting || !embeddedKnowledgeAutoFollow || topPanelMode !== 'document' || isVideoMasked ||
             currentIndex < 0 || trackKnowledgeTabEntries.length < 2 || !embeddedKnowledgeFileInfo?.filename) return;
         const searchKey = `${currentTrackIndex}:${currentIndex}:${subtitles[currentIndex]?.text || ""}`;
         if (embeddedKnowledgeTabSearchRef.current === searchKey) return;
@@ -21706,7 +21796,7 @@ ${userQ}`;
             if (isCurrent()) setEmbeddedKnowledgeFollowStatus(`定位未完成：${String(err?.message || err)}`);
         });
         return () => { cancelled = true; };
-    }, [currentTrackIndex, currentIndex, embeddedKnowledgeAutoFollow, embeddedKnowledgeFileInfo?.filename,
+    }, [knowledgeReverseSelecting, currentTrackIndex, currentIndex, embeddedKnowledgeAutoFollow, embeddedKnowledgeFileInfo?.filename,
         getEmbeddedKnowledgeTabSearchData, getKnowledgeTxtFileByName, loadEmbeddedKnowledgeTxtFile,
         subtitles, topPanelMode, isVideoMasked, trackKnowledgeTabEntries]);
     const renderTrackKnowledgeTabs = (target = "modal") => {
@@ -22347,6 +22437,11 @@ ${userQ}`;
                                         title={knowledgeReverseSelection ? `在目前 LRC／SRT 尋找並播放：${knowledgeReverseSelection.slice(0, 160)}` : '先在文本選取一段原文，再反查目前字幕並播放'}>
                                         選文播放
                                     </button>
+                                    <button type="button" onPointerDown={event => event.preventDefault()} onClick={() => resetKnowledgeReverseSelection(false)}
+                                        className="px-2 py-1.5 text-xs rounded-full border border-cyan-200 text-cyan-700 shrink-0" title="清除上次選取，留在目前文本重新選取，不需重新整理">重新選文</button>
+                                    <button type="button" disabled={!knowledgeReverseSelecting} onClick={() => resetKnowledgeReverseSelection(true)}
+                                        className="px-2 py-1.5 text-xs rounded-full border border-gray-200 text-gray-600 disabled:opacity-40 shrink-0" title="結束選文，恢復文本反白與播放跟隨">恢復跟隨</button>
+                                    <span className="text-[10px] text-slate-500">{knowledgeReverseSelecting ? '選文中・暫停跟隨' : ''}</span>
                                     {knowledgeReverseSelection && <span className="max-w-40 truncate text-[10px] text-slate-500" title={knowledgeReverseSelection}>已選：{knowledgeReverseSelection.slice(0, 60)}</span>}
                                     {knowledgeReverseNotice && <span role="status" className="text-[10px] text-cyan-700">{knowledgeReverseNotice}</span>}
                                     {embeddedKnowledgeAlignmentLogNotice && <span className="text-[10px] text-violet-700 shrink-0">{embeddedKnowledgeAlignmentLogNotice}</span>}

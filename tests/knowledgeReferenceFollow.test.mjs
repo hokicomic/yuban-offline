@@ -141,14 +141,14 @@ for (const filename of sourceFiles) {
         assert.equal(first.loadEmbeddedKnowledgeTxtFile, second.loadEmbeddedKnowledgeTxtFile);
     });
 
-    const effectStart = source.indexOf('    useEffect(() => {\n        if (!embeddedKnowledgeAutoFollow');
+    const effectStart = source.indexOf('    useEffect(() => {\n        if (knowledgeReverseSelecting || !embeddedKnowledgeAutoFollow');
     const effectEnd = source.indexOf('    const renderTrackKnowledgeTabs =', effectStart);
     const effectSource = source.slice(effectStart, effectEnd);
-    const runController = ({ fixture, index, active, read = null, enabled = true }) => {
+    const runController = ({ fixture, index, active, read = null, enabled = true, selecting = false }) => {
         const cache = api.createKnowledgeReferenceCache(2);
         const state = { status: '', loaded: null, located: null, cleanup: null, reads: 0 };
         Object.assign(context, {
-            embeddedKnowledgeAutoFollow: enabled, topPanelMode: 'document', isVideoMasked: false,
+            knowledgeReverseSelecting: selecting, embeddedKnowledgeAutoFollow: enabled, topPanelMode: 'document', isVideoMasked: false,
             currentTrackIndex: 0, currentIndex: index, subtitles: fixture.subtitles,
             trackKnowledgeTabEntries: fixture.entries, embeddedKnowledgeFileInfo: { filename: fixture.files[active].name },
             embeddedKnowledgeTabSearchRef: { current: '' }, embeddedKnowledgeCueLookupRef: { current: null },
@@ -176,6 +176,11 @@ for (const filename of sourceFiles) {
         assert.fail('reference controller did not finish');
     };
 
+    test('selection mode suspends automatic reference switching without changing the chosen file: ' + filename, () => {
+        const fixture = makeFixture(api);
+        const state = runController({fixture,index:8,active:0,selecting:true});
+        assert.equal(state.reads,0);assert.equal(state.loaded,null);assert.equal(state.located,null);
+    });
     test('actual React controller lazily finds far part and accepts reverse seeking: ' + filename, async () => {
         const fixture = makeFixture(api);
         for (const [index, active, expected] of [[53, 0, 13], [5, 13, 1]]) {
