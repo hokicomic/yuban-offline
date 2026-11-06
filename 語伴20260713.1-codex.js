@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.265 · reverse-selection-controls";
+const APP_VERSION = "v5.266 · dual-correction-answers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8566,6 +8566,62 @@ const tokenizeSubtitlePractice = (text, language = 'en', nameHints = []) => {
         return { kind: 'word', index: wordIndex++, parts };
     });
 };
+// Map correction offsets onto exercise words, preserving the immutable cue.
+// Changed phrases with different word counts form one dual-answer blank.
+const buildSubtitlePracticeDualTokens = (source, language, nameHints, projection) => {
+    const tokens = tokenizeSubtitlePractice(source, language, nameHints);
+    if (!projection?.changed || projection.text !== source) return tokens;
+    let cursor = 0;
+    const positioned = tokens.map(token => { const start = cursor; cursor += token.kind === 'literal' ? token.text.length : token.parts.map(part => part.text).join('').length; return {...token, start, end: cursor}; });
+    const ranges = []; let offset = 0;
+    for (const edit of [...projection.edits].sort((a,b) => a.start-b.start || a.end-b.end)) {
+        if (edit.text?.trim()) {
+            const leading = edit.text.length - edit.text.trimStart().length;
+            ranges.push({start:edit.start+offset+leading,end:edit.start+offset+edit.text.trimEnd().length,
+                original:String(edit.from ?? projection.raw.slice(edit.start,edit.end)).trim()});
+        } else if (edit.kind === 'duplicate') {
+            const previous = positioned.filter(token => token.kind === 'word' && token.end <= edit.start+offset).at(-1);
+            if (previous) ranges.push({start:previous.start,end:previous.end,original:previous.parts.map(part=>part.text).join('')+' '+String(edit.from || '').trim()});
+        }
+        offset += edit.text.length - (edit.end-edit.start);
+    }
+    const result = []; let index = 0;
+    for (let i=0;i<positioned.length;i++) {
+        const token = positioned[i];
+        const range = ranges.find(range => token.kind === 'word' && token.start < range.end && token.end > range.start);
+        if (!range) { result.push(token.kind === 'word' ? {...token,index:index++} : token); continue; }
+        let last=i;
+        while(last+1<positioned.length && positioned[last+1].end<=range.end && !positioned[last+1].name) last++;
+        const corrected=source.slice(token.start,positioned[last].end);
+        const original=range.original;
+        // No answer is exposed until the learner completes or requests a hint.
+        const accepted=[corrected,original].filter(Boolean);
+        result.push({kind:'word',index:index++,corrected:true,correctedText:corrected,originalText:original,
+            parts:[{kind:'letters',index:0,text:corrected,accepted:[...new Set(accepted)]}]});
+        i=last;
+    }
+    return result;
+};
+const getSubtitlePracticePartOptions = part => part.accepted || [part.text];
+const getSubtitlePracticeAcceptedOption = (part,value) => {
+    const fold=text=>String(text || '').normalize('NFC').toLowerCase().replace(/['’ʼ‐‑–—-]/gu,'');
+    return getSubtitlePracticePartOptions(part).find(expected=>part.accepted ? fold(expected)===fold(value) : isSubtitlePracticePartCorrect(expected,value));
+};
+const isSubtitlePracticePartAccepted = (part,value) => getSubtitlePracticeAcceptedOption(part,value) !== undefined;
+const getSubtitlePracticeDualAlignment = (part,value) => {
+    const options=getSubtitlePracticePartOptions(part).map(expected=>({expected,alignment:getSubtitlePracticeLetterAlignment(expected,value)}));
+    const best=options.reduce((best,item)=>item.alignment.matchedCount>best.alignment.matchedCount?item:best,options[0]);
+    // A typed letter is green if either answer supports it in order.
+    const masks=options.map(item=>item.alignment.runs.flatMap(run=>splitSubtitlePracticeGraphemes(run.text).map(()=>run.matched)));
+    const runs=[];
+    splitSubtitlePracticeGraphemes(value).forEach((text,index)=>{
+        const matched=masks.some(mask=>mask[index]);
+        if(runs.at(-1)?.matched===matched)runs[runs.length-1].text+=text;
+        else runs.push({text,matched});
+    });
+    return {...best.alignment,runs,alternatives:options};
+};
+
 const findSubtitlePracticeNameRanges = (text, hints = []) => {
     const source = String(text || '');
     const words = Array.from(source.matchAll(/[\p{L}\p{M}]+(?:['’ʼ][\p{L}\p{M}]+)*/gu), match => ({ text:match[0], start:match.index, end:match.index+match[0].length,
@@ -8654,13 +8710,13 @@ const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composin
     if (previous?.revealed) return previous;
     const values = [...(previous?.values || [])];
     const target = word.parts.find(part => part.kind === 'letters' && part.index === partIndex);
-    values[partIndex] = !composing && target && isSubtitlePracticePartCorrect(target.text, value) ? target.text : value;
-    const revealed = !composing && value.includes('?');
+    values[partIndex] = !composing && target && isSubtitlePracticePartAccepted(target, value) ? getSubtitlePracticeAcceptedOption(target,value) : value;
+    const revealed = !composing && /[?？]/u.test(value);
     return { values: revealed ? word.parts.filter(part => part.kind === 'letters').map(part => part.text) : values, revealed, composing: Boolean(composing) };
 };
 const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && word.parts
     .filter(part => part.kind === 'letters')
-    .every(part => isSubtitlePracticePartCorrect(part.text, answer?.values?.[part.index]));
+    .every(part => isSubtitlePracticePartAccepted(part, answer?.values?.[part.index]));
 
 const getSubtitlePracticeProgress = (tokens, answers) => {
     const words = tokens.filter(token => token.kind === 'word');
@@ -8758,6 +8814,10 @@ const createPlaybackShortcutHandler = getState => {
         if (!space && !['-', '/', '.'].includes(key)) return;
         if (event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
             event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+        const phrase = event.target?.dataset?.subtitlePhraseAnswer;
+        if (space && phrase) {
+            try { if (JSON.parse(phrase).some(expected => expected.toLowerCase().startsWith(String(event.target.value || '').toLowerCase() + ' '))) return; } catch (_) {}
+        }
         const state = getState();
         if (!state?.enabled || (key === '.' && !state.blankMode)) return;
         const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
@@ -8797,8 +8857,8 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const containerRef = useRef(null);
     const source = subtitle && editsRef.current.has(subtitle) ? editsRef.current.get(subtitle) : text;
     const nameHints = useMemo(() => correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to) || [], [correction]);
-    const tokens = useMemo(() => tokenizeSubtitlePractice(source, language, nameHints), [source, language, nameHints]);
-    const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => part.text).join('') : null)), [tokens]);
+    const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, subtitle && editsRef.current.has(subtitle) ? null : correction), [source, language, nameHints, correction, subtitle, editsRef]);
+    const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source && cached.signature === answerSignature ? cached.answers : {};
     const progress = getSubtitlePracticeProgress(tokens, answers);
@@ -8827,7 +8887,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const previous = latest?.text === source && latest.signature === answerSignature ? latest.answers : {};
         const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
         answerCache.current.set(subtitle, { text: source, signature: answerSignature, answers: next });
-        advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticePartCorrect(part.text, next[word.index].values[part.index])) ? `${word.index}:${part.index}` : null;
+        advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticePartAccepted(part, next[word.index].values[part.index])) ? `${word.index}:${part.index}` : null;
         refreshAnswers(revision => revision + 1);
     };
     React.useLayoutEffect(() => {
@@ -8842,7 +8902,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         context.font = doc.defaultView.getComputedStyle(fields[0]).font;
         const parts = tokens.filter(token => token.kind === 'word').flatMap(word => word.parts.filter(part => part.kind === 'letters'));
         fields.forEach((field, index) => {
-            field.style.width = `${Math.ceil(Math.max(context.measureText('00').width, context.measureText(parts[index].text).width, context.measureText('0').width * splitSubtitlePracticeGraphemes(parts[index].text).length * 0.75 * 1.12) + 8)}px`;
+            field.style.width = `${Math.ceil(Math.max(context.measureText('00').width, parts[index].accepted ? context.measureText('原字幕：'+(parts[index].accepted[1] || '缺字')).width * 0.55 : 0, ...getSubtitlePracticePartOptions(parts[index]).map(option => Math.max(context.measureText(option).width, context.measureText('0').width * splitSubtitlePracticeGraphemes(option).length * 0.75 * 1.12))) + 8)}px`;
         });
     }, [tokens, fontSize, blankMode]);
     const nextBlank = event => {
@@ -8861,7 +8921,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         if (composingBlankRef.current) return;
         const field = event.currentTarget;
         if (!field.value) update(token, part, '?', false);
-        else if (!isSubtitlePracticePartCorrect(part.text, field.value)) update(token, part, '', false);
+        else if (!isSubtitlePracticePartAccepted(part, field.value)) update(token, part, '', false);
         else {
             const copied = await copySubtitlePracticeField(field);
             setCopyNotice({ subtitle, message: copied ? '已複製' : '未能複製，已選取文字，可手動複製' });
@@ -8881,20 +8941,20 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
         const value = answer?.values?.[part.index] || '';
-        const correct = isSubtitlePracticePartCorrect(part.text, value);
+        const correct = isSubtitlePracticePartAccepted(part, value);
         const color = answer?.revealed ? '#dc2626' : correct ? '#2f7d57' : '#6b4c9a';
         const showGuide = Boolean(value) && !answer?.revealed && !correct && !answer?.composing;
-        const alignment = showGuide ? getSubtitlePracticeLetterAlignment(part.text, value) : null;
+        const alignment = showGuide ? getSubtitlePracticeDualAlignment(part, value) : null;
         const runs = alignment?.runs || [];
         const guide = alignment?.slots.map(slot => slot.matched ? slot.text : '_').join(' ') || '';
         const hasHints = runs.some(run => run.matched);
         return (
-            <span key={key} className="relative inline-block align-baseline max-w-full" style={{ paddingBottom: showGuide ? '0.95em' : undefined }}>
+            <span key={key} className="relative inline-block align-baseline max-w-full" data-subtitle-corrected-blank={token.corrected || undefined} style={{ paddingBottom: (answer?.revealed || correct) && token.corrected ? '1.5em' : showGuide ? (part.accepted?.length > 1 ? '1.9em' : '0.95em') : undefined }}>
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
-                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index])}
-                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartCorrect(part.text, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
+                    data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartAccepted(part, answers[token.index]?.values?.[part.index])}
+                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartAccepted(part, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
                     aria-description={showGuide ? `字母位置提示：${guide}。底線代表尚未答出的字母。` : '雙擊：空白顯示答案，未答對清空，答對選取並複製'}
                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
@@ -8914,11 +8974,12 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     }}
                     onPointerUp={event => touchBlankTap(event, token, part)}
                     onPointerCancel={() => { lastBlankTapRef.current = null; }}
+                    data-subtitle-phrase-answer={part.accepted?.some(expected => expected.includes(' ')) ? JSON.stringify(part.accepted) : undefined}
                     onKeyDown={nextBlank}
                     className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
                     style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
                         maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit', fontFamily: 'inherit', fontWeight: 'inherit',
-                        color: hasHints ? 'transparent' : color, WebkitTextFillColor: hasHints ? 'transparent' : color, caretColor: '#6b4c9a' }}
+                        borderBottomColor: token.corrected ? '#dc2626' : undefined, color: hasHints ? 'transparent' : color, WebkitTextFillColor: hasHints ? 'transparent' : color, caretColor: '#6b4c9a' }}
                 />
                 {hasHints && (
                     <span aria-hidden="true" data-subtitle-letter-overlay
@@ -8929,13 +8990,22 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                         </span>
                     </span>
                 )}
+                {token.corrected && (correct || answer?.revealed) && (
+                    <span data-subtitle-other-answer role="note" className="absolute bottom-0 left-1/2 -translate-x-1/2 text-center whitespace-nowrap"
+                        style={{fontSize:'0.55em',lineHeight:'1.15',color:answer?.revealed?'#dc2626':'#64748b'}}>
+                        {answer?.revealed ? `文本：${token.correctedText}／原字幕：${token.originalText || '缺字'}` :
+                            isSubtitlePracticePartCorrect(token.correctedText,value) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
+                    </span>
+                )}
                 {showGuide && (
-                    <span role="note" aria-label={`字母位置提示：${guide}`} data-subtitle-letter-guide
-                        className="absolute bottom-0 left-0 right-0 text-center whitespace-nowrap overflow-x-auto"
-                        style={{ fontSize: '0.75em', lineHeight: '1.1', height: '1.2em' }}>
-                        {alignment.slots.map((slot, index) => <span key={index} aria-hidden="true"
-                            data-subtitle-letter-slot={index} data-subtitle-letter-matched={slot.matched}
-                            style={{ display: 'inline-block', width: '1ch', marginInline: '0.06ch', textAlign: 'center', color: slot.matched ? '#2f7d57' : '#64748b' }}>{slot.matched ? slot.text : '_'}</span>)}
+                    <span role="note" aria-label={`字母位置提示：${guide}`} data-subtitle-letter-guide data-subtitle-alternative-guide={part.accepted?.length > 1 || undefined}
+                        className="absolute left-0 right-0 text-center whitespace-nowrap overflow-x-auto"
+                        style={{ bottom: 0, fontSize: part.accepted?.length > 1 ? '0.65em' : '0.75em', lineHeight: '1.1', height: part.accepted?.length > 1 ? '2.4em' : '1.2em' }}>
+                        {(alignment.alternatives || [{alignment}]).map((choice,variantIndex) => <span key={variantIndex} className="block">
+                            {choice.alignment.slots.map((slot, index) => <span key={index} aria-hidden="true"
+                                data-subtitle-letter-slot={index} data-subtitle-letter-matched={slot.matched}
+                                style={{ display: 'inline-block', width: '1ch', marginInline: '0.06ch', textAlign: 'center', color: slot.matched ? '#2f7d57' : '#64748b' }}>{slot.matched ? slot.text : '_'}</span>)}
+                        </span>)}
                     </span>
                 )}
             </span>
@@ -21600,7 +21670,7 @@ ${userQ}`;
         if (!file) return;
         setEmbeddedKnowledgeAutoFollow(false);
         setEmbeddedKnowledgeLocatedCue(null);
-        setEmbeddedKnowledgeFollowStatus("手動選檔；可勾選「跟隨播放」恢復自動定位");
+        setEmbeddedKnowledgeFollowStatus("手動選檔；可勾選「自動切換文本檔」恢復自動定位");
         try {
             const result = await loadEmbeddedKnowledgeTxtFile(file, { markSelected: true });
             setIsVideoMasked(false);
@@ -21718,7 +21788,7 @@ ${userQ}`;
         if (target === "embedded") {
             setEmbeddedKnowledgeAutoFollow(false);
             setEmbeddedKnowledgeLocatedCue(null);
-            setEmbeddedKnowledgeFollowStatus("手動選檔；開啟「跟隨播放」即可恢復自動定位");
+            setEmbeddedKnowledgeFollowStatus("手動選檔；開啟「自動切換文本檔」即可恢復自動定位");
             try {
                 await openEmbeddedKnowledgeTxtByName(nextName);
             } catch (err) {
@@ -21813,7 +21883,7 @@ ${userQ}`;
                                     setEmbeddedKnowledgeAutoFollow(event.target.checked);
                                     setEmbeddedKnowledgeFollowStatus(event.target.checked ? "按字幕定位…" : "手動選檔（自動跟隨已暫停）");
                                 }} />
-                            跟隨播放
+                            自動切換文本檔
                         </label>
                 )}
                 <div data-knowledge-tab-list={target} className={target === "embedded" ? "flex min-w-0 flex-1 items-center gap-1 overflow-x-auto no-scrollbar" : "contents"}>
@@ -22440,7 +22510,7 @@ ${userQ}`;
                                     <button type="button" onPointerDown={event => event.preventDefault()} onClick={() => resetKnowledgeReverseSelection(false)}
                                         className="px-2 py-1.5 text-xs rounded-full border border-cyan-200 text-cyan-700 shrink-0" title="清除上次選取，留在目前文本重新選取，不需重新整理">重新選文</button>
                                     <button type="button" disabled={!knowledgeReverseSelecting} onClick={() => resetKnowledgeReverseSelection(true)}
-                                        className="px-2 py-1.5 text-xs rounded-full border border-gray-200 text-gray-600 disabled:opacity-40 shrink-0" title="結束選文，恢復文本反白與播放跟隨">恢復跟隨</button>
+                                        className="px-2 py-1.5 text-xs rounded-full border border-gray-200 text-gray-600 disabled:opacity-40 shrink-0" title="結束選文，恢復文本反白與播放跟隨">結束選文</button>
                                     <span className="text-[10px] text-slate-500">{knowledgeReverseSelecting ? '選文中・暫停跟隨' : ''}</span>
                                     {knowledgeReverseSelection && <span className="max-w-40 truncate text-[10px] text-slate-500" title={knowledgeReverseSelection}>已選：{knowledgeReverseSelection.slice(0, 60)}</span>}
                                     {knowledgeReverseNotice && <span role="status" className="text-[10px] text-cyan-700">{knowledgeReverseNotice}</span>}

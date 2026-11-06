@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField})');
+    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,buildSubtitlePracticeDualTokens,getSubtitlePracticeDualAlignment})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -216,6 +216,38 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         fontSize: 24, textRef: { current: null }, editsRef: { current: new WeakMap() } });
     const fields = nodes => nodes.filter(node => node.type === 'input');
     const type = (field, value) => field.props.onChange({ target: { value }, nativeEvent: {} });
+    test('corrected blanks accept either answer, show the other below, and reveal both with ?: ' + file, () => {
+        const props={...base(),subtitle:{text:'The block matters.'},text:'The bloc matters.',correction:{raw:'The block matters.',text:'The bloc matters.',changed:true,
+            edits:[{start:4,end:9,text:'bloc',from:'block',to:'bloc',kind:'spelling'}]}};
+        for(const accepted of ['bloc','block','BLOCK']) {
+            const render=setup();let nodes=render(props), input=fields(nodes)[1];
+            assert.equal(input.props.style.borderBottomColor,'#dc2626');
+            assert.equal(fields(nodes)[0].props.style.borderBottomColor,undefined);
+            assert.equal(nodes.filter(n=>n.props?.['data-subtitle-other-answer']).length,0,'do not leak either answer');
+            type(input,accepted);nodes=render(props);input=fields(nodes)[1];
+            assert.equal(input.props['data-subtitle-part-complete'],true);assert.equal(input.props.style.color,'#2f7d57');
+            const label=nodes.find(n=>n.props?.['data-subtitle-other-answer']);
+            assert.equal(label.props.children,accepted.toLowerCase()==='bloc'?'原字幕：block':'文本：bloc');
+        }
+        const render=setup();let nodes=render(props);type(fields(nodes)[1],'?');nodes=render(props);
+        assert.equal(fields(nodes)[1].props.value,'bloc');assert.equal(fields(nodes)[1].props.style.color,'#dc2626');
+        assert.equal(nodes.find(n=>n.props?.['data-subtitle-other-answer']).props.children,'文本：bloc／原字幕：block');
+        const wideRender=setup();let wideNodes=wideRender(props);type(fields(wideNodes)[1],'？');wideNodes=wideRender(props);
+        assert.equal(wideNodes.find(n=>n.props?.['data-subtitle-other-answer']).props.children,'文本：bloc／原字幕：block');
+        const part=api.buildSubtitlePracticeDualTokens(props.text,'en',[],props.correction).find(t=>t.corrected).parts[0];
+        assert.equal(api.getSubtitlePracticeDualAlignment(part,'block').runs.every(r=>r.matched),true);
+        assert.equal(api.getSubtitlePracticeDualAlignment(part,'blocx').runs.at(-1).matched,false);
+    });
+    test('phrase replacements preserve both complete alternatives and keep names exempt: ' + file, () => {
+        const raw='They re signed the agreement.',text='They resigned the agreement.';
+        const correction={raw,text,changed:true,edits:[{start:5,end:14,text:'resigned',from:'re signed',to:'resigned'}]};
+        const word=api.buildSubtitlePracticeDualTokens(text,'en',[],correction).find(t=>t.corrected);
+        assert.deepEqual(Array.from(word.parts[0].accepted),['resigned','re signed']);
+        for(const value of ['resigned','re signed']) assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,value)),true);
+        assert.equal(api.buildSubtitlePracticeDualTokens('My edited caption.','en',[],correction).some(t=>t.corrected),false);
+        const names=api.buildSubtitlePracticeDualTokens('We visited Kherson yesterday.','en',['Kherson'],{raw:'We visited Haerson yesterday.',text:'We visited Kherson yesterday.',changed:true,edits:[{start:11,end:18,text:'Kherson',from:'Haerson',kind:'name'}]});
+        assert.equal(names.some(t=>t.kind==='word'&&t.parts.some(p=>p.text==='Kherson')),false);
+    });
     test('typing updates real input props, correct/revealed colors, and retains drafts across modes and cues: ' + file, () => {
         const render = setup(), props = base();
         let inputs = fields(render(props));
