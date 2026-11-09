@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,getSubtitlePracticeDualAlignment})');
+    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,buildSubtitlePracticeDeletionDisplay,getSubtitlePracticeDualAlignment})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -74,6 +74,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(await api.copySubtitlePracticeText(caption.textContent,caption),false);
         assert.equal(selected,caption);assert.equal(caption.textContent,'The corrected bloc agreed.');
         assert.equal(await api.copySubtitlePracticeText('text',null),false);
+    });
+    test('deletion display decorates literal gaps without changing words, names or answer indices: ' + file, () => {
+        const text='Thanks to Bernard, we agree today.';
+        const original=tokens(text),at=text.indexOf(' today');
+        const display=api.buildSubtitlePracticeDeletionDisplay(original,text,[{start:at,end:at+1,deleted:'extra'}]);
+        assert.equal(display.map(token=>token.kind==='deletion'?token.text:join([token])).join(''),text);
+        const originalWords=original.filter(token=>token.kind==='word'),displayWords=display.filter(token=>token.kind==='word');
+        assert.equal(displayWords.length,originalWords.length);
+        displayWords.forEach((word,index)=>{assert.equal(word,originalWords[index]);assert.equal(word.index,originalWords[index].index);});
+        assert.equal(display.find(token=>token.kind==='deletion').text,' ');
+        assert.equal(display.find(token=>token.kind==='deletion').deleted,'extra');
+        assert.equal(display.filter(token=>token.name).map(token=>token.text).join(''),'Bernard');
+        assert.equal(api.buildSubtitlePracticeDeletionDisplay(original,text,[]),original);
+        for(const point of [0,text.length-1,text.length]) {
+            const marked=api.buildSubtitlePracticeDeletionDisplay(original,text,[{start:point,end:point,deleted:'removed'}]);
+            assert.equal(marked.map(token=>token.kind==='deletion'?token.text:join([token])).join(''),text);
+            assert.equal(marked.filter(token=>token.kind==='deletion').length,1);
+        }
     });
     test('letter overlays follow the native input horizontal scroll: ' + file, () => {
         const overlay = { scrollLeft: 0 };
@@ -216,7 +234,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const runtime = { ...React, useMemo: memo, useRef: value => { const at = cursor++; return slots[at] ||= { current: value }; },
             useState: initial => { const at = cursor++; if (!(at in slots)) slots[at] = initial; return [slots[at], value => { slots[at] = typeof value === 'function' ? value(slots[at]) : value; }]; },
             useLayoutEffect: (fn, deps) => memo(() => { effects.push(fn); }, deps),
-            useEffect: (fn, deps) => memo(() => { effects.push(fn); }, deps) };
+            useEffect: (fn, deps) => memo(() => { effects.push(fn); }, deps), useCallback: (fn,deps) => memo(()=>fn,deps) };
         const module = { exports: {} };
         vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require: name => name === 'react' ? runtime : require(name), console, setTimeout, clearTimeout });
         return props => {
@@ -230,6 +248,30 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         fontSize: 24, textRef: { current: null }, editsRef: { current: new WeakMap() } });
     const fields = nodes => nodes.filter(node => node.type === 'input');
     const type = (field, value) => field.props.onChange({ target: { value }, nativeEvent: {} });
+    test('blank-mode deletion marks support inspection while drafts, completion and original choices remain correct: ' + file, () => {
+        const render=setup(),raw='We agree extra today.',text='We agree today.';
+        const props={...base(),subtitle:{text:raw},text,correction:{raw,text,changed:true,edits:[{start:8,end:14,text:'',from:'extra',kind:'extra'}]}};
+        let nodes=render(props),inputs=fields(nodes);
+        assert.equal(inputs.length,3);assert.deepEqual(inputs.map(node=>node.props['data-subtitle-blank']),['0:0','1:0','2:0']);
+        type(inputs[0],'we');nodes=render(props);inputs=fields(nodes);type(inputs[1],'ag');nodes=render(props);
+        const marker=nodes.find(node=>node.props?.['data-subtitle-deletion-marker']);
+        const gap=nodes.find(node=>node.props?.['data-subtitle-deletion-gap']);
+        assert.ok(marker);assert.equal(marker.props.title,'已刪除：extra');assert.equal(marker.props.style.color,'#2563eb');
+        assert.equal(gap.props.children[0],' ','marker stays in the gap between the two inputs');
+        let prevented=0,stopped=0;marker.props.onPointerDown({preventDefault(){prevented++;}});
+        marker.props.onClick({preventDefault(){prevented++;},stopPropagation(){stopped++;}});
+        nodes=render(props);inputs=fields(nodes);
+        assert.equal(prevented,2);assert.equal(stopped,1,'inspection cannot switch modes or take typing focus');
+        assert.equal(inputs[1].props.value,'ag','inspection does not clear a partial answer');
+        assert.ok(nodes.some(node=>node.props?.role==='status' && node.props.children==='已刪除：extra'));
+        type(inputs[1],'agree');nodes=render(props);inputs=fields(nodes);type(inputs[2],'today');nodes=render(props);
+        assert.ok(fields(nodes).every(node=>node.props['data-subtitle-part-complete']));
+        assert.ok(nodes.some(node=>node.props?.role==='status' && JSON.stringify(node.props.children).includes('本句完成')));
+        assert.ok(nodes.some(node=>node.props?.['data-subtitle-deletion-marker']),'completion does not remove the correction cue');
+        const original=render({...props,text:raw,correction:null});
+        assert.equal(fields(original).length,4);assert.ok(!original.some(node=>node.props?.['data-subtitle-deletion-marker']));
+        assert.equal(props.subtitle.text,raw);
+    });
     test('corrected blanks accept either answer, show the other below, and reveal both with ?: ' + file, () => {
         const props={...base(),subtitle:{text:'The block matters.'},text:'The bloc matters.',correction:{raw:'The block matters.',text:'The bloc matters.',changed:true,
             edits:[{start:4,end:9,text:'bloc',from:'block',to:'bloc',kind:'spelling'}]}};

@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.272 · deleted-word-indicators";
+const APP_VERSION = "v5.273 · dictation-deletion-indicators";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8748,6 +8748,10 @@ const getSubtitleCorrectionDeletionMarkers = projection => {
     }
     return [...grouped.values()].sort((a,b)=>a.start-b.start).map(marker=>({...marker,deleted:marker.deleted.join(' ')}));
 };
+const SUBTITLE_DELETION_GAP_STYLE = {display:'inline-block',position:'relative',whiteSpace:'pre',lineHeight:'1',paddingBottom:'0.6em',verticalAlign:'baseline'};
+const SUBTITLE_DELETION_BUTTON_STYLE = {position:'absolute',left:'50%',top:'1em',transform:'translateX(-50%)',width:'0.8em',height:'0.6em',
+    display:'inline-flex',alignItems:'center',justifyContent:'center',padding:'0',border:'0',background:'transparent',color:'#2563eb',font:'inherit',lineHeight:'1',cursor:'help',userSelect:'none'};
+const SUBTITLE_DELETION_ICON_PATH = 'M21 4H8L1 12l7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2ZM11 9l6 6m0-6-6 6';
 const paintSubtitleReferenceCorrections = (editor, text, projection, onDeletionInspect = null) => {
     if (!editor) return;
     const ranges = projection?.text === text ? getSubtitleCorrectionDisplayRanges(projection) : [];
@@ -8772,14 +8776,13 @@ const paintSubtitleReferenceCorrections = (editor, text, projection, onDeletionI
         appendText(cursor,marker.start);
         const gap=doc.createElement('span');
         gap.setAttribute('data-subtitle-deletion-gap','true');
-        Object.assign(gap.style,{display:'inline-block',position:'relative',whiteSpace:'pre',lineHeight:'1',paddingBottom:'0.6em',verticalAlign:'baseline'});
+        Object.assign(gap.style,SUBTITLE_DELETION_GAP_STYLE);
         gap.textContent=text.slice(marker.start,marker.end);
         if(marker.start===marker.end){gap.style.height='1em';gap.style.verticalAlign='-0.6em';}
         const button=doc.createElement('button');
         button.type='button';button.title=`已刪除：${marker.deleted}`;
         button.setAttribute('aria-label',button.title);button.setAttribute('data-subtitle-deletion-marker','true');
-        Object.assign(button.style,{position:'absolute',left:'50%',top:'1em',transform:'translateX(-50%)',width:'0.8em',height:'0.6em',
-            display:'inline-flex',alignItems:'center',justifyContent:'center',padding:'0',border:'0',background:'transparent',color:'#2563eb',font:'inherit',lineHeight:'1',cursor:'help',userSelect:'none'});
+        Object.assign(button.style,SUBTITLE_DELETION_BUTTON_STYLE);
         if(marker.start===marker.end)button.style.top='1.2em';
         // SVG paths carry no text nodes: neither native selection nor the
         // sentence-copy fallback can accidentally copy the decoration.
@@ -8787,7 +8790,7 @@ const paintSubtitleReferenceCorrections = (editor, text, projection, onDeletionI
         svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');svg.setAttribute('focusable','false');
         svg.style.width='0.65em';svg.style.height='0.55em';svg.style.overflow='visible';
         const path=doc.createElementNS('http://www.w3.org/2000/svg','path');
-        path.setAttribute('d','M21 4H8L1 12l7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2ZM11 9l6 6m0-6-6 6');
+        path.setAttribute('d',SUBTITLE_DELETION_ICON_PATH);
         path.setAttribute('fill','none');path.setAttribute('stroke','currentColor');path.setAttribute('stroke-width','2');path.setAttribute('stroke-linecap','round');path.setAttribute('stroke-linejoin','round');
         svg.appendChild(path);button.appendChild(svg);
         button.onpointerenter=event=>{if(event.pointerType==='mouse')onDeletionInspect?.(marker.deleted);};
@@ -8858,6 +8861,35 @@ const buildSubtitlePracticeDualTokens = (source, language, nameHints, projection
             parts:[{kind:'letters',index:0,text:corrected,accepted:[...new Set(accepted)]}]});
         i=last;
     }
+    return result;
+};
+// Decorate only the visible gaps. Keep word tokens and their answer indices
+// intact so a deletion marker is never an extra blank or a completed answer.
+const buildSubtitlePracticeDeletionDisplay = (tokens,source,markers) => {
+    if(!markers.length)return tokens;
+    const result=[];let cursor=0,next=0;
+    const appendMarker=(marker,text=source.slice(marker.start,marker.end))=>result.push({...marker,kind:'deletion',text});
+    for(const token of tokens) {
+        const value=token.kind==='literal'?token.text:token.parts.map(part=>part.text).join('');
+        const end=cursor+value.length;
+        if(token.kind==='literal') {
+            let from=cursor;
+            while(next<markers.length && markers[next].start<end) {
+                const marker=markers[next++];
+                if(marker.start>from)result.push({...token,text:source.slice(from,marker.start)});
+                appendMarker(marker);from=marker.end;
+            }
+            if(from<end)result.push({...token,text:source.slice(from,end)});
+        } else {
+            while(next<markers.length && markers[next].start<=cursor)appendMarker(markers[next++]);
+            result.push(token);
+            // A grouped phrase input cannot be split into extra answers. A
+            // rare marker inside one stays decorative at that group's edge.
+            while(next<markers.length && markers[next].start<end)appendMarker(markers[next++],'');
+        }
+        cursor=end;
+    }
+    while(next<markers.length)appendMarker(markers[next++]);
     return result;
 };
 const getSubtitlePracticePartOptions = part => part.accepted || [part.text];
@@ -9140,6 +9172,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const source = String(text || '');
     const nameHints = useMemo(() => correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to) || [], [correction]);
     const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
+    const displayTokens = useMemo(() => buildSubtitlePracticeDeletionDisplay(tokens,source,correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[]), [tokens,source,correction]);
     const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source && cached.signature === answerSignature ? cached.answers : {};
@@ -9158,14 +9191,14 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             focusSubtitlePracticeBlank(containerRef.current, field);
         }
     });
+    const inspectDeletion = useCallback((deleted,pin=false)=>setCopyNotice(current=>{
+        if(!deleted)return current?.kind==='deletion' && !current.pinned?null:current;
+        if(pin && current?.kind==='deletion' && current.deleted===deleted && current.pinned)return null;
+        return {subtitle,kind:'deletion',deleted,pinned:pin || (current?.deleted===deleted && current.pinned),message:`已刪除：${deleted}`};
+    }), [subtitle]);
     React.useLayoutEffect(() => {
-        const inspectDeletion=(deleted,pin=false)=>setCopyNotice(current=>{
-            if(!deleted)return current?.kind==='deletion' && !current.pinned?null:current;
-            if(pin && current?.kind==='deletion' && current.deleted===deleted && current.pinned)return null;
-            return {subtitle,kind:'deletion',deleted,pinned:pin || (current?.deleted===deleted && current.pinned),message:`已刪除：${deleted}`};
-        });
         if (!blankMode || !subtitle) paintSubtitleReferenceCorrections(editorRef.current, source, correction, inspectDeletion);
-    }, [subtitle, source, blankMode, correction]);
+    }, [subtitle, source, blankMode, correction, inspectDeletion]);
     React.useEffect(() => { setCopyNotice(null); }, [subtitle, source]);
     const update = (word, part, value, composing) => {
         if (!subtitle) return;
@@ -9231,6 +9264,22 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         }
         lastBlankTapRef.current = { key, at: now, x: event.clientX, y: event.clientY };
     };
+    const renderDeletion = (marker,key) => (
+        <span key={key} data-subtitle-deletion-gap="true"
+            style={{...SUBTITLE_DELETION_GAP_STYLE,paddingBottom:'1em',...(marker.text?'':{height:'1em',verticalAlign:'-1.2em',paddingBottom:'1.2em'})}}>
+            {marker.text}<button type="button" data-subtitle-deletion-marker="true" title={`已刪除：${marker.deleted}`} aria-label={`已刪除：${marker.deleted}`}
+                style={{...SUBTITLE_DELETION_BUTTON_STYLE,top:marker.text?'1.35em':'1.6em'}}
+                onPointerDown={event=>event.preventDefault()}
+                onPointerEnter={event=>{if(event.pointerType==='mouse')inspectDeletion(marker.deleted);}}
+                onPointerLeave={event=>{if(event.pointerType==='mouse')inspectDeletion(null);}}
+                onFocus={()=>inspectDeletion(marker.deleted)} onBlur={()=>inspectDeletion(null)}
+                onClick={event=>{event.preventDefault();event.stopPropagation();inspectDeletion(marker.deleted,true);}}>
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" style={{width:'0.65em',height:'0.55em',overflow:'visible'}}>
+                    <path d={SUBTITLE_DELETION_ICON_PATH} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+            </button>
+        </span>
+    );
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
         const value = answer?.values?.[part.index] || '';
@@ -9309,7 +9358,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             style={{ fontSize: `${blankMode ? Math.max(16, fontSize) : fontSize}px` }}>
             {blankMode && subtitle ? (
                 <div ref={containerRef}>
-                    {tokens.map((token, index) => token.kind === 'literal' ? <span key={index} data-subtitle-visible-name={token.name || undefined}>{token.text}</span> : (
+                    {displayTokens.map((token, index) => token.kind === 'deletion' ? renderDeletion(token,index) : token.kind === 'literal' ? <span key={index} data-subtitle-visible-name={token.name || undefined}>{token.text}</span> : (
                         <span key={index} className="inline-block whitespace-nowrap align-baseline max-w-full">
                             {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : renderBlank(token, part, partIndex))}
                         </span>
