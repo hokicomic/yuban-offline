@@ -42,6 +42,34 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const damaged = 'The researcher doesn t know why the visible7 universe appears so distant to everyone today.';
         assert.equal(api.applySubtitleReferencePreference(resolver(damaged).resolve({text: typo})).text, typo.replace('univerze','universe'));
     });
+    test('nearby dialogue maps names, sound-boundary errors and contractions without borrowing surrounding speech: ' + file, () => {
+        const fixtures=[
+            ['“We should start back,” Gared urged as the woods began to grow dark around them.','Garret urged as the woods began to grow darker on them.','Gared urged as the woods began to grow dark around them.'],
+            ['Gared did not rise to the bait. He was an old man, past fifty.','Garret did not rise to the bait.','Gared did not rise to the bait.'],
+            ['“Will saw them,” Gared said. “If he says they are dead, that’s proof enough for me.”',"We'll show them, Garret said. And if he says they're dead, that's proof enough for me.",null],
+            ['He wished it had been later rather than sooner.',"He wished he'd been later rather than sooner.",'He wished it had been later rather than sooner.'],
+            ['Will shared his unease. He had been four years on the Wall.',"He'd been four years on the wall.","He'd been four years on the wall."]
+        ];
+        for(const [ref,raw,expected] of fixtures){
+            const result=resolver(ref).resolve({text:raw},{sourceLine:1,sequential:true});
+            assert.equal(result.aligned,true,raw);
+            if(expected)assert.equal(api.applySubtitleReferencePreference(result).text,expected);
+            assert.equal(result.ranges[0].text.includes('We should start back'),false);
+            assert.equal(result.ranges[0].text.includes('He was an old man'),false);
+            assert.equal(result.ranges[0].text.includes('Will shared his unease'),false);
+        }
+        const frequent='urged woods began grow '.repeat(150);
+        const book=resolver(frequent+'\n'+frequent+fixtures[0][0]);
+        const located=book.resolve({text:fixtures[0][1]},{sourceLine:1,sequential:true});
+        assert.equal(located.aligned,true,'nearby late-paragraph anchors survive global frequency and first-128 limits');
+        assert.equal(api.applySubtitleReferencePreference(located).text,fixtures[0][2]);
+        const short=resolver(fixtures[1][0]).resolve({text:fixtures[1][1]});
+        assert.equal(short.changed,false,'short misspelled names still need a nearby reference anchor');
+        const repeated=resolver(fixtures[1][0]+'\n'+fixtures[1][0]).resolve({text:fixtures[1][1]},{sourceLine:1,sequential:true});
+        assert.equal(repeated.aligned,undefined,'identical nearby dialogue remains ambiguous');
+        const contraction=resolver(fixtures[4][0]).resolve({text:fixtures[4][1]},{sourceLine:1,sequential:true});
+        assert.equal(contraction.changed,false);assert.equal(contraction.reviewDifferences?.length||0,0);
+    });
     test('legacy ebook apostrophes are format equivalence, never two replacement answers: ' + file, () => {
         const raw="For the month or so that they are visible, all that distinguishes them from the other stars in the sky is that they occupy a point of space that wasn't filled before.";
         for (const damaged of ['wasn\u0092t','wasn\u0091t','wasnʼt','wasn＇t','wasn‘t','wasn`t','wasn´t','wasn\uFFFDt','wasn\u200Bt','wasn t','wasnt']) {
