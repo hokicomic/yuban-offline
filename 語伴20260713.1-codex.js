@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.270 · adjacent-short-cue-alignment";
+const APP_VERSION = "v5.271 · readonly-caption-copy";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8928,6 +8928,28 @@ const copySubtitlePracticeField = async field => {
     try { return Boolean(doc.execCommand?.('copy')); } catch (_) { return false; }
 };
 
+// Copy the displayed sentence, including reference corrections, without
+// making the caption editable. The fallback selects this text span only;
+// button labels and notices are never part of the copied sentence.
+const copySubtitlePracticeText = async (text,element) => {
+    const doc=element?.ownerDocument;
+    if(!doc)return false;
+    try {
+        const clipboard=doc.defaultView?.navigator?.clipboard;
+        if(typeof clipboard?.writeText==='function'){await clipboard.writeText(String(text || ''));return true;}
+    } catch (_) { /* Fall back to the browser's copy command. */ }
+    const selection=doc.getSelection?.();
+    if(!selection || !doc.createRange)return false;
+    const previous=Array.from({length:selection.rangeCount || 0},(_,i)=>selection.getRangeAt(i).cloneRange());
+    try {
+        const range=doc.createRange();range.selectNodeContents(element);
+        selection.removeAllRanges();selection.addRange(range);
+        if(!doc.execCommand?.('copy'))return false;
+        selection.removeAllRanges();previous.forEach(range=>selection.addRange(range));
+        return true;
+    } catch (_) { return false; }
+};
+
 const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composing = false) => {
     if (previous?.revealed) return previous;
     const values = [...(previous?.values || [])];
@@ -9067,7 +9089,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, editsRef, autoFocusEnabled = true, correction = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -9077,9 +9099,11 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const [, refreshAnswers] = useState(0);
     const editorRef = useRef(null);
     const containerRef = useRef(null);
-    const source = subtitle && editsRef.current.has(subtitle) ? editsRef.current.get(subtitle) : text;
+    // Full captions are selectable reading text. Old accidental edits must
+    // never replace the source caption or become dictation answers.
+    const source = String(text || '');
     const nameHints = useMemo(() => correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to) || [], [correction]);
-    const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, subtitle && editsRef.current.has(subtitle) ? null : correction), [source, language, nameHints, correction, subtitle, editsRef]);
+    const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
     const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source && cached.signature === answerSignature ? cached.answers : {};
@@ -9099,8 +9123,9 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         }
     });
     React.useLayoutEffect(() => {
-        if (!blankMode || !subtitle) paintSubtitleReferenceCorrections(editorRef.current, source, subtitle && editsRef.current.has(subtitle) ? null : correction);
-    }, [subtitle, text, blankMode, editsRef, correction]);
+        if (!blankMode || !subtitle) paintSubtitleReferenceCorrections(editorRef.current, source, correction);
+    }, [subtitle, source, blankMode, correction]);
+    React.useEffect(() => { setCopyNotice(null); }, [subtitle, source]);
     const update = (word, part, value, composing) => {
         if (!subtitle) return;
         setCopyNotice(null);
@@ -9148,6 +9173,11 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             const copied = await copySubtitlePracticeField(field);
             setCopyNotice({ subtitle, message: copied ? '已複製' : '未能複製，已選取文字，可手動複製' });
         }
+    };
+    const copySentence = async event => {
+        event.preventDefault();event.stopPropagation();
+        const copied=await copySubtitlePracticeText(source,editorRef.current);
+        setCopyNotice({subtitle,message:copied?'已複製全句':'未能複製，請選取字幕後手動複製'});
     };
     const touchBlankTap = (event, token, part) => {
         if (!['touch', 'pen'].includes(event.pointerType)) return;
@@ -9245,11 +9275,17 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     ))}
                 </div>
             ) : (
-                <p ref={editorRef} contentEditable={subtitle ? 'plaintext-only' : false} suppressContentEditableWarning
-                    role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" aria-multiline="true" tabIndex={subtitle ? 0 : -1}
-                    onInput={event => { if (subtitle) { editsRef.current.set(subtitle, event.currentTarget.textContent || ''); refreshAnswers(revision => revision + 1); } }}
-                    className="w-fit max-w-full mx-auto select-text cursor-text outline-none"
-                />
+                <p className="w-fit max-w-full mx-auto select-text cursor-text">
+                    <span ref={editorRef} contentEditable={false}
+                        role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
+                        className="select-text outline-none" />
+                    {subtitle && source.trim() && <button type="button" aria-label="複製全句" title="複製目前顯示的完整字幕"
+                        onPointerDown={event=>event.preventDefault()} onClick={copySentence}
+                        className="inline-flex align-middle ml-1 rounded p-1 select-none text-slate-500 hover:text-blue-600 hover:bg-blue-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
+                        style={{lineHeight:1}}>
+                        <Copy size={Math.max(16,Math.min(22,fontSize*0.65))} aria-hidden="true" />
+                    </button>}
+                </p>
             )}
             {copyNotice && copyNotice.subtitle === subtitle && <span role="status" aria-live="polite" className="block mt-1 text-xs text-blue-700">{copyNotice.message}</span>}
             {subtitle && progress.done && (
@@ -9610,7 +9646,6 @@ export default function App() {
     useEffect(() => { subtitlesRef.current = subtitles; }, [subtitles]);
     const subtitleCardRef = useRef(null);
     const subtitleTextRef = useRef(null);
-    const subtitleTextEditsRef = useRef(new WeakMap());
     const panelSplitDragCleanupRef = useRef(null);
 
     const aiCacheRef = useRef(aiCache);
@@ -22909,7 +22944,7 @@ ${userQ}`;
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
-                                    textRef={subtitleTextRef} editsRef={subtitleTextEditsRef}
+                                    textRef={subtitleTextRef}
                                     autoFocusEnabled={!showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode} />
                             </div>
 

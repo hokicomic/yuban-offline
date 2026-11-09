@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,buildSubtitlePracticeDualTokens,getSubtitlePracticeDualAlignment})');
+    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,getSubtitlePracticeDualAlignment})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -60,6 +60,20 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(await api.copySubtitlePracticeField(field), true); assert.equal(fallbacks, 1);
         field.ownerDocument.execCommand = () => false;
         assert.equal(await api.copySubtitlePracticeField(field), false);
+    });
+    test('sentence copying falls back to selecting readonly caption text without changing it: ' + file, async () => {
+        const saved={id:'previous'},ranges=[{cloneRange:()=>saved}];
+        const selection={get rangeCount(){return ranges.length;},getRangeAt:i=>ranges[i],removeAllRanges(){ranges.length=0;},addRange:range=>ranges.push(range)};
+        let selected,success=true,copies=0;
+        const doc={defaultView:{navigator:{clipboard:{writeText:async()=>{throw Error('unavailable');}}}},getSelection:()=>selection,
+            createRange:()=>({selectNodeContents(element){selected=element;}}),execCommand:name=>{assert.equal(name,'copy');copies++;return success;}};
+        const caption={textContent:'The corrected bloc agreed.',ownerDocument:doc};
+        assert.equal(await api.copySubtitlePracticeText(caption.textContent,caption),true);
+        assert.equal(selected,caption);assert.equal(ranges[0],saved);assert.equal(copies,1);
+        saved.cloneRange=()=>saved;success=false;
+        assert.equal(await api.copySubtitlePracticeText(caption.textContent,caption),false);
+        assert.equal(selected,caption);assert.equal(caption.textContent,'The corrected bloc agreed.');
+        assert.equal(await api.copySubtitlePracticeText('text',null),false);
     });
     test('letter overlays follow the native input horizontal scroll: ' + file, () => {
         const overlay = { scrollLeft: 0 };
@@ -208,7 +222,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         return props => {
             cursor = 0; effects = [];
             const nodes = flatten(module.exports.SubtitlePractice.type(props));
-            for (const node of nodes) if (node.props?.contentEditable && node.props.ref) node.props.ref.current = { textContent: '' };
+            for (const node of nodes) if (node.props?.['aria-label'] === '完整字幕文字' && node.props.ref) node.props.ref.current = { textContent: '' };
             effects.forEach(fn => fn()); return nodes;
         };
     };
@@ -401,13 +415,35 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         type(inputs[2],'200');inputs=fields(render(original));assert.equal(inputs[2].props['data-subtitle-part-complete'],true);
         assert.equal(props.subtitle.text,raw);
     });
-    test('full subtitle editing is preserved and edited text becomes the next exercise: ' + file, () => {
-        const render = setup(), props = base();
-        const editor = render({ ...props, blankMode: false }).find(node => node.props?.role === 'textbox');
-        assert.equal(editor.props.ref.current.textContent, props.text);
-        editor.props.onInput({ currentTarget: { textContent: 'Edited, text.' } });
-        assert.equal(fields(render(props)).length, 2);
-        const full = render({ ...props, blankMode: false }).find(node => node.props?.role === 'textbox');
-        assert.equal(full.props.ref.current.textContent, 'Edited, text.');
+    test('full captions remain selectable but cannot be edited or inherit a cleared caption draft: ' + file, () => {
+        const render=setup(),props=base();
+        props.editsRef.current.set(props.subtitle,'.'); // Legacy accidental deletion.
+        const nodes=render({...props,blankMode:false});
+        const caption=nodes.find(node=>node.props?.['aria-label']==='完整字幕文字');
+        assert.equal(caption.props.contentEditable,false);
+        assert.equal(caption.props['aria-readonly'],'true');
+        assert.equal(caption.props.onInput,undefined);
+        assert.match(caption.props.className,/select-text/);
+        assert.equal(caption.props.ref.current.textContent,props.text);
+        assert.equal(fields(render(props)).length,4,'dictation still uses the complete source caption');
+        assert.equal(props.subtitle.text,props.text);
+        assert.ok(nodes.some(node=>node.props?.['aria-label']==='複製全句'));
+        assert.ok(!render(props).some(node=>node.props?.['aria-label']==='複製全句'),'blank mode has no full-answer copy button');
+        assert.ok(!render({...props,blankMode:false,subtitle:null}).some(node=>node.props?.['aria-label']==='複製全句'),'loading messages have no copy button');
+    });
+    test('the sentence button copies displayed corrected text only and reports success or failure: ' + file, async () => {
+        const render=setup(),props={...base(),blankMode:false,text:'The bloc agreed.\n“We are ready.”'};
+        const writes=[];
+        let nodes=render(props),caption=nodes.find(node=>node.props?.['aria-label']==='完整字幕文字');
+        caption.props.ref.current.ownerDocument={defaultView:{navigator:{clipboard:{writeText:async text=>writes.push(text)}}}};
+        let prevented=0,stopped=0;
+        await nodes.find(node=>node.props?.['aria-label']==='複製全句').props.onClick({preventDefault(){prevented++;},stopPropagation(){stopped++;}});
+        assert.deepEqual(writes,[props.text]);assert.equal(prevented,1);assert.equal(stopped,1);
+        assert.ok(render(props).some(node=>node.props?.role==='status' && node.props.children==='已複製全句'));
+        nodes=render(props);caption=nodes.find(node=>node.props?.['aria-label']==='完整字幕文字');
+        caption.props.ref.current.ownerDocument={};
+        await nodes.find(node=>node.props?.['aria-label']==='複製全句').props.onClick({preventDefault(){},stopPropagation(){}});
+        assert.ok(render(props).some(node=>node.props?.role==='status' && node.props.children==='未能複製，請選取字幕後手動複製'));
+        assert.equal(props.subtitle.text,"Hello, don't stop!");
     });
 }
