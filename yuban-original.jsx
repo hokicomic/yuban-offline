@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.269 · phrase-anchor-compound-equivalence";
+const APP_VERSION = "v5.270 · adjacent-short-cue-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6906,6 +6906,10 @@ const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts) => {
         return {rawCount:1,refCount:2,equivalent:true};
     if(expansions(ref.key).some(pair=>pair[0]===word.key && pair[1]===words[i+1]?.key))
         return {rawCount:2,refCount:1,equivalent:true};
+    // Vocative O / Oh is a spelling/punctuation convention, not a different
+    // answer. The rest of the cue still has to map to the same source words.
+    if ((word.key==='o' && ref.key==='oh') || (word.key==='oh' && ref.key==='o'))
+        return {rawCount:1,refCount:1,equivalent:true};
     // A contracted pronoun can be misheard too: "he'd" / "it had".
     // Keep this as a whole-span review, never replace just the pronoun and lose had.
     const pronouns=new Set(['he','she','it','they','we','you','i']);
@@ -6934,6 +6938,44 @@ const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts) => {
         if((left>=2&&right>=2)||(left>=4&&right>=1)||(i===0&&words.length>=14&&right>=1))return {rawCount:count,refCount:count,equivalent:false};
     }
     return null;
+};
+
+// An immediately preceding verified cue supplies a word boundary, not just
+// a paragraph number. Short cues may continue there even if the same word is
+// common elsewhere. Never skip unspoken source words to manufacture a match.
+const locateSubtitleReferenceFollowing = (words,tokens,lineTexts,lineStarts,lineEnds,after,raw) => {
+    if (!words.length || words.length>9 || !after?.length) return null;
+    const last=after[after.length-1],first=lineStarts.get(last.sourceLine),end=lineEnds.get(last.sourceLine);
+    if (!Number.isInteger(first) || !Number.isInteger(last.end)) return null;
+    let low=first,high=end;
+    while(low<high){const mid=(low+high)>>>1;if(tokens[mid].end<last.end)low=mid+1;else high=mid;}
+    if(low>=end || tokens[low].end!==last.end)return null;
+    let start=low+1;
+    while(tokens[start]?.possibleFootnote)start++;
+    if(!tokens[start] || tokens[start].sourceLine-last.sourceLine>4)return null;
+    let i=0,j=start,exact=0;
+    const consumed=[],differences=[];
+    while(i<words.length && j<tokens.length) {
+        const word=words[i],ref=tokens[j];
+        if(consumed.length && ref.sourceLine-consumed.at(-1).sourceLine>4)return null;
+        if(word.key===ref.key){exact++;consumed.push(ref);i++;j++;continue;}
+        const span=getSubtitleReferenceSpanMatch(words,i,tokens,j,lineTexts);
+        if(span?.equivalent){exact+=span.rawCount;consumed.push(...tokens.slice(j,j+span.refCount));i+=span.rawCount;j+=span.refCount;continue;}
+        if(words.length<5 || differences.length)return null;
+        differences.push({word,ref});consumed.push(ref);i++;j++;
+    }
+    if(i!==words.length || exact<words.length-differences.length)return null;
+    const content=new Set(words.filter(word=>word.key.length>=3 && !word.numeric && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key)).map(word=>word.key));
+    if(differences.length && !content.size)return null;
+    const ranges=[];
+    for(const ref of consumed){const range=ranges.at(-1);if(range?.sourceLine===ref.sourceLine)range.end=ref.end;else ranges.push({sourceLine:ref.sourceLine,start:ref.start,end:ref.end});}
+    ranges.forEach(range=>{range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end);});
+    const reviewDifferences=differences.map(({word,ref})=>{
+        const edit={start:word.start,end:word.end,text:ref.text,from:word.text,to:ref.text,kind:isSubtitleReferenceNameWord(ref)?'name':'spelling'};
+        return {side:'difference',text:`${edit.from} → ${edit.to}`,signature:JSON.stringify(['following',ranges,edit]),edit};
+    });
+    return {text:raw,changed:false,edits:[],ranges,aligned:true,trusted:!differences.length,
+        reviewDifferences,boundaryOmissions:[],alignmentMethod:'adjacent_cue'};
 };
 
 const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {sourceLine=-1,sequential=false}={}) => {
@@ -7125,13 +7167,13 @@ const createSubtitleReferenceResolver = searchIndex => {
         }
         return spellingCache.get(key);
     };
-    const resolve = (cue, { sourceLine = -1, sequential = false } = {}) => {
+    const resolve = (cue, { sourceLine = -1, sequential = false, after = [] } = {}) => {
         const raw = typeof cue === 'string' ? cue : String(cue?.text || '');
         const objectCue = cue && typeof cue === 'object';
         // A result depends on the trusted location as well as the cue. A failed
         // speculative lookup must not poison a later lookup after a document
         // switch or a newly established anchor. Bound each cue to four contexts.
-        const contextKey = JSON.stringify([sourceLine, sequential]);
+        const contextKey = JSON.stringify([sourceLine, sequential, after.map(({sourceLine,start,end})=>[sourceLine,start,end])]);
         const cached = objectCue ? cueCache.get(cue) : textCache.get(raw);
         if (cached?.raw === raw && cached.results.has(contextKey)) return cached.results.get(contextKey);
         const remember = result => {
@@ -7144,7 +7186,10 @@ const createSubtitleReferenceResolver = searchIndex => {
             return record;
         };
         const words = tokenizeSubtitleReferenceWords(raw);
-        if (!tokens.length || words.length < 2 || words.length > 120 || /[぀-ヿ㐀-鿿가-힯]/u.test(raw)) return remember({ reason: 'unsupported_or_short' });
+        if (!tokens.length || !words.length || words.length > 120 || /[぀-ヿ㐀-鿿가-힯]/u.test(raw)) return remember({ reason: 'unsupported_or_short' });
+        const following=after.length && locateSubtitleReferenceFollowing(words,tokens,lineTexts,lineStarts,lineEnds,after,raw);
+        if(following)return remember(following);
+        if(words.length<2)return remember({reason:'short_without_adjacent_context'});
         const anchors = words.map((word, index) => ({ index, positions: postings.get(word.key) || [] }))
             .filter(anchor => anchor.positions.length > 0 && anchor.positions.length <= 96)
             .sort((a, b) => a.positions.length - b.positions.length).slice(0, 3);
@@ -7337,7 +7382,19 @@ const createSubtitleReferenceResolver = searchIndex => {
         const cue=perLineTexts.find(range=>range.sourceLine===sourceLine)?.text || subtitleText;
         return Boolean(source && findKnowledgePreciseSubtitleRanges(source,cue).length);
     });
-    return { resolve, tokenCount: tokens.length, hasHighlight };
+    // Only a result verified for the actual preceding subtitle can supply the
+    // boundary. A line hint, a failed lookup, or an unrelated remembered cue
+    // cannot make a one-word caption match. Caches are scoped to this document.
+    const resolveFollowing = (cue,previousCue,options={}) => {
+        const raw=typeof previousCue==='string'?previousCue:String(previousCue?.text || '');
+        const cached=previousCue && typeof previousCue==='object'?cueCache.get(previousCue):textCache.get(raw);
+        let previous=cached?.raw===raw?[...cached.results.values()].filter(result=>(result.aligned || result.trusted) && result.ranges.length):[];
+        if(options.sourceLine>=0){const nearby=previous.filter(result=>Math.abs(result.ranges.at(-1).sourceLine-options.sourceLine)<=4);if(nearby.length)previous=nearby;}
+        const distinct=new Map(previous.map(result=>[JSON.stringify(result.ranges),result]));
+        if(distinct.size===1){const ranges=[...distinct.values()][0].ranges;return resolve(cue,{...options,sourceLine:ranges.at(-1).sourceLine,after:ranges});}
+        return resolve(cue,options);
+    };
+    return { resolve, resolveFollowing, tokenCount: tokens.length, hasHighlight };
 };
 const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
     if (!(projection?.trusted || projection?.aligned) || !accepted?.size) return projection;
@@ -7742,6 +7799,12 @@ const createKnowledgeReverseLookup = subtitles => {
         const index = results[0].first, endIndex = results.at(-1).last;
         return {status: 'found', index, endIndex, start: Number(subtitles[index].start), end: Number(subtitles[endIndex].end)};
     }};
+};
+
+const getKnowledgeVerifiedHighlightRanges = (source,subtitleText,verified) => {
+    if(Number.isInteger(verified?.start) && Number.isInteger(verified?.end) && verified.start>=0 && verified.end>verified.start &&
+        source.slice(verified.start,verified.end)===verified.text)return [{start:verified.start,end:verified.end}];
+    return findKnowledgePreciseSubtitleRanges(source,subtitleText);
 };
 
 const MarkdownView = ({
@@ -8220,15 +8283,16 @@ const MarkdownView = ({
         return result;
     };
 
-    const buildSentenceHighlightedKnowledgeNodes = (text, subtitleText, keyPrefix = "mdk-active") => {
+    const buildSentenceHighlightedKnowledgeNodes = (text, subtitleText, keyPrefix = "mdk-active", sourceLine = -1) => {
         const source = String(text || "");
         // LRC often ends a cue at a semicolon/comma even though the ebook keeps
         // the surrounding prose as one grammatical sentence. Prefer an exact
         // word-range so only the spoken cue is marked (including Mr./Ms.).
-        const cacheKey = JSON.stringify([source, subtitleText]);
+        const verified=activeKnowledgeLineTexts.find(range=>range.sourceLine===sourceLine);
+        const cacheKey = JSON.stringify([source, subtitleText, verified]);
         let highlightRanges = knowledgeCueRangesCache.get(cacheKey);
         if (!highlightRanges) {
-            highlightRanges = findKnowledgePreciseSubtitleRanges(source, subtitleText);
+            highlightRanges = getKnowledgeVerifiedHighlightRanges(source, subtitleText, verified);
             if (knowledgeCueRangesCache.size >= 256) knowledgeCueRangesCache.delete(knowledgeCueRangesCache.keys().next().value);
             knowledgeCueRangesCache.set(cacheKey, highlightRanges);
         }
@@ -8356,7 +8420,7 @@ const MarkdownView = ({
             // the exact yellow range(s), never an earlier link in the same
             // paragraph.  For example, this prevents `accountability` from
             // winning when the current highlighted cue contains `misconduct`.
-            const exactRanges = findKnowledgePreciseSubtitleRanges(source, subtitleForSourceLine(segment.sourceLine));
+            const exactRanges = getKnowledgeVerifiedHighlightRanges(source, subtitleForSourceLine(segment.sourceLine), activeKnowledgeLineTexts.find(range=>range.sourceLine===segment.sourceLine));
             const highlightedFragments = exactRanges.length > 0
                 ? exactRanges.map((range) => source.slice(range.start, range.end))
                 : [];
@@ -8530,7 +8594,7 @@ const MarkdownView = ({
                                 {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
                                         {useSentenceLevelHighlight
-                                            ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, subtitleForSourceLine(seg.sourceLine), `mdk-active-${i}`)
+                                            ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, subtitleForSourceLine(seg.sourceLine), `mdk-active-${i}`, seg.sourceLine)
                                             : buildKnowledgeLinkedNodes(plainTextForLink, `mdk-${i}`)}
                                     </div>
                                 ) : (
@@ -19822,7 +19886,7 @@ ${userQ}`;
         // Text changes before the deferred document follower resets its cursor.
         // Its old line numbers have no meaning in the new reference document.
         const sameDocument = progress.documentText === embeddedKnowledgeText;
-        return subtitleReferenceResolver.resolve(subtitles[currentIndex], {
+        return subtitleReferenceResolver.resolveFollowing(subtitles[currentIndex], subtitles[currentIndex - 1], {
             sourceLine: sameDocument ? progress.maxSourceLine : -1,
             sequential: sameDocument && progress.anchorState === 'anchored' && currentIndex >= progress.subtitleIndex && currentIndex - progress.subtitleIndex <= 2
         });
@@ -19864,7 +19928,7 @@ ${userQ}`;
         const run = () => {
             if (cancelled || !neighbours.length) return;
             const index = neighbours.shift();
-            subtitleReferenceResolver.resolve(subtitles[index], { sourceLine: currentSubtitleProjection?.ranges[0]?.sourceLine ?? -1, sequential: index > currentIndex });
+            subtitleReferenceResolver.resolveFollowing(subtitles[index], subtitles[index - 1], { sourceLine: currentSubtitleProjection?.ranges[0]?.sourceLine ?? -1, sequential: index > currentIndex });
             if (neighbours.length) schedule();
         };
         const schedule = () => { handle = window.requestIdleCallback ? window.requestIdleCallback(run, { timeout: 400 }) : window.setTimeout(run, 0); };
@@ -19879,7 +19943,7 @@ ${userQ}`;
         const progress = embeddedKnowledgePlaybackProgressRef.current;
         if (embeddedKnowledgeRenderIndex === currentIndex) return currentSubtitlePresentation;
         const cue = subtitles[embeddedKnowledgeRenderIndex];
-        const projection = subtitleReferenceResolver.resolve(cue, {
+        const projection = subtitleReferenceResolver.resolveFollowing(cue, subtitles[embeddedKnowledgeRenderIndex - 1], {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
         return applySubtitleReferencePreference(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue), cue && referenceOriginalDifferencesRef.current.get(cue));

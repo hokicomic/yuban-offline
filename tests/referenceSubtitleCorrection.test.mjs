@@ -107,6 +107,55 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(adjacent.text,'The signatories wanted to ride hell-bent for safety before the coming storm.');
         assert.equal(adjacent.edits.length,1,'a reliable adjacent correction remains independent from compound typography');
     });
+    test('a one-word cue follows only the exact endpoint of the actual preceding verified subtitle: ' + file, () => {
+        const ref='At the edge of the room, he passed rows of lights. They held sapphires infused with Stormlight. Profane. How could they do that? Profane, but beautiful. That was profane.';
+        const previous={text:'They held sapphires infused with stormlight.'};
+        const cue={text:'Profane.',start:270.5,end:271.2};
+        const book=resolver(ref);
+        assert.ok(!book.resolve(cue,{sourceLine:1,sequential:true}).aligned,'a paragraph hint alone cannot pick a repeated word');
+        assert.equal(book.resolve(previous,{sourceLine:1}).aligned,true);
+        const projection=book.resolveFollowing(cue,previous,{sourceLine:1,sequential:true});
+        assert.equal(projection.aligned,true);assert.equal(projection.text,'Profane.');assert.equal(projection.changed,false);
+        assert.equal(projection.ranges[0].start,ref.indexOf('Profane.'));
+        assert.equal(projection.ranges[0].text,'Profane','never borrow the next sentence');
+        assert.equal(book.resolveFollowing(cue,previous,{sourceLine:1,sequential:true}),projection,'replay keeps the same bounded range');
+        const next={text:'How could they do that?'};
+        assert.equal(book.resolveFollowing(next,cue).aligned,true,'short consecutive cues retain sequence context');
+        const third=book.resolveFollowing({text:'Profane, but beautiful.'},next);
+        assert.equal(third.aligned,true);assert.equal(third.ranges[0].start,ref.indexOf('Profane, but'));
+        assert.equal(cue.start,270.5);assert.equal(cue.end,271.2);
+        assert.ok(!resolver(ref).resolveFollowing(cue,previous).aligned,'a new document cannot inherit another resolver’s endpoint');
+        const wrongPrevious={text:'At the edge of the room, he passed rows of lights.'};
+        assert.equal(book.resolve(wrongPrevious).aligned,true);
+        assert.ok(!book.resolveFollowing(cue,wrongPrevious).aligned,'cannot skip intervening words to find a convenient answer');
+        assert.ok(!book.resolveFollowing({text:'Profanity.'},previous).aligned,'single-word phonetic guesses remain forbidden');
+    });
+    test('a previous cue cannot impose forward-only limits on an explicit nonsequential lookup: ' + file, () => {
+        const prior={text:'The earlier delegation discussed the regional peace treaty yesterday.'};
+        const next={text:'The royal delegation completed its lengthy journey through the northern mountains before the evening meeting.'};
+        const book=resolver(prior.text+'\n'+Array.from({length:70},(_,i)=>'Unrelated heading '+i+'.').join('\n')+'\n'+next.text);
+        assert.equal(book.resolve(prior,{sourceLine:1}).aligned,true);
+        assert.equal(book.resolveFollowing(next,prior,{sourceLine:1,sequential:false}).aligned,true,'manual navigation retains its requested search scope');
+    });
+    test('short adjacent cues compare vocatives, demonstratives and ASR names without a whole-book guess: ' + file, () => {
+        for(const [ref,previous,raw,expected,review,seed] of [
+            ['A mountain stream only three steps from the ice. We are his. Oh Stormfather … we are his. It is but a thousand days.','We are his.','O Stormfather, we are his.','O Stormfather, we are his.',0,'A mountain stream only three steps from the ice.'],
+            ['They did not call themselves Parshendi; this was the Alethi name for them. It meant something else.','They did not call themselves Parshendi.','That was the Alethi name for them.','this was the Alethi name for them.',1],
+            ['The tiny spirits took the form of spinning translucent ribbons. As Szeth passed the drummers, they noted him. They would withdraw soon.','The tiny spirits took the form of spinning translucent ribbons.','As Zeth passed the drummers, they noted him.','As Szeth passed the drummers, they noted him.',1]
+        ]) {
+            const book=resolver(ref),previousCue={text:previous};
+            const seedCue=seed && {text:seed};
+            if(seedCue)assert.equal(book.resolve(seedCue,{sourceLine:1}).aligned,true);
+            const prior=seedCue?book.resolveFollowing(previousCue,seedCue,{sourceLine:1}):book.resolve(previousCue,{sourceLine:1});
+            assert.equal(prior.aligned,true,previous);
+            const projection=book.resolveFollowing({text:raw},previousCue,{sourceLine:1,sequential:true});
+            assert.equal(projection.aligned,true,raw);
+            assert.equal(api.applySubtitleReferencePreference(projection).text,expected);
+            assert.equal(projection.reviewDifferences.length,review);
+            assert.ok(!projection.ranges[0].text.includes('It meant'));
+            assert.ok(!projection.ranges[0].text.includes('They would withdraw'));
+        }
+    });
     test('legacy ebook apostrophes are format equivalence, never two replacement answers: ' + file, () => {
         const raw="For the month or so that they are visible, all that distinguishes them from the other stars in the sky is that they occupy a point of space that wasn't filled before.";
         for (const damaged of ['wasn\u0092t','wasn\u0091t','wasnʼt','wasn＇t','wasn‘t','wasn`t','wasn´t','wasn\uFFFDt','wasn\u200Bt','wasn t','wasnt']) {
@@ -521,6 +570,18 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         platform: 'node', format: 'cjs', external: ['react'], write: false, logLevel: 'silent' });
     const module = { exports: {} };
     vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require, console, setTimeout, clearTimeout });
+    test('the actual renderer preserves verified offsets for a repeated one-word caption in one paragraph: ' + file, () => {
+        const ref='They held sapphires infused with Stormlight. Profane. Later he said Profane, but beautiful.';
+        const book=resolver(ref),previous={text:'They held sapphires infused with Stormlight.'};
+        book.resolve(previous,{sourceLine:1});
+        const projection=book.resolveFollowing({text:'Profane.'},previous);
+        const markup=renderToStaticMarkup(React.createElement(module.exports.MarkdownView,{
+            content:'[原文]\n'+ref,activeKnowledgeSourceLines:[1],activeKnowledgeSubtitleText:'Profane.',activeKnowledgeLineTexts:projection.ranges
+        }));
+        const marks=[...markup.matchAll(/<mark[^>]*>([\s\S]*?)<\/mark>/g)].map(match=>match[1].replace(/<[^>]*>/g,''));
+        assert.deepEqual(marks,['Profane']);
+        assert.ok(markup.indexOf('<mark')<markup.indexOf('Later he said'),'highlight the adjacent occurrence, not the later duplicate');
+    });
     test('the actual document renderer uses per-line cue portions and never backfills unspoken sentences: ' + file, () => {
         const text = '[原文]\nThe member states agreed to join the bloc and strengthen their common policy.\nBefore negotiations begin on Monday. Unspoken ending.';
         const markup = renderToStaticMarkup(React.createElement(module.exports.MarkdownView, {
