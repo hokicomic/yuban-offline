@@ -70,6 +70,43 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const contraction=resolver(fixtures[4][0]).resolve({text:fixtures[4][1]},{sourceLine:1,sequential:true});
         assert.equal(contraction.changed,false);assert.equal(contraction.reviewDifferences?.length||0,0);
     });
+    test('unanchored whole-book lookup uses ordered phrases when every useful word exceeds the posting limit: ' + file, () => {
+        const ref='“We should start back,” Gared urged as the woods began to grow dark around them.';
+        const raw='Garret urged as the woods began to grow darker on them.';
+        const frequent='urged quiet woods distant began slowly grow tall '.repeat(110);
+        const padding=Array.from({length:520},(_,i)=>'Unrelated chapter heading '+i+'.').join('\n');
+        const book=resolver(padding+'\n'+frequent+'\n'+ref+'\nUnspoken later narration.');
+        const cue={text:raw,start:7.7,end:12.2}, before=JSON.stringify(cue);
+        const projection=book.resolve(cue); // Deliberately no sourceLine hint.
+        assert.equal(projection.aligned,true,'a first lookup must work without a supplied correct paragraph');
+        assert.equal(api.applySubtitleReferencePreference(projection).text,'Gared urged as the woods began to grow dark around them.');
+        assert.equal(projection.ranges[0].text,'Gared urged as the woods began to grow dark around them');
+        assert.equal(JSON.stringify(cue),before,'reference lookup cannot alter media timing or raw subtitles');
+        assert.ok(projection.reviewDifferences.some(item=>item.text==='darker on → dark around'),'phrase review describes the complete replacement');
+        assert.equal(book.resolve(cue),projection,'repeat playback reuses the result');
+        const duplicate=resolver(frequent+'\n'+ref+'\n'+ref).resolve({text:raw});
+        assert.ok(!duplicate.aligned,'exact phrase anchors cannot choose between duplicate full-cue matches');
+        const unrelated=resolver(frequent+'\nSomeone urged as the woods were quiet before a storm started elsewhere.').resolve({text:raw});
+        assert.ok(!unrelated.aligned,'an anchor phrase alone cannot approve a different whole sentence');
+    });
+    test('hyphenated and joined compounds retain caption spelling and never create false deletion/replacement blanks: ' + file, () => {
+        const raw='Will wanted nothing so much as to ride hell-bent for the safety of the wall, but that was not a feeling to share with your commander, especially not a commander like this one.';
+        const ref=raw.replace('hell-bent','hellbent').replace(', especially','.\nEspecially');
+        for(const form of ['hell-bent','hell‐bent','hell‑bent','hell bent','hellbent']) {
+            const cue={text:raw.replace('hell-bent',form)};
+            const projection=resolver(ref).resolve(cue);
+            assert.equal(projection.aligned,true,form);
+            assert.equal(projection.changed,false,form);
+            assert.equal(projection.reviewDifferences?.length || 0,0,form);
+            assert.equal(api.applySubtitleReferencePreference(projection).text,cue.text,form);
+            assert.equal(api.buildSubtitlePracticeDualTokens(cue.text,'en-US',[],projection).some(token=>token.corrected),false,form);
+        }
+        const reverse=resolver(raw).resolve({text:raw.replace('hell-bent','hellbent')});
+        assert.equal(reverse.aligned,true);assert.equal(reverse.changed,false);assert.equal(reverse.reviewDifferences?.length || 0,0);
+        const adjacent=resolver('The signatories wanted to ride hellbent for safety before the coming storm.').resolve({text:'The sinatures wanted to ride hell-bent for safety before the coming storm.'});
+        assert.equal(adjacent.text,'The signatories wanted to ride hell-bent for safety before the coming storm.');
+        assert.equal(adjacent.edits.length,1,'a reliable adjacent correction remains independent from compound typography');
+    });
     test('legacy ebook apostrophes are format equivalence, never two replacement answers: ' + file, () => {
         const raw="For the month or so that they are visible, all that distinguishes them from the other stars in the sky is that they occupy a point of space that wasn't filled before.";
         for (const damaged of ['wasn\u0092t','wasn\u0091t','wasnʼt','wasn＇t','wasn‘t','wasn`t','wasn´t','wasn\uFFFDt','wasn\u200Bt','wasn t','wasnt']) {
