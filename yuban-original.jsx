@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.271 · readonly-caption-copy";
+const APP_VERSION = "v5.272 · deleted-word-indicators";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8728,24 +8728,75 @@ const getSubtitleCorrectionDisplayRanges = projection => {
     }
     return ranges.sort((a, b) => a.start - b.start).filter((range, index, all) => index === 0 || range.start >= all[index - 1].end);
 };
-const paintSubtitleReferenceCorrections = (editor, text, projection) => {
+const getSubtitleCorrectionDeletionMarkers = projection => {
+    if(!projection?.changed)return [];
+    const grouped=new Map();let offset=0;
+    for(const edit of [...projection.edits].sort((a,b)=>a.start-b.start || a.end-b.end)) {
+        if(!edit.text && edit.end>edit.start) {
+            const deleted=String(edit.from || projection.raw.slice(edit.start,edit.end)).trim();
+            if(deleted) {
+                const point=Math.max(0,Math.min(projection.text.length,edit.start+offset));
+                // Put the mark under the surviving space, never under a word.
+                // At sentence boundaries use a zero-width anchor instead.
+                const space=/[ \t\u00a0]/u;
+                const at=space.test(projection.text[point] || '')?point:point>0 && space.test(projection.text[point-1])?point-1:point;
+                const marker=grouped.get(at) || {start:at,end:at+(space.test(projection.text[at] || '')?1:0),deleted:[]};
+                marker.deleted.push(deleted);grouped.set(at,marker);
+            }
+        }
+        offset+=edit.text.length-(edit.end-edit.start);
+    }
+    return [...grouped.values()].sort((a,b)=>a.start-b.start).map(marker=>({...marker,deleted:marker.deleted.join(' ')}));
+};
+const paintSubtitleReferenceCorrections = (editor, text, projection, onDeletionInspect = null) => {
     if (!editor) return;
     const ranges = projection?.text === text ? getSubtitleCorrectionDisplayRanges(projection) : [];
+    const markers = projection?.text === text ? getSubtitleCorrectionDeletionMarkers(projection) : [];
     const doc = editor.ownerDocument;
-    if (!ranges.length) { editor.textContent = text; return; }
+    if (!ranges.length && !markers.length) { editor.textContent = text; return; }
     const fragment = doc.createDocumentFragment();
-    let cursor = 0;
-    for (const range of ranges) {
-        if (range.start > cursor) fragment.appendChild(doc.createTextNode(text.slice(cursor, range.start)));
-        const span = doc.createElement('span');
-        span.setAttribute('data-subtitle-reference-corrected', 'true');
-        span.style.color = '#2563eb';
-        span.textContent = text.slice(range.start, range.end);
-        fragment.appendChild(span);
-        cursor = range.end;
+    const appendText=(from,to)=>{
+        let cursor=from;
+        for(const range of ranges) {
+            const start=Math.max(from,range.start),end=Math.min(to,range.end);
+            if(end<=start)continue;
+            if(start>cursor)fragment.appendChild(doc.createTextNode(text.slice(cursor,start)));
+            const span=doc.createElement('span');
+            span.setAttribute('data-subtitle-reference-corrected','true');span.style.color='#2563eb';
+            span.textContent=text.slice(start,end);fragment.appendChild(span);cursor=end;
+        }
+        if(cursor<to)fragment.appendChild(doc.createTextNode(text.slice(cursor,to)));
+    };
+    let cursor=0;
+    for(const marker of markers) {
+        appendText(cursor,marker.start);
+        const gap=doc.createElement('span');
+        gap.setAttribute('data-subtitle-deletion-gap','true');
+        Object.assign(gap.style,{display:'inline-block',position:'relative',whiteSpace:'pre',lineHeight:'1',paddingBottom:'0.6em',verticalAlign:'baseline'});
+        gap.textContent=text.slice(marker.start,marker.end);
+        if(marker.start===marker.end){gap.style.height='1em';gap.style.verticalAlign='-0.6em';}
+        const button=doc.createElement('button');
+        button.type='button';button.title=`已刪除：${marker.deleted}`;
+        button.setAttribute('aria-label',button.title);button.setAttribute('data-subtitle-deletion-marker','true');
+        Object.assign(button.style,{position:'absolute',left:'50%',top:'1em',transform:'translateX(-50%)',width:'0.8em',height:'0.6em',
+            display:'inline-flex',alignItems:'center',justifyContent:'center',padding:'0',border:'0',background:'transparent',color:'#2563eb',font:'inherit',lineHeight:'1',cursor:'help',userSelect:'none'});
+        if(marker.start===marker.end)button.style.top='1.2em';
+        // SVG paths carry no text nodes: neither native selection nor the
+        // sentence-copy fallback can accidentally copy the decoration.
+        const svg=doc.createElementNS('http://www.w3.org/2000/svg','svg');
+        svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');svg.setAttribute('focusable','false');
+        svg.style.width='0.65em';svg.style.height='0.55em';svg.style.overflow='visible';
+        const path=doc.createElementNS('http://www.w3.org/2000/svg','path');
+        path.setAttribute('d','M21 4H8L1 12l7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2ZM11 9l6 6m0-6-6 6');
+        path.setAttribute('fill','none');path.setAttribute('stroke','currentColor');path.setAttribute('stroke-width','2');path.setAttribute('stroke-linecap','round');path.setAttribute('stroke-linejoin','round');
+        svg.appendChild(path);button.appendChild(svg);
+        button.onpointerenter=event=>{if(event.pointerType==='mouse')onDeletionInspect?.(marker.deleted);};
+        button.onpointerleave=event=>{if(event.pointerType==='mouse')onDeletionInspect?.(null);};
+        button.onfocus=()=>onDeletionInspect?.(marker.deleted);button.onblur=()=>onDeletionInspect?.(null);
+        button.onclick=event=>{event.preventDefault();event.stopPropagation();onDeletionInspect?.(marker.deleted,true);};
+        gap.appendChild(button);fragment.appendChild(gap);cursor=marker.end;
     }
-    if (cursor < text.length) fragment.appendChild(doc.createTextNode(text.slice(cursor)));
-    editor.replaceChildren(fragment);
+    appendText(cursor,text.length);editor.replaceChildren(fragment);
 };
 
 const tokenizeSubtitlePractice = (text, language = 'en', nameHints = []) => {
@@ -9108,7 +9159,12 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         }
     });
     React.useLayoutEffect(() => {
-        if (!blankMode || !subtitle) paintSubtitleReferenceCorrections(editorRef.current, source, correction);
+        const inspectDeletion=(deleted,pin=false)=>setCopyNotice(current=>{
+            if(!deleted)return current?.kind==='deletion' && !current.pinned?null:current;
+            if(pin && current?.kind==='deletion' && current.deleted===deleted && current.pinned)return null;
+            return {subtitle,kind:'deletion',deleted,pinned:pin || (current?.deleted===deleted && current.pinned),message:`已刪除：${deleted}`};
+        });
+        if (!blankMode || !subtitle) paintSubtitleReferenceCorrections(editorRef.current, source, correction, inspectDeletion);
     }, [subtitle, source, blankMode, correction]);
     React.useEffect(() => { setCopyNotice(null); }, [subtitle, source]);
     const update = (word, part, value, composing) => {
