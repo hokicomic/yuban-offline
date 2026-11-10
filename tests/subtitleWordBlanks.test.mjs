@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({buildSubtitlePracticeNameHints,tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,buildSubtitlePracticeDeletionDisplay,getSubtitlePracticeDualAlignment})');
+    const api = vm.runInNewContext(code + '\n({buildSubtitlePracticeNameContext,buildSubtitlePracticeNameHints,tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,buildSubtitlePracticeDeletionDisplay,getSubtitlePracticeDualAlignment})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -149,6 +149,43 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(tokens('Dr. Bernard arrived.').find(part=>part.text==='Bernard').name,true);
         const split=api.tokenizeSubtitlePractice('Joan. Of Arc.','en-US',['Joan of Arc']);
         assert.equal(split.find(part=>part.parts?.some(p=>p.text==='Of')).kind,'word','hints cannot bridge sentence punctuation');
+    });
+    test('ordinary sentence starters never become visible names through headings, mid-sentence capitals or correction hints: ' + file, () => {
+        const words=['There','Certain','Here','Some','Several','Another','Each','Every','Which','What','How','If','Because','Although','Perhaps','Sometimes'];
+        // Sometimes is deliberately not on the closed-class exclusion list:
+        // ordinary lower-case reference evidence must still protect it.
+        const context=api.buildSubtitlePracticeNameContext(words.map(word=>({text:`She said ${word} things happen.`})),
+            [{raw:'These things sometimes happen to ordinary people.'}]);
+        for(const word of words){
+            const text=`${word} things happen.`,hints={...context,names:[...context.names,word]};
+            const parts=api.tokenizeSubtitlePractice(text,'en-US',hints);
+            assert.equal(parts[0].kind,'word',word);assert.equal(join(parts),text);
+            assert.ok(!parts.some(part=>part.name && part.text===word),word);
+        }
+    });
+    test('lowercase reference usage vetoes inferred single names, including capitals inside a sentence, and contexts never leak: ' + file, () => {
+        const context=api.buildSubtitlePracticeNameContext([{text:'She said Quiet now.'},{text:'They called it Open today.'}],
+            [{raw:'The hallway was quiet and the door was open.'}]);
+        for(const word of ['Quiet','Open']){
+            assert.ok(!context.names.includes(word),word);
+            assert.equal(api.tokenizeSubtitlePractice(`${word} rooms felt strange.`,'en-US',context)[0].kind,'word');
+            assert.equal(api.tokenizeSubtitlePractice(`She said ${word} now.`,'en-US',context).find(part=>part.parts?.some(p=>p.text===word)).kind,'word');
+        }
+        const different=api.buildSubtitlePracticeNameContext([{text:'We met Gared beside the river.'}],[]);
+        assert.equal(api.tokenizeSubtitlePractice('Gared returned.','en-US',different)[0].name,true);
+        assert.equal(api.tokenizeSubtitlePractice('Gared returned.','en-US',context)[0].kind,'word','a new document cannot inherit earlier name evidence');
+    });
+    test('title-case headings do not promote their component words, while full names and explicit titles remain visible: ' + file, () => {
+        const context=api.buildSubtitlePracticeNameContext([],[{raw:'Silent Forest'},{raw:'She had hope for the future.'},
+            {raw:'We met Gared and John Smith yesterday.'}]);
+        assert.ok(!context.names.includes('Silent'));assert.ok(!context.names.includes('Forest'));
+        assert.equal(api.tokenizeSubtitlePractice('Silent water surrounded them.','en-US',context)[0].kind,'word');
+        for(const [text,expected] of [['Gared returned.',['Gared']],['John Smith arrived.',['John','Smith']],
+            ['Hope Davis arrived.',['Hope','Davis']],['Dr. Hope arrived.',['Hope']]]){
+            const parts=api.tokenizeSubtitlePractice(text,'en-US',context);
+            for(const name of expected)assert.ok(parts.some(part=>part.name && part.text===name),text+' / '+name);
+        }
+        assert.equal(api.tokenizeSubtitlePractice('Hope remains.','en-US',context)[0].kind,'word');
     });
     test('case differences are accepted and replaced by the original subtitle casing: ' + file, () => {
         for (const [target, typed] of [['Good', 'good'], ['afternoon', 'AFTERNOON'], ['iPhone', 'IPHONE'], ['CAFÉ', 'cafe\u0301']]) {
@@ -481,6 +518,17 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const plain={...props,contextNameHints:[]};nodes=render(plain);inputs=fields(nodes);
         assert.equal(inputs.length,5,'a different context cannot inherit stale name exemptions');
         assert.equal(inputs[0].props.value,'');assert.equal(props.subtitle.text,text);
+    });
+    test('the component preserves blanks for ordinary capitals even if a correction labels one as a name: ' + file, () => {
+        const render=setup(),context=api.buildSubtitlePracticeNameContext([{text:'She said Quiet now.'}],
+            [{raw:'The hallway was quiet.'}]);
+        for(const word of ['There','Certain','Quiet']){
+            const text=`${word} things happen.`,props={...base(),subtitle:{text},text,contextNameHints:context,
+                correction:{edits:[{kind:'name',to:word}]}};
+            const nodes=render(props),inputs=fields(nodes);
+            assert.equal(inputs.length,3,word);assert.equal(inputs[0].props.value,'');
+            assert.ok(!nodes.some(node=>node.props?.['data-subtitle-visible-name'] && node.props.children===word),word);
+        }
     });
     test('provisional text and original text selections change the actual blank answer and reset its draft: ' + file, () => {
         const render=setup();const raw='They counted 200 votes.';

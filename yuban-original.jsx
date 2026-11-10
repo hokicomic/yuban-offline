@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.277 · immediate-context-alignment";
+const APP_VERSION = "v5.278 · conservative-name-evidence";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9005,7 +9005,17 @@ const getSubtitlePracticeDualAlignment = (part,value) => {
 };
 
 const SUBTITLE_PRACTICE_NAME_CONNECTORS = new Set(['of','de','del','da','di','van','von','la','le','d']);
-const SUBTITLE_PRACTICE_ORDINARY_CAPITALS = new Set(['a','an','the','i','we','you','he','she','it','they','this','that','these','those','but','and','or','at','in','on','to','as','with','after','before','once','according','earlier','later','meanwhile','officials','dozens','hundreds','thousands','politics','government','good','hello','hi','please','thanks','thank','yes','no','okay','well','now']);
+const SUBTITLE_PRACTICE_ORDINARY_CAPITALS = new Set(`
+    a an the i we you he she it they this that these those my your his her its our their mine yours ours
+    theirs myself yourself himself herself itself ourselves yourselves themselves there here where when why how who whom whose which what whatever whichever whoever whenever
+    wherever but and or nor so yet for if unless until since because although though while whereas whether however therefore moreover furthermore otherwise also
+    then thus indeed perhaps maybe certainly actually just even already again instead as at by from in into of on onto out over under
+    to up upon with within without through throughout during after before between among against about around near beyond am is are was were be
+    been being do does did have has had can could should would must might shall ought not all another any anybody anyone anything each
+    either enough every everybody everyone everything few fewer many more most much neither nobody none nothing other others several some somebody someone something such
+    both only own same certain once according earlier later meanwhile officials dozens hundreds thousands politics government good hello hi please thanks thank yes no
+    okay well now
+`.trim().split(/\s+/u));
 const getSubtitlePracticeNameKey = text => String(text || '').normalize('NFKD').replace(/\p{M}/gu,'').replace(/[’ʼ]/g,"'").toLowerCase();
 const isSubtitlePracticeNameCapital = word => Boolean(word && !SUBTITLE_PRACTICE_ORDINARY_CAPITALS.has(word.key) && !SUBTITLE_PRACTICE_NAME_CONNECTORS.has(word.key) &&
     !/^(?:(?:i|you|we|they|he|she|it|that|there|here|who|what|where|when|why|how|let)'(?:m|re|ve|ll|d|s)|(?:isn|aren|wasn|weren|don|doesn|didn|haven|hasn|hadn|won|wouldn|can|couldn|shouldn|mustn|needn|daren|shan|ain)'t|o'clock|ma'am|y'all|c'mon)$/u.test(word.key) &&
@@ -9014,6 +9024,9 @@ const getSubtitlePracticeNameWords = source => Array.from(String(source || '').m
     ({text:match[0],start:match.index,end:match.index+match[0].length,key:getSubtitlePracticeNameKey(match[0])}));
 const findSubtitlePracticeNameRanges = (text, hints = []) => {
     const source = String(text || ''), words = getSubtitlePracticeNameWords(source);
+    const context=Array.isArray(hints)?{names:hints}:hints || {};
+    const ordinaryWords=context.ordinaryWords;
+    const singleAllowed=word=>!ordinaryWords?.has(word.key.replace(/'s$/u,''));
     const connectors = SUBTITLE_PRACTICE_NAME_CONNECTORS;
     const ranges = [];
     for (let i=0;i<words.length;i++) {
@@ -9031,15 +9044,16 @@ const findSubtitlePracticeNameRanges = (text, hints = []) => {
         const titled = /(?:^|\s)(?:Mr|Mrs|Ms|Miss|Dr|Prof|Sir|Ser|Lord|Lady|King|Queen|Saint|St)\.?\s*$/u.test(before);
         // One sentence-initial capital alone is ambiguous. Other occurrences,
         // titles and verified name corrections can supply the missing evidence.
-        if (capitals>=2 || !sentenceInitial || titled) ranges.push({start:words[i].start,end:words[end-1].end});
+        if (capitals>=2 || titled || (!sentenceInitial && singleAllowed(words[i]))) ranges.push({start:words[i].start,end:words[end-1].end});
         i=end-1;
     }
     // Index hints once rather than testing every known name against every word.
     // Capitalization is still required here: learning Will must not exempt will.
     const byFirst = new Map();
-    for (const hint of hints || []) {
+    for (const hint of context.names || []) {
         const parts=getSubtitlePracticeNameWords(hint);
         if (!parts.length || !isSubtitlePracticeNameCapital(parts[0]) || !isSubtitlePracticeNameCapital(parts.at(-1))) continue;
+        if(parts.length===1 && !singleAllowed(parts[0]))continue;
         if (!parts.every(word=>isSubtitlePracticeNameCapital(word) || connectors.has(word.key))) continue;
         const keys=parts.map(word=>word.key.replace(/'s$/u,''));
         const list=byFirst.get(keys[0]) || [];list.push(keys);byFirst.set(keys[0],list);
@@ -9055,21 +9069,34 @@ const findSubtitlePracticeNameRanges = (text, hints = []) => {
     }
     return ranges.sort((a,b)=>a.start-b.start || b.end-a.end);
 };
-const buildSubtitlePracticeNameHints = (subtitles = [], referenceEntries = []) => {
-    const names = new Set();
-    const collect = text => {
-        for (const range of findSubtitlePracticeNameRanges(text)) {
+const buildSubtitlePracticeNameContext = (subtitles = [], referenceEntries = []) => {
+    const names = new Set(), ordinaryWords = new Set();
+    const cueTexts=subtitles.map(cue=>cue?.text || ''), referenceTexts=referenceEntries.map(entry=>entry?.raw || '');
+    // ASR may lowercase actual names. Prefer the reference's case evidence when
+    // available; without a reference, use the loaded track only.
+    for(const text of referenceTexts.length?referenceTexts:cueTexts) {
+        for(const word of getSubtitlePracticeNameWords(text)) if(/\p{Ll}/u.test(word.text) && word.text===word.text.toLowerCase()) {
+            ordinaryWords.add(word.key.replace(/'s$/u,''));
+        }
+    }
+    for(const text of [...cueTexts,...referenceTexts]) {
+        const words=getSubtitlePracticeNameWords(text);
+        // Book headings and title-cased fragments are not evidence that every
+        // capital is a name. Do not distribute their words across the track.
+        if(words.length>1 && !/[.!?。！？][”’"')\]]*\s*$/u.test(text) &&
+            words.every(word=>/^\p{Lu}/u.test(word.text) || SUBTITLE_PRACTICE_NAME_CONNECTORS.has(word.key) || SUBTITLE_PRACTICE_ORDINARY_CAPITALS.has(word.key)))continue;
+        for(const range of findSubtitlePracticeNameRanges(text,{names:[],ordinaryWords})) {
             const phrase=String(text).slice(range.start,range.end);
             names.add(phrase);
-            for (const word of getSubtitlePracticeNameWords(phrase)) if (isSubtitlePracticeNameCapital(word)) names.add(word.text.replace(/['’ʼ]s$/u,''));
+            for(const word of getSubtitlePracticeNameWords(phrase)) {
+                const key=word.key.replace(/'s$/u,'');
+                if(isSubtitlePracticeNameCapital(word) && !ordinaryWords.has(key))names.add(word.text.replace(/['’ʼ]s$/u,''));
+            }
         }
-    };
-    for (const cue of subtitles) collect(cue?.text || '');
-    // Only the reference index's original-language entries participate. Chinese
-    // translations and knowledge-point explanations do not create name hints.
-    for (const entry of referenceEntries) collect(entry?.raw || '');
-    return [...names];
+    }
+    return {names:[...names],ordinaryWords};
 };
+const buildSubtitlePracticeNameHints = (subtitles = [], referenceEntries = []) => buildSubtitlePracticeNameContext(subtitles,referenceEntries).names;
 
 const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
 const splitSubtitlePracticeGraphemes = value => {
@@ -9295,7 +9322,10 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     // Full captions are selectable reading text. Old accidental edits must
     // never replace the source caption or become dictation answers.
     const source = String(text || '');
-    const nameHints = useMemo(() => [...(contextNameHints || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || [])], [contextNameHints, correction]);
+    const nameHints = useMemo(() => ({
+        names:[...(Array.isArray(contextNameHints)?contextNameHints:contextNameHints?.names || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || [])],
+        ordinaryWords:Array.isArray(contextNameHints)?undefined:contextNameHints?.ordinaryWords
+    }), [contextNameHints, correction]);
     const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
     const displayTokens = useMemo(() => buildSubtitlePracticeDeletionDisplay(tokens,source,correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[]), [tokens,source,correction]);
     const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
@@ -20160,7 +20190,7 @@ ${userQ}`;
     const embeddedKnowledgeDocumentKey = useMemo(() => {
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
-    const subtitlePracticeNameHints = useMemo(() => buildSubtitlePracticeNameHints(subtitles, embeddedKnowledgeAlignmentIndex.entries), [subtitles, embeddedKnowledgeAlignmentIndex]);
+    const subtitlePracticeNameHints = useMemo(() => buildSubtitlePracticeNameContext(subtitles, embeddedKnowledgeAlignmentIndex.entries), [subtitles, embeddedKnowledgeAlignmentIndex]);
     const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
     const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText.trim()) && !embeddedKnowledgeLoading && !embeddedKnowledgeError;
     const currentSubtitleProjection = useMemo(() => {
