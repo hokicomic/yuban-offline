@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.278 · conservative-name-evidence";
+const APP_VERSION = "v5.279 · longer-contained-answers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8985,10 +8985,23 @@ const buildSubtitlePracticeDeletionDisplay = (tokens,source,markers) => {
     return result;
 };
 const getSubtitlePracticePartOptions = part => part.accepted || [part.text];
-const getSubtitlePracticeAcceptedOption = (part,value) => {
-    const fold=text=>String(text || '').normalize('NFC').toLowerCase().replace(/['’ʼ‐‑–—-]/gu,'');
-    return getSubtitlePracticePartOptions(part).find(expected=>part.accepted ? fold(expected)===fold(value) : isSubtitlePracticePartCorrect(expected,value));
+const normalizeSubtitlePracticeOption = value => String(value || '').normalize('NFC').toLowerCase().replace(/['’ʼ‐‑–—-]/gu,'');
+const getSubtitlePracticeMatchedOption = (part,value) => getSubtitlePracticePartOptions(part).find(expected=>
+    part.accepted ? normalizeSubtitlePracticeOption(expected)===normalizeSubtitlePracticeOption(value) : isSubtitlePracticePartCorrect(expected,value));
+const getSubtitlePracticePendingLongerOptions = (part,value) => {
+    if(!part.accepted)return [];
+    const matched=getSubtitlePracticeMatchedOption(part,value);
+    if(matched===undefined)return [];
+    const short=normalizeSubtitlePracticeOption(matched);
+    // Containment can be a prefix, suffix, or an internal span (fit / befit).
+    // Equal punctuation/case variants are still one complete answer.
+    return getSubtitlePracticePartOptions(part).filter(expected=>{
+        const longer=normalizeSubtitlePracticeOption(expected);
+        return longer.length>short.length && longer.includes(short);
+    });
 };
+const getSubtitlePracticeAcceptedOption = (part,value) => getSubtitlePracticePendingLongerOptions(part,value).length
+    ? undefined : getSubtitlePracticeMatchedOption(part,value);
 const isSubtitlePracticePartAccepted = (part,value) => getSubtitlePracticeAcceptedOption(part,value) !== undefined;
 const getSubtitlePracticeDualAlignment = (part,value) => {
     const options=getSubtitlePracticePartOptions(part).map(expected=>({expected,alignment:getSubtitlePracticeLetterAlignment(expected,value)}));
@@ -9439,6 +9452,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const answer = answers[token.index];
         const value = answer?.values?.[part.index] || '';
         const correct = isSubtitlePracticePartAccepted(part, value);
+        const pendingLonger = !answer?.revealed && !answer?.composing && getSubtitlePracticePendingLongerOptions(part,value).length > 0;
         const color = answer?.revealed ? '#dc2626' : correct ? '#2f7d57' : '#6b4c9a';
         const showGuide = Boolean(value) && !answer?.revealed && !correct && !answer?.composing;
         const alignment = showGuide ? getSubtitlePracticeDualAlignment(part, value) : null;
@@ -9451,8 +9465,9 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
                     data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartAccepted(part, answers[token.index]?.values?.[part.index])}
+                    data-subtitle-longer-answer-pending={pendingLonger || undefined}
                     aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartAccepted(part, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
-                    aria-description={showGuide ? `字母位置提示：${guide}。底線代表尚未答出的字母。` : '雙擊：空白顯示答案，未答對清空，答對選取並複製'}
+                    aria-description={showGuide ? `${pendingLonger ? '已符合短答案，請繼續輸入較長答案。' : ''}字母位置提示：${guide}。底線代表尚未答出的字母。` : '雙擊：空白顯示答案，未答對清空，答對選取並複製'}
                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
                     onCompositionStart={event => {

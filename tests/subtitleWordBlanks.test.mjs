@@ -334,9 +334,9 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(props.subtitle.text,raw);
     });
     test('corrected blanks accept either answer, show the other below, and reveal both with ?: ' + file, () => {
-        const props={...base(),subtitle:{text:'The block matters.'},text:'The bloc matters.',correction:{raw:'The block matters.',text:'The bloc matters.',changed:true,
-            edits:[{start:4,end:9,text:'bloc',from:'block',to:'bloc',kind:'spelling'}]}};
-        for(const accepted of ['bloc','block','BLOCK']) {
+        const props={...base(),subtitle:{text:'The block matters.'},text:'The flock matters.',correction:{raw:'The block matters.',text:'The flock matters.',changed:true,
+            edits:[{start:4,end:9,text:'flock',from:'block',to:'flock',kind:'spelling'}]}};
+        for(const accepted of ['flock','block','BLOCK']) {
             const render=setup();let nodes=render(props), input=fields(nodes)[1];
             assert.equal(input.props.style.borderBottomColor,'#dc2626');
             assert.equal(fields(nodes)[0].props.style.borderBottomColor,undefined);
@@ -344,16 +344,80 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             type(input,accepted);nodes=render(props);input=fields(nodes)[1];
             assert.equal(input.props['data-subtitle-part-complete'],true);assert.equal(input.props.style.color,'#2f7d57');
             const label=nodes.find(n=>n.props?.['data-subtitle-other-answer']);
-            assert.equal(label.props.children,accepted.toLowerCase()==='bloc'?'原字幕：block':'文本：bloc');
+            assert.equal(label.props.children,accepted.toLowerCase()==='flock'?'原字幕：block':'文本：flock');
         }
         const render=setup();let nodes=render(props);type(fields(nodes)[1],'?');nodes=render(props);
-        assert.equal(fields(nodes)[1].props.value,'bloc');assert.equal(fields(nodes)[1].props.style.color,'#dc2626');
-        assert.equal(nodes.find(n=>n.props?.['data-subtitle-other-answer']).props.children,'文本：bloc／原字幕：block');
+        assert.equal(fields(nodes)[1].props.value,'flock');assert.equal(fields(nodes)[1].props.style.color,'#dc2626');
+        assert.equal(nodes.find(n=>n.props?.['data-subtitle-other-answer']).props.children,'文本：flock／原字幕：block');
         const wideRender=setup();let wideNodes=wideRender(props);type(fields(wideNodes)[1],'？');wideNodes=wideRender(props);
-        assert.equal(wideNodes.find(n=>n.props?.['data-subtitle-other-answer']).props.children,'文本：bloc／原字幕：block');
+        assert.equal(wideNodes.find(n=>n.props?.['data-subtitle-other-answer']).props.children,'文本：flock／原字幕：block');
         const part=api.buildSubtitlePracticeDualTokens(props.text,'en',[],props.correction).find(t=>t.corrected).parts[0];
         assert.equal(api.getSubtitlePracticeDualAlignment(part,'block').runs.every(r=>r.matched),true);
-        assert.equal(api.getSubtitlePracticeDualAlignment(part,'blocx').runs.at(-1).matched,false);
+        assert.equal(api.getSubtitlePracticeDualAlignment(part,'flocx').runs.at(-1).matched,false);
+    });
+    test('contained alternatives require the longer complete answer in either option order: ' + file, () => {
+        for(const [short,long] of [['act','acted'],['thing','things'],['fit','befit'],['ear','heard']]){
+            for(const accepted of [[short,long],[long,short]]){
+                const word={kind:'word',index:0,parts:[{kind:'letters',index:0,text:accepted[0],accepted}]};
+                let answer=api.updateSubtitlePracticeAnswer(word,null,0,short);
+                assert.equal(answer.values[0],short);assert.equal(api.isSubtitlePracticeAnswerCorrect(word,answer),false,short+' / '+long);
+                assert.equal(api.getSubtitlePracticeProgress([word],{0:answer}).completed,0);
+                answer=api.updateSubtitlePracticeAnswer(word,answer,0,long.toUpperCase());
+                assert.equal(answer.values[0],long);assert.equal(api.isSubtitlePracticeAnswerCorrect(word,answer),true);
+                assert.equal(api.getSubtitlePracticeProgress([word],{0:answer}).done,true);
+                const wrong=api.updateSubtitlePracticeAnswer(word,answer,0,short+'x');
+                assert.equal(api.isSubtitlePracticeAnswerCorrect(word,wrong),false);
+            }
+        }
+        const chain={kind:'word',index:0,parts:[{kind:'letters',index:0,text:'act',accepted:['act','acted','reacted','perform']}]};
+        for(const typed of ['act','acted'])assert.equal(api.isSubtitlePracticeAnswerCorrect(chain,api.updateSubtitlePracticeAnswer(chain,null,0,typed)),false);
+        for(const typed of ['reacted','perform'])assert.equal(api.isSubtitlePracticeAnswerCorrect(chain,api.updateSubtitlePracticeAnswer(chain,null,0,typed)),true);
+    });
+    test('short alternative remains unresolved with a full short-answer guide until the containing string is typed: ' + file, () => {
+        for(const [short,long] of [['act','acted'],['thing','things'],['fit','befit'],['ear','heard']]){
+            const render=setup(),raw=`We ${short} today.`,text=`We ${long} today.`;
+            const props={...base(),subtitle:{text:raw},text,correction:{raw,text,changed:true,
+                edits:[{start:3,end:3+short.length,text:long,from:short,to:long,kind:'spelling'}]}};
+            let nodes=render(props);type(fields(nodes)[0],'we');nodes=render(props);type(fields(nodes)[2],'today');nodes=render(props);
+            type(fields(nodes)[1],short);nodes=render(props);
+            const input=fields(nodes)[1];
+            assert.equal(input.props.value,short);assert.equal(input.props['data-subtitle-part-complete'],false);
+            assert.equal(input.props['data-subtitle-longer-answer-pending'],true);assert.equal(input.props.readOnly,false);
+            assert.match(input.props['aria-description'],/已符合短答案/);
+            const guide=nodes.find(node=>node.props?.['data-subtitle-alternative-guide']);assert.ok(guide);
+            const alternatives=guide.props.children;
+            assert.equal(alternatives.length,2);
+            const rows=alternatives.map(row=>flatten(row).filter(node=>node.props?.['data-subtitle-letter-slot']!==undefined));
+            assert.ok(rows[1].every(slot=>slot.props['data-subtitle-letter-matched']),'the short answer is fully shown below');
+            assert.ok(rows[0].some(slot=>!slot.props['data-subtitle-letter-matched']),'the longer answer still has missing letters');
+            assert.ok(!nodes.some(node=>node.props?.role==='status'),'short match cannot complete the sentence');
+            type(input,long);nodes=render(props);
+            assert.equal(fields(nodes)[1].props['data-subtitle-part-complete'],true);
+            assert.equal(fields(nodes)[1].props['data-subtitle-longer-answer-pending'],undefined);
+            assert.equal(fields(nodes)[1].props.style.color,'#2f7d57');
+            assert.ok(nodes.some(node=>node.props?.role==='status' && JSON.stringify(node.props.children).includes('本句完成')));
+        }
+    });
+    test('equivalent typography does not create a longer-answer wait, and hints still reveal both contained alternatives: ' + file, () => {
+        for(const accepted of [["can't",'cant'],['act','ACT'],['re-sign','resign']]){
+            const word={kind:'word',index:0,parts:[{kind:'letters',index:0,text:accepted[0],accepted}]};
+            for(const typed of accepted)assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,typed)),true);
+        }
+        for(const [short,long] of [['act','acted'],['fit','befit']]){
+            const render=setup(),raw=`We ${long} today.`,text=`We ${short} today.`;
+            const props={...base(),subtitle:{text:raw},text,correction:{raw,text,changed:true,
+                edits:[{start:3,end:3+long.length,text:short,from:long,to:short,kind:'spelling'}]}};
+            let nodes=render(props);type(fields(nodes)[1],short);nodes=render(props);
+            assert.equal(fields(nodes)[1].props['data-subtitle-part-complete'],false);
+            fields(nodes)[1].props.onCompositionStart({currentTarget:{value:short}});nodes=render(props);
+            assert.ok(!nodes.some(node=>node.props?.['data-subtitle-alternative-guide']),'IME remains native during composition');
+            fields(nodes)[1].props.onCompositionEnd({currentTarget:{value:short}});nodes=render(props);
+            assert.equal(fields(nodes)[1].props['data-subtitle-longer-answer-pending'],true);
+            type(fields(nodes)[1],'?');nodes=render(props);
+            assert.equal(fields(nodes)[1].props.readOnly,true);assert.equal(fields(nodes)[1].props['data-subtitle-part-complete'],true);
+            assert.equal(nodes.find(node=>node.props?.['data-subtitle-other-answer']).props.children,`文本：${short}／原字幕：${long}`);
+            assert.equal(fields(nodes)[1].props['data-subtitle-longer-answer-pending'],undefined);
+        }
     });
     test('phrase replacements preserve both complete alternatives and keep names exempt: ' + file, () => {
         const raw='They re signed the agreement.',text='They resigned the agreement.';
