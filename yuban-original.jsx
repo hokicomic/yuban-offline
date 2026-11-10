@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.274 · folder-reference-mode-colors";
+const APP_VERSION = "v5.275 · reference-highlight-resume";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7081,6 +7081,42 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
     if(new Set(best.map(item=>item.expectedWords)).size>1)return null;
     if(best.length>1 && sourceLine>=0){const local=best.filter(item=>item.ranges.some(range=>Math.abs(range.sourceLine-sourceLine)<=4));if(local.length===1)best=local;}
     return best.length===1?best[0]:null;
+};
+
+// Keep the latest cue visible when a collapsed reference panel is reopened.
+// Its viewport can still be growing after the first paint (CSS transition).
+const installKnowledgeActiveLineFollow = (container, sourceLine) => {
+    const win = container?.ownerDocument?.defaultView;
+    if (!win || !Number.isFinite(sourceLine)) return () => {};
+    let outerFrame = 0, revealFrame = 0, stopped = false;
+    const reveal = () => {
+        if (stopped || container.clientHeight <= 0) return;
+        const line = container.querySelector(`[data-knowledge-source-line="${sourceLine}"]`);
+        const target = line?.querySelector('mark[data-active-knowledge-highlight="true"]') || line;
+        if (!target) return;
+        const containerRect = container.getBoundingClientRect();
+        if (containerRect.height <= 0) return;
+        const topPadding = Math.min(96, Math.max(28, container.clientHeight * 0.24));
+        const desiredTop = container.scrollTop + target.getBoundingClientRect().top - containerRect.top - topPadding;
+        const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+        container.scrollTo({top: Math.max(0, Math.min(maxTop, desiredTop)), behavior: 'auto'});
+    };
+    const schedule = () => {
+        win.cancelAnimationFrame(outerFrame);
+        win.cancelAnimationFrame(revealFrame);
+        outerFrame = win.requestAnimationFrame(() => {
+            revealFrame = win.requestAnimationFrame(reveal);
+        });
+    };
+    const observer = win.ResizeObserver ? new win.ResizeObserver(schedule) : null;
+    observer?.observe(container);
+    schedule();
+    return () => {
+        stopped = true;
+        win.cancelAnimationFrame(outerFrame);
+        win.cancelAnimationFrame(revealFrame);
+        observer?.disconnect();
+    };
 };
 
 const canCollapseBlankReferencePanel = ({documentMode,blankMode,text,loading,error}) => Boolean(documentMode && blankMode && String(text || '').trim() && !loading && !error);
@@ -20355,41 +20391,13 @@ ${userQ}`;
         setTimeout(() => setEmbeddedKnowledgeAlignmentLogNotice(""), 5000);
     }, []);
     useEffect(() => {
-        // A visibly matched line is enough to follow during reading.  Waiting
-        // for the two-cue "anchored" state meant the first correct highlight
-        // often stayed outside the viewport.  Use an immediate, deterministic
-        // scroll rather than smooth scrolling: LRC cues can change before a
-        // previous smooth animation ends, leaving the new highlight offscreen.
-        if (knowledgeReverseSelecting || topPanelMode !== 'document' || embeddedKnowledgeSourceLines.length === 0 || !embeddedKnowledgeContentRef.current) return;
-        let outerFrame = 0;
-        let revealFrame = 0;
-        const revealActiveLine = () => {
-            const container = embeddedKnowledgeContentRef.current;
-            const firstLine = embeddedKnowledgeSourceLines[0];
-            const line = container?.querySelector?.(`[data-knowledge-source-line="${firstLine}"]`);
-            // The line wrapper may be a long paragraph.  Its top can already
-            // be visible while the yellow sentence is below the fold, so use
-            // the actual rendered mark for the viewport calculation.
-            const target = line?.querySelector?.('mark[data-active-knowledge-highlight="true"]') || line;
-            if (!container || !target) return;
-            const containerRect = container.getBoundingClientRect();
-            const targetRect = target.getBoundingClientRect();
-            const topPadding = Math.min(96, Math.max(28, container.clientHeight * 0.24));
-            const desiredTop = container.scrollTop + targetRect.top - containerRect.top - topPadding;
-            const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
-            container.scrollTo({ top: Math.max(0, Math.min(maxTop, desiredTop)), behavior: 'auto' });
-        };
-        // MarkdownView may window a long document around the new source line.
-        // Two frames ensure the target exists and has its final layout before
-        // taking measurements.
-        outerFrame = requestAnimationFrame(() => {
-            revealFrame = requestAnimationFrame(revealActiveLine);
-        });
-        return () => {
-            cancelAnimationFrame(outerFrame);
-            cancelAnimationFrame(revealFrame);
-        };
-    }, [knowledgeReverseSelecting, topPanelMode, embeddedKnowledgeRenderIndex, embeddedKnowledgeSourceLines]);
+        // Matching continues while the blank-mode panel is collapsed. Reveal
+        // the latest rendered mark when it opens, including during resizing.
+        if (knowledgeReverseSelecting || topPanelMode !== 'document' || isVideoMasked || embeddedKnowledgeSourceLines.length === 0) return;
+        return installKnowledgeActiveLineFollow(embeddedKnowledgeContentRef.current, embeddedKnowledgeSourceLines[0]);
+    }, [knowledgeReverseSelecting, topPanelMode, isVideoMasked, isSubtitleBlankMode,
+        embeddedKnowledgePanelHeight, blankReferencePanelHeight, embeddedKnowledgeLoading, embeddedKnowledgeError,
+        embeddedKnowledgeRenderIndex, embeddedKnowledgeSourceLines]);
     const isLatinTermWordChar = useCallback((ch = "") => /[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]/u.test(ch), []);
     const matchFlashCardTermAt = useCallback((text, at, entry) => {
         const source = String(text || "");
@@ -20772,6 +20780,14 @@ ${userQ}`;
             embeddedKnowledgeAlignmentIndex.entries.map(entry => entry.sourceLine),
             () => setKnowledgeReverseSelecting(true), setKnowledgeReverseSelection);
     }, [embeddedKnowledgeAlignmentIndex, subtitles, currentTrackIndex, topPanelMode, isVideoMasked]);
+    useEffect(() => {
+        // Changing subtitle practice mode ends an earlier text-selection pause.
+        // Otherwise correction advances while the frozen reading view does not.
+        const container = embeddedKnowledgeContentRef.current;
+        const selection = window.getSelection();
+        if (selection?.rangeCount && container?.contains(selection.getRangeAt(0).commonAncestorContainer)) selection.removeAllRanges();
+        setKnowledgeReverseSelection(''); setKnowledgeReverseNotice(''); setKnowledgeReverseSelecting(false);
+    }, [isSubtitleBlankMode]);
     const resetKnowledgeReverseSelection = (resumeFollowing = false) => {
         window.getSelection()?.removeAllRanges();
         setKnowledgeReverseSelection(''); setKnowledgeReverseNotice('');
