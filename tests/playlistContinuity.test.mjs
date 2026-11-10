@@ -17,12 +17,12 @@ test('media ended delegates to the autoplay-aware playlist transition', () => {
 });
 
 test('track changes preserve the selected media/document panel state', () => {
-  const effect = source.match(/\/\/ Track changes must not reset[\s\S]*?\}, \[currentTrackIndex\]\);/)?.[0] || '';
+  const effect = source.match(/\/\/ Track changes must not reset[\s\S]*?\}, \[currentTrackIndex,\s*selectedFolderSession\]\);/)?.[0] || '';
   assert.ok(effect, 'track-change continuity effect should exist');
   assert.doesNotMatch(effect, /setIsVideoMasked\(/);
   assert.doesNotMatch(effect, /setTopPanelMode\(/);
   assert.match(effect, /topPanelMode === 'document' && !isVideoMasked/);
-  assert.match(effect, /loadEmbeddedKnowledgePanel\(\)/);
+  assert.match(effect, /loadEmbeddedKnowledgePanel\(\{force:true\}\)/);
 });
 
 test('source and standalone release carry the same continuity fix and version', () => {

@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.273 · dictation-deletion-indicators";
+const APP_VERSION = "v5.274 · folder-reference-mode-colors";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7816,6 +7816,13 @@ const createKnowledgeReverseLookup = subtitles => {
     }};
 };
 
+const getSingleFolderReferenceTxt = (files,{mediaFile=null,videoVisible=false}={}) => {
+    const name=String(mediaFile?.name || '');
+    if(videoVisible && (/^video\//i.test(mediaFile?.type || '') || /\.(mp4|webm|mov|m4v|mkv|avi)$/i.test(name)))return null;
+    const candidates=(Array.isArray(files)?files:[]).filter(file=>/\.txt$/i.test(file?.name || '') && !String(file.name).startsWith('._'));
+    return candidates.length===1?candidates[0]:null;
+};
+
 const getKnowledgeVerifiedHighlightRanges = (source,subtitleText,verified) => {
     if(Number.isInteger(verified?.start) && Number.isInteger(verified?.end) && verified.start>=0 && verified.end>verified.start &&
         source.slice(verified.start,verified.end)===verified.text)return [{start:verified.start,end:verified.end}];
@@ -9453,6 +9460,7 @@ export default function App() {
     };
 
     const [playlist, setPlaylist] = useState([]);
+    const [selectedFolderSession,setSelectedFolderSession] = useState(null);
     const [currentTrackIndex, setCurrentTrackIndex] = useState(-1);
     const [rawSubtitles, setRawSubtitles] = useState([]);
     const [subtitles, setSubtitles] = useState([]);
@@ -10437,6 +10445,9 @@ export default function App() {
     const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
     const openedFolderHandleRef = useRef(null);
+    const selectedFolderSessionRef = useRef(null);
+    const handledFolderReferenceRef = useRef(null);
+    const folderReferenceLoaderRef = useRef(null);
     const openedFolderNameRef = useRef("");
     const selectedFolderFilesRef = useRef({});
     const folderWriteNoticeShownRef = useRef(false);
@@ -11730,6 +11741,8 @@ export default function App() {
                 triedBaseNames: candidates
             };
         }
+        const singleTxt=getSingleFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}));
+        if(singleTxt)return {exists:true,source:'single-folder-txt',file:singleTxt,filename:singleTxt.name,baseName:candidates[0] || '',triedBaseNames:candidates};
         return { exists: false, source: "none", baseName: candidates[0] || "", triedBaseNames: candidates };
     };
 
@@ -11922,6 +11935,17 @@ export default function App() {
             }
         });
         newPlaylist.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+        // Folder A and folder B can both begin at playlist index zero. Reset
+        // reference state by folder identity as well as by track index.
+        const session={files,mediaFile:newPlaylist[0]?.mediaFile || null,videoVisible:topPanelMode==='media' && !isVideoMasked};
+        selectedFolderSessionRef.current=session;
+        setSelectedFolderSession(session);
+        embeddedKnowledgeLoadRequestRef.current+=1;
+        embeddedKnowledgeTabIndexCacheRef.current.clear();
+        embeddedKnowledgePreferSeriesStartRef.current=true;
+        setEmbeddedKnowledgeText('');setEmbeddedKnowledgeFileInfo(null);setEmbeddedKnowledgeError('');setEmbeddedKnowledgeLoading(false);
+        setEmbeddedKnowledgeLocatedCue(null);setEmbeddedKnowledgeAutoFollow(true);
+        setSelectedKnowledgeTxtName('');setActiveTrackKnowledgeTabName('');
         setPlaylist(newPlaylist);
         if (newPlaylist.length > 0) loadTrack(0, newPlaylist);
         else {
@@ -22081,15 +22105,18 @@ ${userQ}`;
         }
     }, [handleManualKnowledgeTxtFileForEmbedded]);
 
-    const loadEmbeddedKnowledgePanel = useCallback(async () => {
+    const loadEmbeddedKnowledgePanel = useCallback(async ({force=false,fallbackFile=null,isCurrent=()=>true}={}) => {
         if (!canShowEmbeddedKnowledgePanel) return false;
-        if (embeddedKnowledgeText.trim()) return true;
+        if (!force && embeddedKnowledgeText.trim()) return true;
         setEmbeddedKnowledgeLoading(true);
         setEmbeddedKnowledgeError("");
         try {
             const hit = await probeKnowledgeFileForCurrentTrack({ refreshFromHandle: true, deepScan: true });
-            if (hit?.file) {
-                const result = await loadEmbeddedKnowledgeTxtFile(hit.file, {
+            if(!isCurrent())return false;
+            const referenceFile=hit?.file || (!hit?.exists?fallbackFile:null);
+            if (referenceFile) {
+                const result = await loadEmbeddedKnowledgeTxtFile(referenceFile, {
+                    isCurrent,
                     markSelected: true,
                     preferSeriesStart: embeddedKnowledgePreferSeriesStartRef.current
                 });
@@ -22104,6 +22131,7 @@ ${userQ}`;
             if (!rawTxt) {
                 throw new Error("目前媒體找不到可對照的文字檔。");
             }
+            if(!isCurrent())return false;
             setEmbeddedKnowledgeText(rawTxt);
             const resolvedFilename = String(knowledgeBank?.filename || hit?.filename || hit?.file?.name || "知識點.txt");
             setEmbeddedKnowledgeFileInfo({
@@ -22118,10 +22146,10 @@ ${userQ}`;
             setActiveTrackKnowledgeTabName(resolvedFilename);
             return true;
         } catch (err) {
-            setEmbeddedKnowledgeError(String(err?.message || err || "載入文字檔失敗。"));
+            if(isCurrent())setEmbeddedKnowledgeError(String(err?.message || err || "載入文字檔失敗。"));
             return false;
         } finally {
-            setEmbeddedKnowledgeLoading(false);
+            if(isCurrent())setEmbeddedKnowledgeLoading(false);
         }
     }, [
         buildQuizKnowledgeTxt,
@@ -22344,10 +22372,31 @@ ${userQ}`;
         setEmbeddedKnowledgeFileInfo(null);
         setEmbeddedKnowledgeError("");
         setEmbeddedKnowledgeLoading(false);
-        if (topPanelMode === 'document' && !isVideoMasked) {
-            void loadEmbeddedKnowledgePanel();
+        const pendingDefault=selectedFolderSession && handledFolderReferenceRef.current!==selectedFolderSession &&
+            selectedFolderSession.mediaFile===(playlist[currentTrackIndex]?.mediaFile || null) &&
+            getSingleFolderReferenceTxt(selectedFolderSession.files,selectedFolderSession);
+        if (topPanelMode === 'document' && !isVideoMasked && !pendingDefault) {
+            void loadEmbeddedKnowledgePanel({force:true});
         }
-    }, [currentTrackIndex]);
+    }, [currentTrackIndex,selectedFolderSession]);
+
+    // Reuse the normal matching loader first, with the sole TXT as its final
+    // fallback. A ref keeps text/language updates from restarting this effect.
+    folderReferenceLoaderRef.current=loadEmbeddedKnowledgePanel;
+    useEffect(() => {
+        const session=selectedFolderSession;
+        if(!session || handledFolderReferenceRef.current===session || selectedFolderSessionRef.current!==session)return;
+        if(session.mediaFile && playlist[currentTrackIndex]?.mediaFile!==session.mediaFile)return;
+        const file=getSingleFolderReferenceTxt(session.files,session);
+        if(!file){handledFolderReferenceRef.current=session;return;}
+        let cancelled=false;
+        const isCurrent=()=>!cancelled && selectedFolderSessionRef.current===session;
+        setTopPanelMode('document');setIsVideoMasked(false);
+        void folderReferenceLoaderRef.current({force:true,fallbackFile:file,isCurrent})
+            .catch(error=>{if(isCurrent())setEmbeddedKnowledgeError(String(error?.message || error));})
+            .finally(()=>{if(isCurrent())handledFolderReferenceRef.current=session;});
+        return ()=>{cancelled=true;};
+    }, [selectedFolderSession,currentTrackIndex]);
 
     const mediaSeekLabel = mediaSeekMode === 'indexed' ? `精準時間索引已就緒 · ${mediaIndexStorage === 'folder' ? '已存同目錄，可跨設備重用' : mediaIndexStorage === 'reused-cache' ? '已重用快取，免重新掃描' : mediaIndexStorage === 'cache' ? '已快取，下次開啟可重用' : '本次暫存'}` : mediaSeekMode === 'stream' ? 'MP3 串流使用原始時間索引；下載後選取本機檔可建立精準索引' : '使用原始 MP3 索引；此檔案或瀏覽器無法建立精準索引';
     const compactMediaSeekLabel = mediaSeekMode === 'indexed' ? (mediaIndexStorage === 'folder' ? '索引已存同目錄' : mediaIndexStorage === 'reused-cache' ? '已重用索引' : mediaIndexStorage === 'cache' ? '索引已快取' : '索引暫存') : mediaSeekMode === 'stream' ? '串流索引' : '原始索引';
@@ -22379,9 +22428,9 @@ ${userQ}`;
                         {playbackMode === 'sentence' && !isEchoMode && sentenceSub && (
                             <div className="mx-4 mt-2" aria-label="單句 A-B 播放範圍">
                                 <div ref={sentenceTimelineRef} className="relative h-14 touch-none select-none">
-                                    <label className="absolute bottom-0 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 bg-white px-1 text-[10px] leading-3 text-violet-800 cursor-pointer">
-                                        <input type="checkbox" checked={sentenceAbLinked} onChange={event => setSentenceAbLinked(event.target.checked)} className="h-3 w-3 accent-violet-600" />
-                                        AB 連動
+                                    <label className="absolute bottom-0 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 bg-white px-1 text-[10px] leading-3 text-blue-800 cursor-pointer">
+                                        <input type="checkbox" checked={sentenceAbLinked} onChange={event => setSentenceAbLinked(event.target.checked)} className="h-3 w-3 accent-blue-600" />
+                                        <span data-ab-mode="sentence">單句 ·</span> AB 連動
                                     </label>
                                     <div className="absolute inset-x-0 top-1/2 h-2 -translate-y-1/2 rounded-full bg-slate-200" />
                                     {[
@@ -22390,7 +22439,7 @@ ${userQ}`;
                                     ].filter(buffer => buffer.seconds > 0).map(buffer => (
                                         <div key={buffer.side} data-sentence-buffer={buffer.side === '前' ? 'before' : 'after'}
                                             aria-label={`${buffer.side} buffer ${buffer.seconds} 秒`}
-                                            className="absolute top-1/2 h-2 -translate-y-1/2 bg-violet-200 pointer-events-none"
+                                            className="absolute top-1/2 h-2 -translate-y-1/2 bg-blue-200 pointer-events-none"
                                             style={{ left: sentencePosition(buffer.start), width: `${buffer.seconds / sentenceTimelineSpan * 100}%` }}>
                                             <span className={`absolute top-4 whitespace-nowrap text-[9px] text-slate-500 ${buffer.side === '前' ? 'left-0' : 'right-0'}`}>{buffer.side} {buffer.seconds}s</span>
                                         </div>
@@ -22406,7 +22455,7 @@ ${userQ}`;
                                     {sentenceTimelineTicks.map(time => (
                                         <span key={time} aria-hidden="true" className="absolute top-1/2 h-3 -translate-y-1/2 border-l border-slate-400/70 pointer-events-none" style={{ left: sentencePosition(time) }} />
                                     ))}
-                                    <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-violet-600" style={{ left: sentencePosition(sentenceSelectedRange.start), width: `${Math.max(0, (sentenceSelectedRange.end - sentenceSelectedRange.start) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100)}%` }} />
+                                    <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-blue-600" style={{ left: sentencePosition(sentenceSelectedRange.start), width: `${Math.max(0, (sentenceSelectedRange.end - sentenceSelectedRange.start) / Math.max(0.001, sentenceTimelineEnd - sentenceTimelineStart) * 100)}%` }} />
                                     {['start', 'end'].map(edge => (
                                         <div key={edge} className="absolute inset-y-0 z-[15] pointer-events-none" style={{ left: sentencePosition(edge === 'start' ? sentenceOriginalStart : sentenceOriginalEnd) }}>
                                             <span className={`absolute top-0 whitespace-nowrap rounded bg-slate-800 px-1 text-[10px] font-bold text-white ${edge === 'end' ? '-translate-x-full' : ''}`}>{edge === 'start' ? '原起點' : '原終點'}</span>
@@ -22416,7 +22465,7 @@ ${userQ}`;
                                     <div className="absolute z-[15] top-1/2 h-6 w-0.5 -translate-x-1/2 -translate-y-1/2 bg-amber-400 pointer-events-none" style={{ left: sentencePosition(currentTime) }} />
                                     {['A', 'B'].map(point => (
                                         <button key={point} type="button" aria-label={point === 'A' ? '拖曳單句播放起點 A' : '拖曳單句播放終點 B'}
-                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-blue-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
                                             style={{ left: sentencePosition(point === 'A' ? sentenceSelectedRange.start : sentenceSelectedRange.end) }}
                                             onPointerDown={event => {
                                                 event.preventDefault();
@@ -23103,16 +23152,16 @@ ${userQ}`;
                         </div>}
 
                         {isEchoMode && (
-                            <div className="mx-4 mb-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 shadow-sm">
+                            <div className="mx-4 mb-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2.5 shadow-sm">
                                 <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
                                     <div>
-                                        <div className="flex items-center gap-1.5 text-xs font-bold text-violet-800"><Ear size={15} />回音法：短段聆聽</div>
-                                        <div className="text-[11px] text-violet-700 mt-0.5">{echoNotice}</div>
+                                        <div className="flex items-center gap-1.5 text-xs font-bold text-orange-800"><Ear size={15} />回音法：短段聆聽</div>
+                                        <div className="text-[11px] text-orange-700 mt-0.5">{echoNotice}</div>
                                     </div>
-                                    <button type="button" onClick={stopEchoMode} data-subtitle-focus-restore className="px-2.5 py-1 rounded-full border border-violet-300 bg-white text-[11px] font-bold text-violet-700 hover:bg-violet-100">結束回音法</button>
+                                    <button type="button" onClick={stopEchoMode} data-subtitle-focus-restore className="px-2.5 py-1 rounded-full border border-orange-300 bg-white text-[11px] font-bold text-orange-700 hover:bg-orange-100">結束回音法</button>
                                 </div>
-                                <div ref={echoTimelineRef} className="relative h-16 touch-none select-none" aria-label="回音法 A-B 片段進度條">
-                                    <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-200" />
+                                <div ref={echoTimelineRef} className="relative h-16 touch-none select-none" aria-label="回音法 A-B 片段進度條" data-ab-mode="echo">
+                                    <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-2 rounded-full bg-orange-200" />
                                     {['start', 'end'].map((edge) => (
                                         <div
                                             key={edge}
@@ -23126,7 +23175,7 @@ ${userQ}`;
                                         </div>
                                     ))}
                                     <div
-                                        className="absolute top-1/2 -translate-y-1/2 h-2 rounded-full bg-violet-600"
+                                        className="absolute top-1/2 -translate-y-1/2 h-2 rounded-full bg-orange-600"
                                         style={{
                                             left: `${((clampEchoTime(echoStart) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
                                             width: `${Math.max(0, ((clampEchoTime(echoEnd) - clampEchoTime(echoStart)) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100)}%`
@@ -23176,7 +23225,7 @@ ${userQ}`;
                                                     left: `${((from - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`,
                                                     width: `${((to - from) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%`
                                                 }}>
-                                                <span className={`absolute inset-x-0 top-1/2 -translate-y-1/2 h-2 rounded ${echoBuffers[side] ? 'bg-violet-400/40 ring-1 ring-violet-500' : 'bg-gray-400'}`} />
+                                                <span className={`absolute inset-x-0 top-1/2 -translate-y-1/2 h-2 rounded ${echoBuffers[side] ? 'bg-orange-400/40 ring-1 ring-orange-500' : 'bg-gray-400'}`} />
                                             </button>
                                         );
                                     })}
@@ -23184,7 +23233,7 @@ ${userQ}`;
                                         type="button"
                                         onPointerDown={(e) => startEchoMarkerDrag('A', e)}
                                         onClick={(e) => e.preventDefault()}
-                                        className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                        className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-orange-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
                                         style={{ left: `${((clampEchoTime(echoStart) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
                                         title="拖曳微調 A 起點"
                                         aria-label="拖曳微調 A 起點"
@@ -23194,7 +23243,7 @@ ${userQ}`;
                                             type="button"
                                             onPointerDown={(e) => startEchoMarkerDrag('B', e)}
                                             onClick={(e) => e.preventDefault()}
-                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-violet-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
+                                            className="absolute z-20 top-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-7 rounded-full border-2 border-white bg-orange-700 text-white text-[10px] font-black shadow cursor-ew-resize touch-none"
                                             style={{ left: `${((clampEchoTime(echoEnd) - echoBounds.start) / Math.max(0.001, echoBounds.end - echoBounds.start)) * 100}%` }}
                                             title="拖曳微調 B 終點"
                                             aria-label="拖曳微調 B 終點"
@@ -23202,9 +23251,9 @@ ${userQ}`;
                                     )}
                                 </div>
                                 <div className="mt-2 flex items-center justify-center gap-2" data-subtitle-focus-restore>
-                                    <button type="button" onClick={() => shiftEchoRange(-1)} aria-keyshortcuts="-" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
-                                    <button type="button" onClick={() => playEchoRangeOnce()} title="重聽目前片段（空白鍵）" aria-keyshortcuts="Space" className="px-3 py-1 rounded-full bg-violet-600 text-white text-xs font-bold hover:bg-violet-700">重聽一次</button>
-                                    <button type="button" onClick={() => shiftEchoRange(1)} aria-keyshortcuts="/" className="px-3 py-1 rounded-full border border-violet-300 bg-white text-violet-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B；B 已超過原終點時結束回音法">向前</button>
+                                    <button type="button" onClick={() => shiftEchoRange(-1)} aria-keyshortcuts="-" className="px-3 py-1 rounded-full border border-orange-300 bg-white text-orange-700 text-xs font-bold disabled:opacity-40" title="往前一段：新 B＝原 A，區段時長不變">向後</button>
+                                    <button type="button" onClick={() => playEchoRangeOnce()} title="重聽目前片段（空白鍵）" aria-keyshortcuts="Space" className="px-3 py-1 rounded-full bg-orange-600 text-white text-xs font-bold hover:bg-orange-700">重聽一次</button>
+                                    <button type="button" onClick={() => shiftEchoRange(1)} aria-keyshortcuts="/" className="px-3 py-1 rounded-full border border-orange-300 bg-white text-orange-700 text-xs font-bold disabled:opacity-40" title="往後一段：新 A＝原 B；B 已超過原終點時結束回音法">向前</button>
                                 </div>
                             </div>
                         )}
@@ -23281,12 +23330,12 @@ ${userQ}`;
                                 )}
                             </div>
 
-                            <div className={`flex flex-wrap items-center gap-1 px-2 py-1.5 rounded-lg border transition-all ${isEchoMode ? 'bg-violet-50 border-violet-200' : 'bg-transparent border-transparent'}`}>
+                            <div className={`flex flex-wrap items-center gap-1 px-2 py-1.5 rounded-lg border transition-all ${isEchoMode ? 'bg-orange-50 border-orange-200' : 'bg-transparent border-transparent'}`}>
                                 <button
                                     type="button"
                                     onClick={() => { if (isEchoMode) stopEchoMode(); else startEchoMode(); }}
                                     title={isEchoMode ? '結束回音法，交回一般播放控制' : '回音法：依設定語速選 A-B，播放一次後停止'}
-                                    className={`flex flex-col items-center gap-0.5 font-bold ${isEchoMode ? 'text-violet-700' : 'text-gray-400'}`}
+                                    className={`flex flex-col items-center gap-0.5 font-bold ${isEchoMode ? 'text-orange-700' : 'text-gray-400'}`}
                                 >
                                     <Ear size={14} /><span className="text-[9px]">回音法</span>
                                 </button>
@@ -23377,7 +23426,7 @@ ${userQ}`;
                                 <button
                                     type="button"
                                     onClick={() => { if (isEchoMode) stopEchoMode(); else startEchoMode(); }}
-                                    className={`flex flex-col items-center justify-center px-2 py-1 rounded-lg ${isEchoMode ? 'text-violet-700 bg-violet-50' : 'text-gray-500 hover:bg-gray-100'}`}
+                                    className={`flex flex-col items-center justify-center px-2 py-1 rounded-lg ${isEchoMode ? 'text-orange-700 bg-orange-50' : 'text-gray-500 hover:bg-gray-100'}`}
                                     title="回音法"
                                     aria-label="回音法"
                                 >
