@@ -25,7 +25,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.276 · context-aware-name-blanks";
+const APP_VERSION = "v5.277 · immediate-context-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7128,7 +7128,7 @@ const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled
     if (!hasCue) return {text:'尚無字幕',tone:'text-slate-500'};
     if (!(projection?.aligned || projection?.trusted)) {
         if (highlightUpdating) return {text:'文本對照更新中',tone:'text-slate-500'};
-        if (highlighted) return {text:enabled?'已反白文本・尚未完整對齊':'已反白文本・校正關閉',tone:'text-amber-700'};
+        if (highlighted) return {text:!enabled?'已反白文本・校正關閉':/ambiguous/.test(projection?.reason || '')?'已反白文本・多處候選，位置待確認':'已反白文本・尚未完整對齊',tone:'text-amber-700'};
         return {text:'本句未對到文本',tone:'text-amber-700'};
     }
     if (!enabled) return {text:'已對到文本・校正關閉',tone:'text-slate-500'};
@@ -7203,13 +7203,22 @@ const createSubtitleReferenceResolver = searchIndex => {
         }
         return spellingCache.get(key);
     };
-    const resolve = (cue, { sourceLine = -1, sequential = false, after = [] } = {}) => {
+    // A verified next cue can bound the current cue even on the first visit.
+    // Match its exact first-word offset, not merely a nearby paragraph number.
+    const getBeforeWordBoundary = before => {
+        const range=before?.[0],first=lineStarts.get(range?.sourceLine),end=lineEnds.get(range?.sourceLine);
+        if(!Number.isInteger(first) || !Number.isInteger(range?.start))return -1;
+        let low=first,high=end;
+        while(low<high){const mid=(low+high)>>>1;if(tokens[mid].start<range.start)low=mid+1;else high=mid;}
+        return low<end && tokens[low].start===range.start?low:-1;
+    };
+    const resolve = (cue, { sourceLine = -1, sequential = false, after = [], before = [] } = {}) => {
         const raw = typeof cue === 'string' ? cue : String(cue?.text || '');
         const objectCue = cue && typeof cue === 'object';
         // A result depends on the trusted location as well as the cue. A failed
         // speculative lookup must not poison a later lookup after a document
         // switch or a newly established anchor. Bound each cue to four contexts.
-        const contextKey = JSON.stringify([sourceLine, sequential, after.map(({sourceLine,start,end})=>[sourceLine,start,end])]);
+        const contextKey = JSON.stringify([sourceLine, sequential, after.map(({sourceLine,start,end})=>[sourceLine,start,end]), before.map(({sourceLine,start,end})=>[sourceLine,start,end])]);
         const cached = objectCue ? cueCache.get(cue) : textCache.get(raw);
         if (cached?.raw === raw && cached.results.has(contextKey)) return cached.results.get(contextKey);
         const remember = result => {
@@ -7223,7 +7232,9 @@ const createSubtitleReferenceResolver = searchIndex => {
         };
         const words = tokenizeSubtitleReferenceWords(raw);
         if (!tokens.length || !words.length || words.length > 120 || /[぀-ヿ㐀-鿿가-힯]/u.test(raw)) return remember({ reason: 'unsupported_or_short' });
-        const following=after.length && locateSubtitleReferenceFollowing(words,tokens,lineTexts,lineStarts,lineEnds,after,raw);
+        const beforeBoundary=before.length?getBeforeWordBoundary(before):-1;
+        if(before.length && beforeBoundary<0)return remember({reason:'invalid_adjacent_boundary'});
+        const following=!before.length && after.length && locateSubtitleReferenceFollowing(words,tokens,lineTexts,lineStarts,lineEnds,after,raw);
         if(following)return remember(following);
         if(words.length<2)return remember({reason:'short_without_adjacent_context'});
         const anchors = words.map((word, index) => ({ index, positions: postings.get(word.key) || [] }))
@@ -7278,6 +7289,11 @@ const createSubtitleReferenceResolver = searchIndex => {
                 if (!Number.isInteger(first)) continue;
                 for (let position=first;position<end && starts.size<128;position++) starts.add(position);
             }
+        }
+        if(beforeBoundary>=0) {
+            const bounded=[];
+            for(let delta=-4;delta<=4;delta++)if(beforeBoundary-words.length+delta>=0)bounded.push(beforeBoundary-words.length+delta);
+            starts=new Set(bounded);
         }
         const verifyStarts = starts => {
             const candidates = [];
@@ -7337,6 +7353,12 @@ const createSubtitleReferenceResolver = searchIndex => {
                     words[i].key === consumed[consumed.length - 1].key && /^\s+$/u.test(raw.slice(words[i - 1].end, words[i].start)) && duplicates < 2) {
                     edits.push({ start: words[i - 1].end, end: words[i].end, text: '', from: words[i].text, to: '', kind: 'duplicate' }); duplicates++; i++;
                 }
+                // No unspoken words may separate this cue from the verified
+                // next cue. A same-line hint alone cannot settle duplicates.
+                if(beforeBoundary>=0) {
+                    while(j<beforeBoundary && tokens[j]?.possibleFootnote)j++;
+                    if(j!==beforeBoundary)continue;
+                }
                 if (i !== words.length || consumed.length < 2) continue;
                 const changed = edits.length > 0;
                 const contentExact = new Set(words.filter(word => !word.numeric && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
@@ -7364,7 +7386,13 @@ const createSubtitleReferenceResolver = searchIndex => {
                 const contextual=locateSubtitleReferenceContext(words,tokens,lineTexts,starts,raw,{sourceLine,sequential});
                 if (contextual) candidates.push(contextual);
             }
-            return candidates;
+            if(beforeBoundary<0)return candidates;
+            let finalWord=beforeBoundary-1;
+            while(finalWord>=0 && tokens[finalWord]?.possibleFootnote)finalWord--;
+            return candidates.filter(candidate=>{
+                const last=candidate.ranges.at(-1),word=tokens[finalWord];
+                return last && word && last.sourceLine===word.sourceLine && last.end===word.end && before[0].sourceLine-last.sourceLine<=4;
+            });
         };
         let candidates=verifyStarts(starts);
         // Recover common-word cues only after the existing name/rare-anchor
@@ -7430,7 +7458,28 @@ const createSubtitleReferenceResolver = searchIndex => {
         if(distinct.size===1){const ranges=[...distinct.values()][0].ranges;return resolve(cue,{...options,sourceLine:ranges.at(-1).sourceLine,after:ranges});}
         return resolve(cue,options);
     };
-    return { resolve, resolveFollowing, tokenCount: tokens.length, hasHighlight };
+    const resolveWithNeighbours = (cue,previousCue,nextCue,options={}) => {
+        let current=resolveFollowing(cue,previousCue,options);
+        if(current.aligned || current.trusted)return current;
+        // Visiting the previous/next cue in the UI used to create this evidence
+        // as a side effect. Verify the loaded neighbours now, without playback.
+        if(previousCue) {
+            const previous=resolve(previousCue,options);
+            if(previous.aligned || previous.trusted) {
+                const retried=resolveFollowing(cue,previousCue,options);
+                if(retried.aligned || retried.trusted)return retried;
+            }
+        }
+        if(nextCue) {
+            const next=resolve(nextCue,options);
+            if((next.aligned || next.trusted) && next.ranges.length) {
+                const retried=resolve(cue,{...options,before:next.ranges});
+                if(retried.aligned || retried.trusted)return retried;
+            }
+        }
+        return current;
+    };
+    return { resolve, resolveFollowing, resolveWithNeighbours, tokenCount: tokens.length, hasHighlight };
 };
 const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
     if (!(projection?.trusted || projection?.aligned) || !accepted?.size) return projection;
@@ -20120,7 +20169,7 @@ ${userQ}`;
         // Text changes before the deferred document follower resets its cursor.
         // Its old line numbers have no meaning in the new reference document.
         const sameDocument = progress.documentText === embeddedKnowledgeText;
-        return subtitleReferenceResolver.resolveFollowing(subtitles[currentIndex], subtitles[currentIndex - 1], {
+        return subtitleReferenceResolver.resolveWithNeighbours(subtitles[currentIndex], subtitles[currentIndex - 1], subtitles[currentIndex + 1], {
             sourceLine: sameDocument ? progress.maxSourceLine : -1,
             sequential: sameDocument && progress.anchorState === 'anchored' && currentIndex >= progress.subtitleIndex && currentIndex - progress.subtitleIndex <= 2
         });
@@ -20177,7 +20226,7 @@ ${userQ}`;
         const progress = embeddedKnowledgePlaybackProgressRef.current;
         if (embeddedKnowledgeRenderIndex === currentIndex) return currentSubtitlePresentation;
         const cue = subtitles[embeddedKnowledgeRenderIndex];
-        const projection = subtitleReferenceResolver.resolveFollowing(cue, subtitles[embeddedKnowledgeRenderIndex - 1], {
+        const projection = subtitleReferenceResolver.resolveWithNeighbours(cue, subtitles[embeddedKnowledgeRenderIndex - 1], subtitles[embeddedKnowledgeRenderIndex + 1], {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
         return applySubtitleReferencePreference(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue), cue && referenceOriginalDifferencesRef.current.get(cue));

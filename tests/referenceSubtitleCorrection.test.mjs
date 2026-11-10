@@ -445,6 +445,56 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(withExtra.aligned,true);assert.equal(withExtra.changed,false);
         assert.equal(api.applySubtitleReferenceBoundaryAcceptance(withExtra,new Set(withExtra.reviewDifferences.map(item=>item.signature))).text,ref);
     });
+    test('first visit uses the next loaded cue to settle a repeated exact sentence without next/back navigation: ' + file, () => {
+        const text='If I leave this house, it will be in handcuffs.';
+        const next='I should have run for it while I had the chance.';
+        // Both copies can even occur inside the same paragraph; a line hint
+        // cannot distinguish them, but the exact next-cue boundary can.
+        const book=text+' A different recollection interrupted the earlier conversation. '+text+' '+next;
+        const engine=resolver(book),cue={text,start:25,end:30},following={text:next,start:30,end:36};
+        assert.equal(engine.resolve(cue).reason,'ambiguous');
+        const first=engine.resolveWithNeighbours(cue,null,following);
+        assert.equal(first.aligned,true);assert.equal(first.trusted,true);assert.equal(first.changed,false);
+        assert.equal(first.ranges[0].start,book.lastIndexOf('If I leave'));
+        assert.equal(api.getSubtitleReferenceStatus({active:true,hasText:true,hasCue:true,enabled:true,projection:first,highlighted:true}).text,'已對到文本・無需校正');
+        engine.resolveWithNeighbours(following,cue,null);
+        const revisited=engine.resolveWithNeighbours(cue,null,following);
+        assert.equal(JSON.stringify(revisited.ranges),JSON.stringify(first.ranges));
+        assert.equal(cue.text,text);assert.equal(cue.start,25);assert.equal(cue.end,30);
+    });
+    test('a previously unvisited preceding cue supplies a real boundary for a one-word cue immediately: ' + file, () => {
+        const previous={text:'They held sapphires infused with Stormlight.'},cue={text:'Profane.'};
+        const engine=resolver(previous.text+' '+cue.text+' Another thought followed. Profane, but beautiful.');
+        assert.equal(engine.resolve(cue).trusted,false);
+        const first=engine.resolveWithNeighbours(cue,previous,null);
+        assert.equal(first.aligned,true);assert.equal(first.ranges[0].start,previous.text.length+1);
+        assert.equal(first.text,'Profane.');
+    });
+    test('unresolved duplicate neighbours report position uncertainty and unrelated or partial cues cannot certify a match: ' + file, () => {
+        const text='If I leave this house, it will be in handcuffs.';
+        const next='I should have run for it while I had the chance.';
+        const duplicated=resolver((text+' '+next+'\n').repeat(2));
+        const unresolved=duplicated.resolveWithNeighbours({text},null,{text:next});
+        assert.equal(unresolved.aligned,undefined);assert.equal(unresolved.trusted,false);
+        assert.equal(api.getSubtitleReferenceStatus({active:true,hasText:true,hasCue:true,enabled:true,projection:unresolved,highlighted:true}).text,'已反白文本・多處候選，位置待確認');
+        const separated=resolver(text+' Unspoken words separate this from the next sentence. '+next+'\n'+text);
+        assert.equal(separated.resolveWithNeighbours({text},null,{text:next}).trusted,false,'a nearby paragraph alone cannot certify adjacency');
+        const engine=resolver(text+' '+next);
+        const partial=engine.resolveWithNeighbours({text:text+' Nonsensical imaginary additional words.'},null,{text:next});
+        assert.equal(partial.aligned,undefined,'the complete current cue must map, including its tail');
+    });
+    test('next-cue evidence keeps review decisions and is isolated from unbounded lookup caches and other documents: ' + file, () => {
+        const ref='The researchers carefully reviewed the evidence and counted 300 confirmed reports in their final study.';
+        const next='The committee accepted their conclusions after a long discussion yesterday.';
+        const raw=ref.replace('300','200'),engine=resolver(ref+' Unrelated intervening prose. '+ref+' '+next);
+        const cue={text:raw,start:2,end:8},following={text:next};
+        assert.equal(engine.resolve(cue).trusted,false);
+        const located=engine.resolveWithNeighbours(cue,null,following);
+        assert.equal(located.aligned,true);assert.equal(located.trusted,false);assert.equal(located.text,raw);
+        assert.ok(located.reviewDifferences.length);
+        assert.equal(engine.resolve(cue).trusted,false,'a constrained success cannot contaminate an ambiguous unbounded cache');
+        assert.equal(resolver('A different document contains none of the requested material.').resolveWithNeighbours(cue,null,following).trusted,false);
+    });
     test('frequent short cues resolve from the known paragraph without a rare global anchor: ' + file, () => {
         const repeated=Array.from({length:130},()=>"She hadn't wanted to remember.").join('\n');
         const engine=resolver(repeated);const cue={text:"She hadn't wanted to remember."};
