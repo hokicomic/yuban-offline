@@ -13,7 +13,7 @@ const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = fs.readFileSync(new URL('../' + file, import.meta.url), 'utf8');
     const code = source.slice(source.indexOf('const tokenizeSubtitlePractice ='), source.indexOf('const SubtitlePractice ='));
-    const api = vm.runInNewContext(code + '\n({tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,buildSubtitlePracticeDeletionDisplay,getSubtitlePracticeDualAlignment})');
+    const api = vm.runInNewContext(code + '\n({buildSubtitlePracticeNameHints,tokenizeSubtitlePractice, updateSubtitlePracticeAnswer, isSubtitlePracticeAnswerCorrect, isSubtitlePracticeTextHit, getSubtitlePracticeProgress, findSubtitlePracticeBlank, focusSubtitlePracticeBlank, installSubtitlePracticeFocus, getSubtitlePracticeLetterHints, syncSubtitlePracticeLetterOverlay, getSubtitlePracticeLetterAlignment, copySubtitlePracticeField,copySubtitlePracticeText,buildSubtitlePracticeDualTokens,buildSubtitlePracticeDeletionDisplay,getSubtitlePracticeDualAlignment})');
     const tokens = text => api.tokenizeSubtitlePractice(text, 'en-US');
     const join = items => items.map(item => item.kind === 'literal' ? item.text : item.parts.map(part => part.text).join('')).join('');
     test('blanks preserve punctuation, whitespace, contractions and multilingual text: ' + file, () => {
@@ -125,6 +125,30 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(tokens('Maria Ana de la Cruz spoke.').filter(part=>part.kind==='word').length,1);
         const fallback=vm.runInNewContext(code+'\ntokenizeSubtitlePractice',{Intl:{}});
         assert.equal(fallback(text,'en-US').filter(part=>part.name).length,6);
+    });
+    test('pronoun and negative contractions stay exercise words even in mid-sentence or mistaken name hints: ' + file, () => {
+        for(const word of ["I'd","I’m","Iʼve","I'll","We're","You'd","They've","He's","It's","There's","Who's","Let's","Don't","Can't","Wasn't"]){
+            const text=`She said ${word} continue.`,parts=api.tokenizeSubtitlePractice(text,'en-US',[word]);
+            assert.equal(join(parts),text);
+            assert.equal(parts.find(part=>part.name && part.text===word),undefined,word);
+            assert.ok(parts.some(part=>part.kind==='word' && part.parts.map(p=>p.text).join('')===word),word);
+            assert.ok(!api.buildSubtitlePracticeNameHints([{text}]).includes(word),word);
+        }
+    });
+    test('names learned elsewhere in captions or reference prose remain visible at cue start without exempting lowercase verbs: ' + file, () => {
+        const hints=api.buildSubtitlePracticeNameHints([{text:'We spoke with Gared and Will yesterday.'}],
+            [{raw:'The guards listened while Szeth explained the plan.'},{raw:'They visited Brazil’s coast with Joan of Arc.'}]);
+        for(const name of ['Gared','Will','Szeth','Brazil','Joan']){
+            const text=`${name} arrived today.`,parts=api.tokenizeSubtitlePractice(text,'en-US',hints);
+            assert.equal(parts[0].name,true,name);assert.equal(join(parts),text);
+        }
+        assert.equal(api.tokenizeSubtitlePractice('We will return tomorrow.','en-US',hints).filter(part=>part.name).length,0);
+        assert.equal(api.tokenizeSubtitlePractice('Will’s horse returned.','en-US',hints)[0].name,true);
+        assert.equal(tokens('Hope survives.')[0].kind,'word');
+        assert.equal(tokens('“Hope survives.”').find(part=>part.text==='Hope' || part.parts?.some(p=>p.text==='Hope')).kind,'word');
+        assert.equal(tokens('Dr. Bernard arrived.').find(part=>part.text==='Bernard').name,true);
+        const split=api.tokenizeSubtitlePractice('Joan. Of Arc.','en-US',['Joan of Arc']);
+        assert.equal(split.find(part=>part.parts?.some(p=>p.text==='Of')).kind,'word','hints cannot bridge sentence punctuation');
     });
     test('case differences are accepted and replaced by the original subtitle casing: ' + file, () => {
         for (const [target, typed] of [['Good', 'good'], ['afternoon', 'AFTERNOON'], ['iPhone', 'IPHONE'], ['CAFÉ', 'cafe\u0301']]) {
@@ -446,6 +470,17 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         type(inputs[0],'was');nodes=render({...props,correction});
         assert.equal(fields(nodes)[0].props.value,'was');
         assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true);
+    });
+    test('context names at sentence start are literal in the component while mid-sentence I’d remains an input: ' + file, () => {
+        const render=setup(),text="Gared said I’d return.",props={...base(),text,subtitle:{text},
+            contextNameHints:api.buildSubtitlePracticeNameHints([{text:'They listened to Gared yesterday.'}])};
+        let nodes=render(props),inputs=fields(nodes);
+        assert.equal(nodes.find(node=>node.props?.['data-subtitle-visible-name']).props.children,'Gared');
+        assert.equal(inputs.length,4,'said, I, d, return are exercise fields');
+        assert.equal(inputs[1].props['aria-label'],'第 2 字第 1 部分：填空');
+        const plain={...props,contextNameHints:[]};nodes=render(plain);inputs=fields(nodes);
+        assert.equal(inputs.length,5,'a different context cannot inherit stale name exemptions');
+        assert.equal(inputs[0].props.value,'');assert.equal(props.subtitle.text,text);
     });
     test('provisional text and original text selections change the actual blank answer and reset its draft: ' + file, () => {
         const render=setup();const raw='They counted 200 votes.';

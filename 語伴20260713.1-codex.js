@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.275 · reference-highlight-resume";
+const APP_VERSION = "v5.276 · context-aware-name-blanks";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8970,38 +8970,71 @@ const getSubtitlePracticeDualAlignment = (part,value) => {
     return {...best.alignment,runs,alternatives:options};
 };
 
+const SUBTITLE_PRACTICE_NAME_CONNECTORS = new Set(['of','de','del','da','di','van','von','la','le','d']);
+const SUBTITLE_PRACTICE_ORDINARY_CAPITALS = new Set(['a','an','the','i','we','you','he','she','it','they','this','that','these','those','but','and','or','at','in','on','to','as','with','after','before','once','according','earlier','later','meanwhile','officials','dozens','hundreds','thousands','politics','government','good','hello','hi','please','thanks','thank','yes','no','okay','well','now']);
+const getSubtitlePracticeNameKey = text => String(text || '').normalize('NFKD').replace(/\p{M}/gu,'').replace(/[’ʼ]/g,"'").toLowerCase();
+const isSubtitlePracticeNameCapital = word => Boolean(word && !SUBTITLE_PRACTICE_ORDINARY_CAPITALS.has(word.key) && !SUBTITLE_PRACTICE_NAME_CONNECTORS.has(word.key) &&
+    !/^(?:(?:i|you|we|they|he|she|it|that|there|here|who|what|where|when|why|how|let)'(?:m|re|ve|ll|d|s)|(?:isn|aren|wasn|weren|don|doesn|didn|haven|hasn|hadn|won|wouldn|can|couldn|shouldn|mustn|needn|daren|shan|ain)'t|o'clock|ma'am|y'all|c'mon)$/u.test(word.key) &&
+    /^\p{Lu}[\p{L}\p{M}'’ʼ]+$/u.test(word.text));
+const getSubtitlePracticeNameWords = source => Array.from(String(source || '').matchAll(/[\p{L}\p{M}]+(?:['’ʼ][\p{L}\p{M}]+)*/gu), match =>
+    ({text:match[0],start:match.index,end:match.index+match[0].length,key:getSubtitlePracticeNameKey(match[0])}));
 const findSubtitlePracticeNameRanges = (text, hints = []) => {
-    const source = String(text || '');
-    const words = Array.from(source.matchAll(/[\p{L}\p{M}]+(?:['’ʼ][\p{L}\p{M}]+)*/gu), match => ({ text:match[0], start:match.index, end:match.index+match[0].length,
-        key:match[0].normalize('NFKD').replace(/\p{M}/gu,'').replace(/[’ʼ]/g,"'").toLowerCase() }));
-    const connectors = new Set(['of','de','del','da','di','van','von','la','le','d']);
-    const ordinary = new Set(['a','an','the','i','we','you','he','she','it','they','this','that','these','those','but','and','or','at','in','on','to','as','with','after','before','once','according','earlier','later','meanwhile','officials','dozens','hundreds','thousands','politics','government','good','hello','hi','please','thanks','thank','yes','no','okay','well','now']);
-    const capitalized = word => word && !ordinary.has(word.key) && /^\p{Lu}[\p{L}\p{M}'’ʼ]+$/u.test(word.text);
+    const source = String(text || ''), words = getSubtitlePracticeNameWords(source);
+    const connectors = SUBTITLE_PRACTICE_NAME_CONNECTORS;
     const ranges = [];
     for (let i=0;i<words.length;i++) {
-        if (!capitalized(words[i])) continue;
+        if (!isSubtitlePracticeNameCapital(words[i])) continue;
         let end=i+1, capitals=1;
-        while (end<words.length && /^[\s\-’']*$/u.test(source.slice(words[end-1].end,words[end].start))) {
-            if (capitalized(words[end])) { capitals++; end++; }
-            else if (connectors.has(words[end].key) && [1,2,3].some(offset=>capitalized(words[end+offset]) &&
+        while (end<words.length && /^[\s\-‐‑]*$/u.test(source.slice(words[end-1].end,words[end].start))) {
+            if (isSubtitlePracticeNameCapital(words[end])) { capitals++; end++; }
+            else if (connectors.has(words[end].key) && [1,2,3].some(offset=>isSubtitlePracticeNameCapital(words[end+offset]) &&
                 Array.from({length:offset},(_,step)=>step).every(step=>connectors.has(words[end+step]?.key))) &&
                 /^\s*$/u.test(source.slice(words[end].end,words[end+1]?.start))) end++;
             else break;
         }
         const before=source.slice(0,words[i].start).replace(/\[[^\]]*\]|［[^］]*］/gu,'').trim();
-        const sentenceInitial=!before || /[.!?。！？][”’"')\]]*$/u.test(before);
-        // A lone capital at sentence start may just be normal capitalization.
-        // A multi-part name, a mid-sentence name, or a verified correction is
-        // stronger evidence. Ordinary sentence starters remain exercise words.
-        if (capitals>=2 || !sentenceInitial) ranges.push({start:words[i].start,end:words[end-1].end});
+        const sentenceInitial=/^[“‘"'(\[]*$/u.test(before) || /[.!?。！？;:][”’"')\]]*\s*[“‘"'(\[]*$/u.test(before);
+        const titled = /(?:^|\s)(?:Mr|Mrs|Ms|Miss|Dr|Prof|Sir|Ser|Lord|Lady|King|Queen|Saint|St)\.?\s*$/u.test(before);
+        // One sentence-initial capital alone is ambiguous. Other occurrences,
+        // titles and verified name corrections can supply the missing evidence.
+        if (capitals>=2 || !sentenceInitial || titled) ranges.push({start:words[i].start,end:words[end-1].end});
         i=end-1;
     }
+    // Index hints once rather than testing every known name against every word.
+    // Capitalization is still required here: learning Will must not exempt will.
+    const byFirst = new Map();
     for (const hint of hints || []) {
-        const keys=Array.from(String(hint).matchAll(/[\p{L}\p{M}]+(?:['’ʼ][\p{L}\p{M}]+)*/gu),m=>m[0].normalize('NFKD').replace(/\p{M}/gu,'').replace(/[’ʼ]/g,"'").toLowerCase());
-        if (!keys.length) continue;
-        for (let i=0;i+keys.length<=words.length;i++) if (keys.every((key,offset)=>words[i+offset].key===key)) ranges.push({start:words[i].start,end:words[i+keys.length-1].end});
+        const parts=getSubtitlePracticeNameWords(hint);
+        if (!parts.length || !isSubtitlePracticeNameCapital(parts[0]) || !isSubtitlePracticeNameCapital(parts.at(-1))) continue;
+        if (!parts.every(word=>isSubtitlePracticeNameCapital(word) || connectors.has(word.key))) continue;
+        const keys=parts.map(word=>word.key.replace(/'s$/u,''));
+        const list=byFirst.get(keys[0]) || [];list.push(keys);byFirst.set(keys[0],list);
+    }
+    for (let i=0;i<words.length;i++) {
+        if (!isSubtitlePracticeNameCapital(words[i])) continue;
+        const candidates=byFirst.get(words[i].key.replace(/'s$/u,'')) || [];
+        for (const keys of candidates) if(i+keys.length<=words.length && keys.every((key,offset)=>words[i+offset].key.replace(/'s$/u,'')===key) &&
+            words.slice(i,i+keys.length).every((word,offset)=>isSubtitlePracticeNameCapital(word) || (offset>0 && connectors.has(word.key))) &&
+            words.slice(i+1,i+keys.length).every((word,offset)=>/^[\s\-‐‑]*$/u.test(source.slice(words[i+offset].end,word.start)))) {
+            ranges.push({start:words[i].start,end:words[i+keys.length-1].end});
+        }
     }
     return ranges.sort((a,b)=>a.start-b.start || b.end-a.end);
+};
+const buildSubtitlePracticeNameHints = (subtitles = [], referenceEntries = []) => {
+    const names = new Set();
+    const collect = text => {
+        for (const range of findSubtitlePracticeNameRanges(text)) {
+            const phrase=String(text).slice(range.start,range.end);
+            names.add(phrase);
+            for (const word of getSubtitlePracticeNameWords(phrase)) if (isSubtitlePracticeNameCapital(word)) names.add(word.text.replace(/['’ʼ]s$/u,''));
+        }
+    };
+    for (const cue of subtitles) collect(cue?.text || '');
+    // Only the reference index's original-language entries participate. Chinese
+    // translations and knowledge-point explanations do not create name hints.
+    for (const entry of referenceEntries) collect(entry?.raw || '');
+    return [...names];
 };
 
 const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
@@ -9215,7 +9248,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -9228,7 +9261,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     // Full captions are selectable reading text. Old accidental edits must
     // never replace the source caption or become dictation answers.
     const source = String(text || '');
-    const nameHints = useMemo(() => correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to) || [], [correction]);
+    const nameHints = useMemo(() => [...(contextNameHints || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || [])], [contextNameHints, correction]);
     const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
     const displayTokens = useMemo(() => buildSubtitlePracticeDeletionDisplay(tokens,source,correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[]), [tokens,source,correction]);
     const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
@@ -20088,6 +20121,7 @@ ${userQ}`;
     const embeddedKnowledgeDocumentKey = useMemo(() => {
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
+    const subtitlePracticeNameHints = useMemo(() => buildSubtitlePracticeNameHints(subtitles, embeddedKnowledgeAlignmentIndex.entries), [subtitles, embeddedKnowledgeAlignmentIndex]);
     const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
     const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText.trim()) && !embeddedKnowledgeLoading && !embeddedKnowledgeError;
     const currentSubtitleProjection = useMemo(() => {
@@ -23116,6 +23150,7 @@ ${userQ}`;
                                     </div>
                                 )}
                                 <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                    contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
                                     textRef={subtitleTextRef}
