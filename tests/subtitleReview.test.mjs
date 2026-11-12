@@ -93,3 +93,30 @@ test('file selected through the mobile folder reader merges with browser progres
     const s=openReviewSession({document:base(),sidecar:{text:async()=>JSON.stringify(previous)},storage:memory()});
     await s.ready;assert.equal(s.document.entries.length,1);assert.equal(s.document.entries[0].attempts[0].id,'portable');
 });
+test('multi-device imports combine unique attempts and words regardless of file selection order',async()=>{
+    const pc=recordReviewAttempt(base(),attempt('pc'),'2026-11-12T01:00:00Z');
+    const phone=recordReviewAttempt(pc,attempt('iphone',[{...word,key:'2:0',wordIndex:2,text:'again',accepted:['again']}]),'2026-11-12T02:00:00Z');
+    const tablet=recordReviewAttempt(pc,{...attempt('ipad',[]),completedWithoutHints:true},'2026-11-12T03:00:00Z');
+    const outputs=[];
+    for(const values of [[pc,phone,tablet],[tablet,pc,phone],[phone,tablet,pc]]){
+        const s=openReviewSession({document:base(),storage:memory()});await s.ready;await s.importMany(values);
+        assert.equal(s.document.entries[0].attempts.length,3);
+        assert.equal(s.document.entries[0].words.length,2);
+        assert.equal(s.document.entries[0].mastered,true,'most recent device status wins');
+        await s.importMany(values);assert.equal(s.document.entries[0].attempts.length,3,'reimport cannot double count');
+        outputs.push(s.document);
+    }
+    assert.deepEqual(outputs[0],outputs[1]);assert.deepEqual(outputs[1],outputs[2]);
+});
+test('an older export cannot replace the newer snapshot of the same attempt',()=>{
+    const older=recordReviewAttempt(base(),attempt('same'),'2026-11-12T01:00:00Z');
+    const newer=recordReviewAttempt(older,attempt('same',[{...word,typed:'ghost du'}]),'2026-11-12T02:00:00Z');
+    assert.deepEqual(mergeReviewDocuments(older,newer),mergeReviewDocuments(newer,older));
+    assert.equal(mergeReviewDocuments(newer,older).entries[0].attempts[0].words[0].typed,'ghost du');
+});
+test('a mismatched file in a batch leaves current records and the original disk untouched',async()=>{
+    const folder=disk(),s=openReviewSession({document:base(),folder,storage:memory()});await s.ready;await s.record(attempt('original'));
+    const before=JSON.stringify(s.document),diskBefore=folder.content;
+    await assert.rejects(s.importMany([recordReviewAttempt(base(),attempt('new')),createReviewDocument('different.lrc','other','other.mp3')]),/不符/);
+    assert.equal(JSON.stringify(s.document),before);assert.equal(folder.content,diskBefore);
+});

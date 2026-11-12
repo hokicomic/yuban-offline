@@ -312,6 +312,19 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         fontSize: 24, textRef: { current: null }, editsRef: { current: new WeakMap() } });
     const fields = nodes => nodes.filter(node => node.type === 'input');
     const type = (field, value) => field.props.onChange({ target: { value }, nativeEvent: {} });
+    test('only recorded pending review blanks receive orange underlines, including corrected phrases: ' + file, () => {
+        const render=setup(),props={...base(),subtitle:{text:'Hello world.',start:1,end:4},text:'Hello world.',
+            reviewTarget:{originalText:'Hello world.',displayText:'Hello world.',start:1,mastered:false,
+                words:[{wordIndex:1,partIndex:0,accepted:['world']}]}};
+        let inputs=fields(render(props));assert.equal(inputs[0].props.style.borderBottomColor,undefined);
+        assert.equal(inputs[1].props.style.borderBottomColor,'#d97706');assert.equal(inputs[1].props.value,'');
+        inputs=fields(render({...props,reviewTarget:{...props.reviewTarget,mastered:true}}));assert.equal(inputs[1].props.style.borderBottomColor,undefined);
+        inputs=fields(render({...props,reviewTarget:{...props.reviewTarget,displayText:'A different sentence.'}}));assert.equal(inputs[1].props.style.borderBottomColor,undefined);
+        const phraseRender=setup(),phrase={...base(),subtitle:{text:'ghost dude',start:5,end:8},text:'ghosted',
+            correction:{raw:'ghost dude',text:'ghosted',changed:true,edits:[{start:0,end:10,text:'ghosted',from:'ghost dude',to:'ghosted',kind:'spelling'}]},
+            reviewTarget:{originalText:'ghost dude',displayText:'ghosted',start:5,mastered:false,words:[{wordIndex:0,partIndex:0,accepted:['ghosted','ghost dude']}]}};
+        assert.equal(fields(phraseRender(phrase))[0].props.style.borderBottomColor,'#d97706');
+    });
     test('review captures reveal/unfinished phrase answers without counting typing drafts or mutating time: ' + file, () => {
         const render=setup(),records=[],props={...base(),autoFocusEnabled:false,reviewContext:{},onReviewRecord:(session,value)=>records.push(value),
             subtitle:{text:'ghost dude',start:5,end:8},text:'ghosted',correction:{raw:'ghost dude',text:'ghosted',changed:true,

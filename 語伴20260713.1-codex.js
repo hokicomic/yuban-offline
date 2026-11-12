@@ -44,9 +44,18 @@ function mergeReviewDocuments(a,b) {
     for(const incoming of b.entries){
         const old=entries.get(incoming.id);
         if(!old){entries.set(incoming.id,incoming);continue;}
-        const latest=incoming.updatedAt>=old.updatedAt?incoming:old;
-        const attempts=[...new Map([...old.attempts,...incoming.attempts].map(x=>[x.id,x])).values()].sort((x,y)=>x.at.localeCompare(y.at));
-        const words=[...new Map([...old.words,...incoming.words].map(x=>[x.key,x])).values()];
+        // Device exports may contain older snapshots of the same attempt.
+        // Resolve by event time, independently of file selection order.
+        const latest=incoming.updatedAt>old.updatedAt?incoming:incoming.updatedAt<old.updatedAt?old:
+            incoming.mastered!==old.mastered?(incoming.mastered?old:incoming):JSON.stringify(incoming)>JSON.stringify(old)?incoming:old;
+        const byAttempt=new Map();
+        for(const attempt of [...old.attempts,...incoming.attempts]){
+            const previous=byAttempt.get(attempt.id);
+            if(!previous || attempt.at>previous.at || (attempt.at===previous.at&&JSON.stringify(attempt)>JSON.stringify(previous)))byAttempt.set(attempt.id,attempt);
+        }
+        const attempts=[...byAttempt.values()].sort((x,y)=>x.at.localeCompare(y.at)||x.id.localeCompare(y.id));
+        const earlier=latest===incoming?old:incoming;
+        const words=[...new Map([...earlier.words,...latest.words].map(x=>[x.key,x])).values()].sort((x,y)=>x.key.localeCompare(y.key));
         entries.set(incoming.id,{...latest,attempts,words});
     }
     return {...a,entries:[...entries.values()].sort((x,y)=>x.start-y.start||x.id.localeCompare(y.id))};
@@ -114,12 +123,15 @@ function openReviewSession({document:initial,folder=null,sidecar=null,storage=nu
         writeQueue=writeQueue.then(work,work);return writeQueue;
     };
     session.record=attempt=>{session.document=recordReviewAttempt(session.document,attempt);notify(session);return session.save();};
-    session.import=async value=>{
+    session.importMany=async values=>{
         await session.ready;
-        session.document=mergeReviewDocuments(session.document,validateReviewDocument(value,initial));notify(session);
+        // Validate the whole selection before changing memory or disk.
+        const documents=values.map(value=>validateReviewDocument(value,initial));
+        session.document=documents.reduce((doc,value)=>mergeReviewDocuments(doc,value),session.document);notify(session);
         // A malformed existing disk file remains protected even after import.
         await session.save();
     };
+    session.import=value=>session.importMany([value]);
     session.mark=(id,mastered)=>{
         session.document={...session.document,entries:session.document.entries.map(e=>e.id===id?{...e,mastered,updatedAt:nextReviewTime(session.document)}:e)};
         notify(session);return session.save();
@@ -158,7 +170,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.282 · subtitle-mistake-review";
+const APP_VERSION = "v5.283 · masked-review-merge";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9455,7 +9467,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -9628,6 +9640,10 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     );
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
+        const reviewWord=reviewTarget && !reviewTarget.mastered && reviewTarget.originalText===subtitle?.text &&
+            Math.abs(reviewTarget.start-Number(subtitle?.start))<.05 && reviewTarget.displayText===source &&
+            reviewTarget.words.some(word=>word.wordIndex===token.index && word.partIndex===part.index &&
+                word.accepted.some(expected=>getSubtitlePracticePartOptions(part).includes(expected)));
         const value = answer?.values?.[part.index] || '';
         const correct = isSubtitlePracticePartAccepted(part, value);
         const pendingLonger = !answer?.revealed && !answer?.composing && getSubtitlePracticePendingLongerOptions(part,value).length > 0;
@@ -9642,6 +9658,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
+                    data-subtitle-review-word={reviewWord || undefined} title={reviewWord?'錯題複習格':undefined}
                     data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || isSubtitlePracticePartAccepted(part, answers[token.index]?.values?.[part.index])}
                     data-subtitle-longer-answer-pending={pendingLonger || undefined}
                     aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : isSubtitlePracticePartAccepted(part, answers[token.index]?.values?.[part.index]) ? '正確' : '填空'}`}
@@ -9669,7 +9686,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     className="inline-block rounded-none border-0 border-b-2 border-slate-400 bg-transparent text-center font-bold outline-none focus:border-blue-500 focus:bg-blue-50"
                     style={{ width: `${Math.max(2, Array.from(part.text).reduce((width, char) => width + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(char) ? 2 : 1), 0) + 0.4)}ch`,
                         maxWidth: 'calc(100vw - 4rem)', padding: '0.05em 0', lineHeight: 'inherit', fontSize: 'inherit', fontFamily: 'inherit', fontWeight: 'inherit',
-                        borderBottomColor: token.corrected ? '#dc2626' : undefined, color: hasHints ? 'transparent' : color, WebkitTextFillColor: hasHints ? 'transparent' : color, caretColor: '#6b4c9a' }}
+                        borderBottomColor: reviewWord ? '#d97706' : token.corrected ? '#dc2626' : undefined, color: hasHints ? 'transparent' : color, WebkitTextFillColor: hasHints ? 'transparent' : color, caretColor: '#6b4c9a' }}
                 />
                 {hasHints && (
                     <span aria-hidden="true" data-subtitle-letter-overlay
@@ -9737,6 +9754,16 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
 });
 
 const MemoizedMarkdownView = React.memo(MarkdownView);
+
+// Keep answer text out of the rendered hint until deliberately revealed.
+const SubtitleReviewWord = ({ word, number }) => {
+    const [revealed,setRevealed]=useState(false);
+    return <button type="button" data-review-word-revealed={revealed}
+        aria-label={`${revealed?'遮住':'顯示'}第 ${number} 個複習字`}
+        onClick={()=>setRevealed(value=>!value)} className="text-blue-700 rounded px-1 border border-blue-100">
+        {revealed?word.accepted.join('／'):'••••'}
+    </button>;
+};
 
 export default function App() {
     const [currentApiKey, setCurrentApiKey] = useState(apiKey);
@@ -10776,6 +10803,7 @@ export default function App() {
     const [,refreshReview]=useState(0);
     const [showReview,setShowReview]=useState(false);
     const [reviewOnlyPending,setReviewOnlyPending]=useState(true);
+    const [reviewRevealKey,setReviewRevealKey]=useState(0);
     const [reviewPracticeKey,setReviewPracticeKey]=useState(0);
     const [reviewNotice,setReviewNotice]=useState('');
     const [folderPermissionNotice,setFolderPermissionNotice]=useState('');
@@ -23432,7 +23460,7 @@ ${userQ}`;
                                             className="rounded-full border border-slate-200 px-2 py-0.5">{currentSubtitlePresentation?.acceptedReviewCount > 0 ? '撤銷確認' : '撤銷補字'}</button>}
                                     </div>
                                 )}
-                                <SubtitlePractice key={reviewPracticeKey} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05)} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
@@ -23441,7 +23469,7 @@ ${userQ}`;
 
                             <div className="px-2 py-1 text-xs border-t border-slate-100" onClick={event=>event.stopPropagation()} data-subtitle-review-panel>
                                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                    <button type="button" disabled={!reviewSession} onClick={()=>setShowReview(value=>!value)} className="text-blue-700 disabled:opacity-40">錯題複習（{reviewSession?.document.entries.filter(e=>!e.mastered).length || 0}）</button>
+                                    <button type="button" disabled={!reviewSession} onClick={()=>{setReviewRevealKey(n=>n+1);setShowReview(value=>!value);}} className="text-blue-700 disabled:opacity-40">錯題複習（{reviewSession?.document.entries.filter(e=>!e.mastered).length || 0}）</button>
                                     <span role="status" className="text-slate-500">{reviewNotice || reviewSession?.status || folderPermissionNotice || '載入字幕後可記錄錯題'}</span>
                                 </div>
                                 {showReview && reviewSession && <div className="mt-1">
@@ -23452,10 +23480,14 @@ ${userQ}`;
                                             const blob=new Blob([JSON.stringify(reviewSession.document,null,2)],{type:'application/json'});
                                             const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=reviewSession.filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
                                         }}>匯出 JSON</button>
-                                        <label className="cursor-pointer text-blue-700">匯入 JSON<input type="file" accept=".json,application/json" className="sr-only" onChange={async event=>{
-                                            const file=event.target.files?.[0],session=reviewSession;event.target.value='';if(!file)return;
-                                            try{if(file.size>10*1024*1024)throw new Error('JSON 超過 10 MB');await session.import(JSON.parse(await file.text()));if(activeReviewRef.current===session)setReviewNotice('已合併匯入；'+session.status);}
-                                            catch(error){if(activeReviewRef.current===session)setReviewNotice(error.message);}
+                                        <label className="cursor-pointer text-blue-700">合併匯入 JSON<input type="file" multiple accept=".json,application/json" className="sr-only" onChange={async event=>{
+                                            const files=Array.from(event.target.files || []),session=reviewSession;event.target.value='';if(!files.length)return;
+                                            try{
+                                                if(files.length>50 || files.reduce((total,file)=>total+file.size,0)>25*1024*1024)throw new Error('請每批選擇最多 50 份、合計 25 MB 以內的 JSON');
+                                                const values=await Promise.all(files.map(async file=>{try{return JSON.parse((await file.text()).replace(/^\uFEFF/u,''));}catch(_){throw new Error(`${file.name}：不是有效 JSON，本批未匯入`);}}));
+                                                await session.importMany(values);
+                                                if(activeReviewRef.current===session){setReviewRevealKey(n=>n+1);setReviewNotice(`已合併 ${files.length} 份 JSON，重複紀錄不重算；${session.status}`);}
+                                            }catch(error){if(activeReviewRef.current===session)setReviewNotice(error.message);}
                                         }}/></label>
                                         <button type="button" onClick={async()=>{
                                             try{const session=reviewSession;if(!session.folder?.requestPermission){setReviewNotice('此瀏覽器請使用支援讀寫的資料夾選擇，或匯出 JSON');return;}
@@ -23466,15 +23498,15 @@ ${userQ}`;
                                     </div>
                                     <div className="text-slate-400 break-all">{reviewSession.filename} · 揭曉即記錄；Enter／離開句子記錄已輸入但未完成的字；打字途中不判錯。</div>
                                     <div className="max-h-40 overflow-y-auto mt-1">
-                                        {reviewSession.document.entries.filter(e=>!reviewOnlyPending||!e.mastered).map(entry=><div key={entry.id} className="border-t py-1 flex flex-wrap gap-x-2 gap-y-1 items-baseline">
+                                        {reviewSession.document.entries.filter(e=>!reviewOnlyPending||!e.mastered).map(entry=><div key={`${entry.id}:${reviewRevealKey}`} className="border-t py-1 flex flex-wrap gap-x-2 gap-y-1 items-baseline">
                                             <button type="button" className="text-blue-700" onClick={()=>{
                                                 const index=findReviewCue(subtitles,entry);if(index<0){setReviewNotice('目前字幕設定找不到此時間，請確認字幕／合句設定');return;}
-                                                setReviewNotice('');setIsSubtitleBlankMode(true);setReviewPracticeKey(n=>n+1);jumpToSubtitle(index);
+                                                setReviewNotice('');setReviewRevealKey(n=>n+1);setIsSubtitleBlankMode(true);setReviewPracticeKey(n=>n+1);jumpToSubtitle(index);
                                             }}>{formatTime(entry.start)} 複習</button>
-                                            <span>{entry.words.map(word=>word.accepted.join('／')).join('、')}</span>
+                                            <span className="inline-flex flex-wrap gap-1">{entry.words.map((word,index)=><SubtitleReviewWord key={word.key} word={word} number={index+1}/>)}</span>
                                             <span className="text-slate-500">{entry.attempts.length} 次 · {entry.mastered?'已掌握':'待複習'}</span>
                                             <button type="button" onClick={()=>{setReviewNotice('');void reviewSession.mark(entry.id,!entry.mastered);}}>{entry.mastered?'改待複習':'標為已掌握'}</button>
-                                            <details className="w-full"><summary>{entry.originalText}</summary><p>當時顯示：{entry.displayText}</p>{entry.words.map(word=><p key={word.key}>{word.text}：{word.reason==='unfinished'?'未完成':word.reason==='revealed-empty'?'未答揭曉':'輸入後揭曉'}；輸入：{word.typed || '（空白）'}</p>)}</details>
+                                            <details className="w-full"><summary>原句與作答紀錄（點擊查看）</summary><p>原字幕：{entry.originalText}</p><p>當時顯示：{entry.displayText}</p>{entry.words.map(word=><p key={word.key}>{word.text}：{word.reason==='unfinished'?'未完成':word.reason==='revealed-empty'?'未答揭曉':'輸入後揭曉'}；輸入：{word.typed || '（空白）'}</p>)}</details>
                                         </div>)}
                                         {!reviewSession.document.entries.some(e=>!reviewOnlyPending||!e.mastered)&&<p>尚無符合條件的錯題。複習會重新提供空白作答。</p>}
                                     </div>

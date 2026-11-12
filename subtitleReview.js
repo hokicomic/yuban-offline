@@ -29,9 +29,18 @@ export function mergeReviewDocuments(a,b) {
     for(const incoming of b.entries){
         const old=entries.get(incoming.id);
         if(!old){entries.set(incoming.id,incoming);continue;}
-        const latest=incoming.updatedAt>=old.updatedAt?incoming:old;
-        const attempts=[...new Map([...old.attempts,...incoming.attempts].map(x=>[x.id,x])).values()].sort((x,y)=>x.at.localeCompare(y.at));
-        const words=[...new Map([...old.words,...incoming.words].map(x=>[x.key,x])).values()];
+        // Device exports may contain older snapshots of the same attempt.
+        // Resolve by event time, independently of file selection order.
+        const latest=incoming.updatedAt>old.updatedAt?incoming:incoming.updatedAt<old.updatedAt?old:
+            incoming.mastered!==old.mastered?(incoming.mastered?old:incoming):JSON.stringify(incoming)>JSON.stringify(old)?incoming:old;
+        const byAttempt=new Map();
+        for(const attempt of [...old.attempts,...incoming.attempts]){
+            const previous=byAttempt.get(attempt.id);
+            if(!previous || attempt.at>previous.at || (attempt.at===previous.at&&JSON.stringify(attempt)>JSON.stringify(previous)))byAttempt.set(attempt.id,attempt);
+        }
+        const attempts=[...byAttempt.values()].sort((x,y)=>x.at.localeCompare(y.at)||x.id.localeCompare(y.id));
+        const earlier=latest===incoming?old:incoming;
+        const words=[...new Map([...earlier.words,...latest.words].map(x=>[x.key,x])).values()].sort((x,y)=>x.key.localeCompare(y.key));
         entries.set(incoming.id,{...latest,attempts,words});
     }
     return {...a,entries:[...entries.values()].sort((x,y)=>x.start-y.start||x.id.localeCompare(y.id))};
@@ -99,12 +108,15 @@ export function openReviewSession({document:initial,folder=null,sidecar=null,sto
         writeQueue=writeQueue.then(work,work);return writeQueue;
     };
     session.record=attempt=>{session.document=recordReviewAttempt(session.document,attempt);notify(session);return session.save();};
-    session.import=async value=>{
+    session.importMany=async values=>{
         await session.ready;
-        session.document=mergeReviewDocuments(session.document,validateReviewDocument(value,initial));notify(session);
+        // Validate the whole selection before changing memory or disk.
+        const documents=values.map(value=>validateReviewDocument(value,initial));
+        session.document=documents.reduce((doc,value)=>mergeReviewDocuments(doc,value),session.document);notify(session);
         // A malformed existing disk file remains protected even after import.
         await session.save();
     };
+    session.import=value=>session.importMany([value]);
     session.mark=(id,mastered)=>{
         session.document={...session.document,entries:session.document.entries.map(e=>e.id===id?{...e,mastered,updatedAt:nextReviewTime(session.document)}:e)};
         notify(session);return session.save();
