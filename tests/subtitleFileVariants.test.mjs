@@ -85,6 +85,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             currentTrackIndexRef: { current: 0 }, playlistRef: { current: [track] },
             currentRepeatRef: { current: 0 }, isWaitingShadowRef: { current: false }, setIsWaitingShadow() {},
             setPlaylist: list => { c.playlistRef.current = list; }, cancelWorkerTimer() {},
+            activeReviewRef: {current:null},setReviewSession() {},beginSubtitleReview() {},
             setRawSubtitles() {}, setSubtitles: subs => updates.push(subs), setCurrentIndex: index => { c.index = index; },
             setMediaError: value => { c.error = value; }, setSeekNotice() {}, setTrackLanguage() {},
             setMediaSrc: src => mediaChanges.push(src), recordPCloudDebug() {},

@@ -150,6 +150,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             cancelWorkerTimer() {}, setIsPlaying() {}, setMediaError() {}, setSeekNotice() {}, setMediaSeekMode() {}, setMediaIndexStorage() {}, mediaIndexExportRef: { current: null },
             setWatchedSegments() {}, setCurrentTime() {}, setCurrentTrackIndex() {},
             setMediaSrc: src => sources.push(src), recordPCloudDebug() {},
+            activeReviewRef: {current:null},setReviewSession() {},beginSubtitleReview() {},
             setRawSubtitles: subs => { if (subs.length) captions.push(subs); }, setSubtitles() {}, setCurrentIndex() {},
             setTrackLanguage() {}, detectTrackLanguageGlobal: () => 'en-US', isSmartMode: false,
             setIsWaitingShadow() {}, parseLRC: text => [text], parseSRT: text => [text],

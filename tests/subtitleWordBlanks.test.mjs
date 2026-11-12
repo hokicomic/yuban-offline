@@ -290,25 +290,41 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const compiled = await build({ stdin: { contents: source + '\nexport { SubtitlePractice };', loader: 'jsx', resolveDir: root },
         bundle: true, platform: 'node', format: 'cjs', external: ['react'], write: false, logLevel: 'silent' });
     const setup = () => {
-        let cursor = 0, effects = []; const slots = [];
+        let cursor = 0, effects = []; const slots = []; const listeners=new Map();
+        const eventTarget={addEventListener:(name,fn)=>listeners.set(name,fn),removeEventListener:name=>listeners.delete(name)};
         const memo = (fn, deps) => { const at = cursor++; if (!slots[at] || (!deps || deps.some((dep, i) => !Object.is(dep, slots[at].deps?.[i])))) slots[at] = { deps, value: fn() }; return slots[at].value; };
         const runtime = { ...React, useMemo: memo, useRef: value => { const at = cursor++; return slots[at] ||= { current: value }; },
             useState: initial => { const at = cursor++; if (!(at in slots)) slots[at] = initial; return [slots[at], value => { slots[at] = typeof value === 'function' ? value(slots[at]) : value; }]; },
             useLayoutEffect: (fn, deps) => memo(() => { effects.push(fn); }, deps),
             useEffect: (fn, deps) => memo(() => { effects.push(fn); }, deps), useCallback: (fn,deps) => memo(()=>fn,deps) };
         const module = { exports: {} };
-        vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require: name => name === 'react' ? runtime : require(name), console, setTimeout, clearTimeout });
-        return props => {
+        vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require: name => name === 'react' ? runtime : require(name), console, setTimeout, clearTimeout,window:eventTarget,document:{...eventTarget,visibilityState:'visible'} });
+        const render = props => {
             cursor = 0; effects = [];
             const nodes = flatten(module.exports.SubtitlePractice.type(props));
             for (const node of nodes) if (node.props?.['aria-label'] === '完整字幕文字' && node.props.ref) node.props.ref.current = { textContent: '' };
             effects.forEach(fn => fn()); return nodes;
         };
+        render.flush=()=>listeners.get('yuban-review-flush')?.();
+        return render;
     };
     const base = () => ({ subtitle: { text: "Hello, don't stop!" }, text: "Hello, don't stop!", language: 'en-US', blankMode: true,
         fontSize: 24, textRef: { current: null }, editsRef: { current: new WeakMap() } });
     const fields = nodes => nodes.filter(node => node.type === 'input');
     const type = (field, value) => field.props.onChange({ target: { value }, nativeEvent: {} });
+    test('review captures reveal/unfinished phrase answers without counting typing drafts or mutating time: ' + file, () => {
+        const render=setup(),records=[],props={...base(),autoFocusEnabled:false,reviewContext:{},onReviewRecord:(session,value)=>records.push(value),
+            subtitle:{text:'ghost dude',start:5,end:8},text:'ghosted',correction:{raw:'ghost dude',text:'ghosted',changed:true,
+                edits:[{start:0,end:10,text:'ghosted',from:'ghost dude',to:'ghosted',kind:'spelling'}]}};
+        type(fields(render(props))[0],'gh');assert.equal(records.length,0,'ordinary typing cannot immediately count as wrong');
+        render.flush();assert.equal(records[0].words[0].reason,'unfinished');assert.equal(records[0].words[0].typed,'gh');
+        let input=fields(render(props))[0];type(input,'?');
+        const revealed=records.at(-1);assert.equal(revealed.words[0].typed,'gh');assert.equal(revealed.words[0].reason,'revealed-after-attempt');
+        assert.deepEqual(Array.from(revealed.words[0].accepted),['ghosted','ghost dude']);
+        assert.equal(revealed.start,5);assert.equal(revealed.end,8);assert.equal(props.subtitle.text,'ghost dude');
+        const second=setup(),empty=[];const blank={...props,reviewContext:{},onReviewRecord:(session,value)=>empty.push(value)};
+        second.flush();type(fields(second(blank))[0],'?');assert.equal(empty[0].words[0].reason,'revealed-empty');
+    });
     test('blank-mode deletion marks support inspection while drafts, completion and original choices remain correct: ' + file, () => {
         const render=setup(),raw='We agree extra today.',text='We agree today.';
         const props={...base(),subtitle:{text:raw},text,correction:{raw,text,changed:true,edits:[{start:8,end:14,text:'',from:'extra',kind:'extra'}]}};

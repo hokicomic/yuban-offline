@@ -13,6 +13,120 @@ import {
     Hand, Languages, Search, Globe, MessageCircle, Phone, PhoneOff, MicOff, Maximize2, Minimize2, FilePlus, MoveRight,
     Gauge, Clock, Trophy, Activity, Zap, Wand2, Ear, Ban, Brain, StopCircle, Trash2, Copy
 } from 'lucide-react';
+// Portable local-file review records. Playback and source captions stay immutable.
+const REVIEW_SCHEMA = 1;
+function reviewHash(value) {
+    let a=2166136261,b=5381;
+    for(const char of String(value)){const n=char.codePointAt(0);a=Math.imul(a^n,16777619);b=Math.imul(b,33)^n;}
+    return `${(a>>>0).toString(16)}-${(b>>>0).toString(16)}-${String(value).length}`;
+}
+function createReviewDocument(subtitleName,content,mediaName='') {
+    return {schemaVersion:REVIEW_SCHEMA,source:{subtitleName,subtitleHash:reviewHash(String(content).replace(/\r\n?/g,'\n')),mediaName},entries:[]};
+}
+function validateReviewDocument(value,expected) {
+    if(!value || value.schemaVersion!==REVIEW_SCHEMA || !value.source || !Array.isArray(value.entries) || value.entries.length>10000)
+        throw new Error('錯題 JSON 格式或版本不符');
+    if(value.source.subtitleName!==expected.source.subtitleName || value.source.subtitleHash!==expected.source.subtitleHash || value.source.mediaName!==expected.source.mediaName)
+        throw new Error('錯題紀錄與目前影音／字幕不符，未匯入或覆寫');
+    const validWords=words=>Array.isArray(words)&&words.every(w=>w&&typeof w.key==='string'&&typeof w.text==='string'&&typeof w.typed==='string'&&
+        ['unfinished','revealed-empty','revealed-after-attempt'].includes(w.reason)&&Array.isArray(w.accepted)&&w.accepted.every(x=>typeof x==='string'));
+    for(const e of value.entries){
+        if(!e || typeof e.id!=='string' || !Number.isFinite(e.start)||e.start<0||!Number.isFinite(e.end)||e.end<e.start||
+            typeof e.originalText!=='string'||typeof e.displayText!=='string'||typeof e.updatedAt!=='string'||!Number.isFinite(Date.parse(e.updatedAt))||typeof e.mastered!=='boolean'||!validWords(e.words)||
+            !Array.isArray(e.attempts)||e.attempts.length>10000||!e.attempts.every(a=>a&&typeof a.id==='string'&&typeof a.at==='string'&&Number.isFinite(Date.parse(a.at))&&validWords(a.words)))
+            throw new Error('錯題 JSON 內含無效紀錄，未覆寫');
+    }
+    return value;
+}
+function mergeReviewDocuments(a,b) {
+    validateReviewDocument(b,a);
+    const entries=new Map(a.entries.map(e=>[e.id,e]));
+    for(const incoming of b.entries){
+        const old=entries.get(incoming.id);
+        if(!old){entries.set(incoming.id,incoming);continue;}
+        const latest=incoming.updatedAt>=old.updatedAt?incoming:old;
+        const attempts=[...new Map([...old.attempts,...incoming.attempts].map(x=>[x.id,x])).values()].sort((x,y)=>x.at.localeCompare(y.at));
+        const words=[...new Map([...old.words,...incoming.words].map(x=>[x.key,x])).values()];
+        entries.set(incoming.id,{...latest,attempts,words});
+    }
+    return {...a,entries:[...entries.values()].sort((x,y)=>x.start-y.start||x.id.localeCompare(y.id))};
+}
+const nextReviewTime=doc=>new Date(Math.max(Date.now(),...doc.entries.map(e=>Date.parse(e.updatedAt)+1))).toISOString();
+function recordReviewAttempt(doc,attempt,now=nextReviewTime(doc)) {
+    const start=Number(attempt.start),end=Number(attempt.end);
+    if(!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<start)return doc;
+    const id=reviewHash(JSON.stringify([start,end,attempt.originalText]));
+    const old=doc.entries.find(e=>e.id===id);
+    const priorAttempt=old?.attempts.find(a=>a.id===attempt.attemptId);
+    // Repeated pagehide/cleanup flushes must not undo an explicit mastery mark.
+    if(priorAttempt && old.displayText===attempt.displayText && JSON.stringify(priorAttempt.words)===JSON.stringify(attempt.words))return doc;
+    if(!attempt.words.length&&!old)return doc;
+    if(!attempt.words.length&&!attempt.completedWithoutHints)return doc;
+    const entry={id,start,end,originalText:attempt.originalText,displayText:attempt.displayText,
+        words:attempt.words,attempts:[{id:attempt.attemptId,at:now,words:attempt.words}],
+        mastered:Boolean(attempt.completedWithoutHints),updatedAt:now};
+    return mergeReviewDocuments(doc,{...doc,entries:[entry]});
+}
+function findReviewCue(subtitles,entry) {
+    // Smart-merge settings can change: match actual original wording first,
+    // otherwise use a containing time interval. Never substitute a distant cue.
+    const exact=subtitles.findIndex(s=>s.text===entry.originalText&&Math.abs(s.start-entry.start)<.05);
+    if(exact>=0)return exact;
+    return subtitles.findIndex(s=>s.start<=entry.start+.05&&s.end>entry.start);
+}
+let writeQueue=Promise.resolve();
+function openReviewSession({document:initial,folder=null,sidecar=null,storage=null,notify=()=>{}}) {
+    const session={document:initial,filename:initial.source.subtitleName+'.review.json',folder,blocked:false,status:'載入錯題紀錄中'};
+    const key='yuban-review-v1:'+JSON.stringify(initial.source);
+    const report=message=>{session.status=message;notify(session);};
+    const cache=()=>{try{if(!storage)throw new Error();storage.setItem(key,JSON.stringify(session.document));return true;}catch(_){return false;}};
+    try{const saved=storage?.getItem(key);if(saved)session.document=mergeReviewDocuments(initial,validateReviewDocument(JSON.parse(saved),initial));}catch(_){report('本機暫存無法讀取；請匯入備份');}
+    const readDisk=async()=>JSON.parse(await (await (await folder.getFileHandle(session.filename)).getFile()).text());
+    session.ready=(async()=>{
+        try {
+            if(folder)session.document=mergeReviewDocuments(session.document,validateReviewDocument(await readDisk(),initial));
+            else if(sidecar)session.document=mergeReviewDocuments(session.document,validateReviewDocument(JSON.parse(await sidecar.text()),initial));
+        } catch(error){if(error.name!=='NotFoundError'){session.blocked=true;report('JSON 未讀入，為保護原檔已停止覆寫：'+error.message);return;}}
+        const cached=cache();
+        let writable=false;
+        try{writable=folder && (typeof folder.queryPermission!=='function' || await folder.queryPermission({mode:'readwrite'})==='granted');}catch(_){}
+        report(writable?'資料夾已授權讀寫；新增錯題將自動保存':cached?'已暫存此瀏覽器；可匯出 JSON':'僅本次記憶體；請匯出備份');
+    })();
+    session.save=()=>{
+        const cached=cache();
+        if(!folder){report(cached?'已暫存此瀏覽器；可匯出 JSON':'暫存失敗，僅本次記憶體；請匯出');return Promise.resolve();}
+        const work=async()=>{
+            await session.ready;
+            if(session.blocked)return;
+            try{
+                if(typeof folder.queryPermission==='function'&&await folder.queryPermission({mode:'readwrite'})!=='granted'){
+                    report(cached?'已暫存；資料夾僅可讀，請重新授權後按儲存':'寫入未授權且暫存失敗，請匯出');return;
+                }
+                try{session.document=mergeReviewDocuments(session.document,validateReviewDocument(await readDisk(),initial));}
+                catch(error){if(error.name!=='NotFoundError'){session.blocked=true;throw error;}}
+                const file=await folder.getFileHandle(session.filename,{create:true});
+                const writable=await file.createWritable();
+                try{await writable.write(JSON.stringify(session.document,null,2));await writable.close();}
+                catch(error){try{await writable.abort();}catch(_){}throw error;}
+                cache();report('已保存同目錄 JSON');
+            }catch(error){report('JSON 寫入失敗（保留暫存）：'+error.message);}
+        };
+        writeQueue=writeQueue.then(work,work);return writeQueue;
+    };
+    session.record=attempt=>{session.document=recordReviewAttempt(session.document,attempt);notify(session);return session.save();};
+    session.import=async value=>{
+        await session.ready;
+        session.document=mergeReviewDocuments(session.document,validateReviewDocument(value,initial));notify(session);
+        // A malformed existing disk file remains protected even after import.
+        await session.save();
+    };
+    session.mark=(id,mastered)=>{
+        session.document={...session.document,entries:session.document.entries.map(e=>e.id===id?{...e,mastered,updatedAt:nextReviewTime(session.document)}:e)};
+        notify(session);return session.save();
+    };
+    return session;
+}
+
 /* Embedded ts-fsrs (MIT), bundled from fsrsScheduler.js for single-file Canvas use.
 MIT License
 
@@ -44,7 +158,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.281 · phrase-hint-spaces";
+const APP_VERSION = "v5.282 · subtitle-mistake-review";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9341,7 +9455,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -9364,6 +9478,40 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
     const answers = cached?.text === source && cached.signature === answerSignature ? cached.answers : {};
     const progress = getSubtitlePracticeProgress(tokens, answers);
+    const reviewDraftRef=useRef(null);
+    const flushPracticeReview=draft=>{
+        if(!draft?.touched || !draft.session || !onReviewRecord)return;
+        const words=[];let offset=0;
+        for(const word of draft.tokens){
+            if(word.kind==='literal'){offset+=word.text.length;continue;}
+            const text=word.parts.map(part=>part.text).join(''),answer=draft.answers[word.index];
+            for(const part of word.parts.filter(part=>part.kind==='letters')){
+                const key=`${word.index}:${part.index}`,typed=String(answer?.values?.[part.index] || '');
+                if(answer?.composing || (answer?.revealed && !(key in draft.beforeReveal)))continue;
+                if(answer?.revealed || (typed && !isSubtitlePracticePartAccepted(part,typed))){
+                    const before=draft.beforeReveal[key] ?? typed;
+                    words.push({key,text:part.text,wordIndex:word.index,partIndex:part.index,start:offset,end:offset+text.length,
+                        typed:answer?.revealed?before:typed,accepted:getSubtitlePracticePartOptions(part),
+                        reason:answer?.revealed?(before.trim()?'revealed-after-attempt':'revealed-empty'):'unfinished'});
+                }
+            }
+            offset+=text.length;
+        }
+        const progress=getSubtitlePracticeProgress(draft.tokens,draft.answers);
+        onReviewRecord(draft.session,{attemptId:draft.id,start:draft.subtitle.start,end:draft.subtitle.end,
+            originalText:String(draft.subtitle.text || ''),displayText:draft.source,words,
+            completedWithoutHints:progress.done && progress.hints===0});
+    };
+    React.useEffect(()=>{
+        if(!subtitle || !blankMode || !reviewContext)return;
+        const draft={id:globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,subtitle,source,tokens,
+            session:reviewContext,answers:{},beforeReveal:{},touched:false};
+        reviewDraftRef.current=draft;
+        const persist=()=>flushPracticeReview(draft);
+        const hide=()=>{if(document.visibilityState==='hidden')persist();};
+        window.addEventListener('pagehide',persist);window.addEventListener('yuban-review-flush',persist);document.addEventListener('visibilitychange',hide);
+        return ()=>{persist();window.removeEventListener('pagehide',persist);window.removeEventListener('yuban-review-flush',persist);document.removeEventListener('visibilitychange',hide);if(reviewDraftRef.current===draft)reviewDraftRef.current=null;};
+    },[subtitle,source,answerSignature,blankMode,reviewContext]);
     React.useLayoutEffect(() => { composingBlankRef.current = null; lastBlankTapRef.current = null; handledTouchDoubleRef.current = null; }, [subtitle, source, answerSignature]);
     React.useLayoutEffect(() => {
         if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
@@ -9395,6 +9543,16 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const previous = latest?.text === source && latest.signature === answerSignature ? latest.answers : {};
         const next = { ...previous, [word.index]: updateSubtitlePracticeAnswer(word, previous[word.index], part.index, value, composing) };
         answerCache.current.set(subtitle, { text: source, signature: answerSignature, answers: next });
+        const draft=reviewDraftRef.current;
+        if(draft && !composing){
+            draft.touched=true;draft.answers=next;
+            if(next[word.index].revealed && !previous[word.index]?.revealed){
+                for(const piece of word.parts.filter(piece=>piece.kind==='letters'))
+                    draft.beforeReveal[`${word.index}:${piece.index}`]=String(previous[word.index]?.values?.[piece.index] || (piece.index===part.index?value.replace(/[?？]/gu,''):''));
+                flushPracticeReview(draft);
+            } else if(getSubtitlePracticeProgress(tokens,next).done)flushPracticeReview(draft);
+        }
+
         advanceFocusRef.current = !composing && (next[word.index].revealed || isSubtitlePracticePartAccepted(part, next[word.index].values[part.index])) ? `${word.index}:${part.index}` : null;
         refreshAnswers(revision => revision + 1);
     };
@@ -9418,6 +9576,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         event.preventDefault();
         // Enter moves through blanks; Space is reserved for listening.
         if (!event.currentTarget.value) return;
+        flushPracticeReview(reviewDraftRef.current);
         const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
         findSubtitlePracticeBlank(fields)?.focus();
     };
@@ -10612,6 +10771,26 @@ export default function App() {
     const echoSessionTokenRef = useRef(0);
     const folderInputRef = useRef(null);
     const openedFolderHandleRef = useRef(null);
+    const [reviewSession,setReviewSession]=useState(null);
+    const activeReviewRef=useRef(null);
+    const [,refreshReview]=useState(0);
+    const [showReview,setShowReview]=useState(false);
+    const [reviewOnlyPending,setReviewOnlyPending]=useState(true);
+    const [reviewPracticeKey,setReviewPracticeKey]=useState(0);
+    const [reviewNotice,setReviewNotice]=useState('');
+    const [folderPermissionNotice,setFolderPermissionNotice]=useState('');
+    const onReviewRecord=useCallback((session,attempt)=>{session?.record(attempt);},[]);
+    const beginSubtitleReview=(track,content)=>{
+        let storage=null;try{storage=window.localStorage;}catch(_){}
+        const folder=track.subFile.isRemotePCloud?null:(mp3SourceFolderHandles.get(track.subFile) || openedFolderHandleRef.current);
+        const filename=track.subFile.name+'.review.json';
+        const session=openReviewSession({document:createReviewDocument(track.subFile.name,content,track.name),folder,
+            sidecar:selectedFolderFilesRef.current[filename.toLowerCase()],storage,
+            notify:value=>{if(activeReviewRef.current===value)refreshReview(n=>n+1);}});
+        activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');
+        void session.ready.then(()=>{if(activeReviewRef.current===session)refreshReview(n=>n+1);if(session.document.entries.length&&!session.blocked)void session.save();});
+    };
+
     const selectedFolderSessionRef = useRef(null);
     const handledFolderReferenceRef = useRef(null);
     const folderReferenceLoaderRef = useRef(null);
@@ -12157,6 +12336,7 @@ export default function App() {
 
     const handleFolderSelect = (e) => {
         const files = Array.from(e.target.files);
+        setFolderPermissionNotice('此選檔方式無寫入權限；錯題暫存，可匯出／匯入');
         if (files.length > 0) {
             applySelectedFolderFiles(files, {
                 folderHandle: null,
@@ -12170,6 +12350,9 @@ export default function App() {
         if (typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function') {
             try {
                 const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                let permission=typeof dirHandle.queryPermission==='function'?await dirHandle.queryPermission({mode:'readwrite'}):'granted';
+                if(permission==='prompt' && typeof dirHandle.requestPermission==='function')permission=await dirHandle.requestPermission({mode:'readwrite'});
+                setFolderPermissionNotice(permission==='granted'?'資料夾已授權讀寫；錯題可保存同目錄':'資料夾僅可讀；錯題將暫存，可匯出');
                 const files = await collectFilesFromDirectoryHandle(dirHandle);
                 if (!files || files.length === 0) {
                     alert("資料夾內找不到可用媒體檔。");
@@ -12204,6 +12387,7 @@ export default function App() {
     };
 
     const loadTrackSubtitles = (track, loadToken, keepPosition = false) => {
+        activeReviewRef.current=null;setReviewSession(null);
         const subtitleToken = (trackLoadRef.current.subtitleToken || 0) + 1;
         trackLoadRef.current.subtitleToken = subtitleToken;
         const isCurrent = () => loadToken === trackLoadRef.current.token && subtitleToken === trackLoadRef.current.subtitleToken;
@@ -12214,6 +12398,7 @@ export default function App() {
         if (track.subFile) {
             const applySubtitleContent = (content) => {
                 if (!isCurrent()) return;
+                beginSubtitleReview(track,content);
                 let parsed = [];
                 if (track.subFile.name.toLowerCase().endsWith('.lrc')) parsed = parseLRC(content);
                 else parsed = parseSRT(content);
@@ -23247,12 +23432,55 @@ ${userQ}`;
                                             className="rounded-full border border-slate-200 px-2 py-0.5">{currentSubtitlePresentation?.acceptedReviewCount > 0 ? '撤銷確認' : '撤銷補字'}</button>}
                                     </div>
                                 )}
-                                <SubtitlePractice subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                <SubtitlePractice key={reviewPracticeKey} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
                                     textRef={subtitleTextRef}
                                     autoFocusEnabled={!showModal && !showSettings && !showPCloudBrowser && !isSurvivalMode} />
+
+                            <div className="px-2 py-1 text-xs border-t border-slate-100" onClick={event=>event.stopPropagation()} data-subtitle-review-panel>
+                                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                    <button type="button" disabled={!reviewSession} onClick={()=>setShowReview(value=>!value)} className="text-blue-700 disabled:opacity-40">錯題複習（{reviewSession?.document.entries.filter(e=>!e.mastered).length || 0}）</button>
+                                    <span role="status" className="text-slate-500">{reviewNotice || reviewSession?.status || folderPermissionNotice || '載入字幕後可記錄錯題'}</span>
+                                </div>
+                                {showReview && reviewSession && <div className="mt-1">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <button type="button" onClick={()=>{setReviewNotice('');window.dispatchEvent(new Event('yuban-review-flush'));void reviewSession.save();}}>儲存 JSON</button>
+                                        <button type="button" onClick={()=>{
+                                            window.dispatchEvent(new Event('yuban-review-flush'));
+                                            const blob=new Blob([JSON.stringify(reviewSession.document,null,2)],{type:'application/json'});
+                                            const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=reviewSession.filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+                                        }}>匯出 JSON</button>
+                                        <label className="cursor-pointer text-blue-700">匯入 JSON<input type="file" accept=".json,application/json" className="sr-only" onChange={async event=>{
+                                            const file=event.target.files?.[0],session=reviewSession;event.target.value='';if(!file)return;
+                                            try{if(file.size>10*1024*1024)throw new Error('JSON 超過 10 MB');await session.import(JSON.parse(await file.text()));if(activeReviewRef.current===session)setReviewNotice('已合併匯入；'+session.status);}
+                                            catch(error){if(activeReviewRef.current===session)setReviewNotice(error.message);}
+                                        }}/></label>
+                                        <button type="button" onClick={async()=>{
+                                            try{const session=reviewSession;if(!session.folder?.requestPermission){setReviewNotice('此瀏覽器請使用支援讀寫的資料夾選擇，或匯出 JSON');return;}
+                                                const granted=await session.folder.requestPermission({mode:'readwrite'});if(granted!=='granted'){setReviewNotice('未取得寫入權限，保留暫存');return;}setReviewNotice('');await session.save();}
+                                            catch(error){setReviewNotice(error.message);}
+                                        }}>重新授權</button>
+                                        <label><input type="checkbox" checked={reviewOnlyPending} onChange={event=>setReviewOnlyPending(event.target.checked)}/>只看待複習</label>
+                                    </div>
+                                    <div className="text-slate-400 break-all">{reviewSession.filename} · 揭曉即記錄；Enter／離開句子記錄已輸入但未完成的字；打字途中不判錯。</div>
+                                    <div className="max-h-40 overflow-y-auto mt-1">
+                                        {reviewSession.document.entries.filter(e=>!reviewOnlyPending||!e.mastered).map(entry=><div key={entry.id} className="border-t py-1 flex flex-wrap gap-x-2 gap-y-1 items-baseline">
+                                            <button type="button" className="text-blue-700" onClick={()=>{
+                                                const index=findReviewCue(subtitles,entry);if(index<0){setReviewNotice('目前字幕設定找不到此時間，請確認字幕／合句設定');return;}
+                                                setReviewNotice('');setIsSubtitleBlankMode(true);setReviewPracticeKey(n=>n+1);jumpToSubtitle(index);
+                                            }}>{formatTime(entry.start)} 複習</button>
+                                            <span>{entry.words.map(word=>word.accepted.join('／')).join('、')}</span>
+                                            <span className="text-slate-500">{entry.attempts.length} 次 · {entry.mastered?'已掌握':'待複習'}</span>
+                                            <button type="button" onClick={()=>{setReviewNotice('');void reviewSession.mark(entry.id,!entry.mastered);}}>{entry.mastered?'改待複習':'標為已掌握'}</button>
+                                            <details className="w-full"><summary>{entry.originalText}</summary><p>當時顯示：{entry.displayText}</p>{entry.words.map(word=><p key={word.key}>{word.text}：{word.reason==='unfinished'?'未完成':word.reason==='revealed-empty'?'未答揭曉':'輸入後揭曉'}；輸入：{word.typed || '（空白）'}</p>)}</details>
+                                        </div>)}
+                                        {!reviewSession.document.entries.some(e=>!reviewOnlyPending||!e.mastered)&&<p>尚無符合條件的錯題。複習會重新提供空白作答。</p>}
+                                    </div>
+                                </div>}
+                            </div>
+
                             </div>
 
                             {/* SHADOWING PROGRESS BAR */}
