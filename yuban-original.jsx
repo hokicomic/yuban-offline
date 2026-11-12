@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.284 · merged-review-cleanup";
+const APP_VERSION = "v5.285 · selected-review-highlight";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10667,6 +10667,7 @@ export default function GeminiPlayer() {
     const [showReview,setShowReview]=useState(false);
     const [reviewOnlyPending,setReviewOnlyPending]=useState(true);
     const [reviewRevealKey,setReviewRevealKey]=useState(0);
+    const [selectedReviewId,setSelectedReviewId]=useState(null);
     const [reviewImportedFiles,setReviewImportedFiles]=useState([]);
     const [reviewPracticeKey,setReviewPracticeKey]=useState(0);
     const [reviewNotice,setReviewNotice]=useState('');
@@ -10679,7 +10680,7 @@ export default function GeminiPlayer() {
         const session=openReviewSession({document:createReviewDocument(track.subFile.name,content,track.name),folder,
             sidecar:selectedFolderFilesRef.current[filename.toLowerCase()],storage,
             notify:value=>{if(activeReviewRef.current===value)refreshReview(n=>n+1);}});
-        activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');setReviewImportedFiles([]);
+        activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');setReviewImportedFiles([]);setSelectedReviewId(null);
         void session.ready.then(()=>{if(activeReviewRef.current===session)refreshReview(n=>n+1);if(session.document.entries.length&&!session.blocked)void session.save();});
     };
 
@@ -23376,11 +23377,12 @@ ${userQ}`;
                                     </div>
                                     <div className="text-slate-400 break-all">{reviewSession.filename} · 揭曉即記錄；Enter／離開句子記錄已輸入但未完成的字；打字途中不判錯。</div>
                                     <div className="max-h-40 overflow-y-auto mt-1">
-                                        {reviewSession.document.entries.filter(e=>!reviewOnlyPending||!e.mastered).map(entry=><div key={`${entry.id}:${reviewRevealKey}`} className="border-t py-1 flex flex-wrap gap-x-2 gap-y-1 items-baseline">
-                                            <button type="button" className="text-blue-700" onClick={()=>{
+                                        {reviewSession.document.entries.filter(e=>!reviewOnlyPending||!e.mastered).map(entry=><div key={`${entry.id}:${reviewRevealKey}`} data-review-selected={selectedReviewId===entry.id || undefined} className={`border-t border-l-4 px-2 py-1 flex flex-wrap gap-x-2 gap-y-1 items-baseline ${selectedReviewId===entry.id?'border-l-blue-500 bg-blue-50':'border-l-transparent'}`}>
+                                            <button type="button" className="text-blue-700" aria-current={selectedReviewId===entry.id?'true':undefined} onClick={()=>{
                                                 const index=findReviewCue(subtitles,entry);if(index<0){setReviewNotice('目前字幕設定找不到此時間，請確認字幕／合句設定');return;}
-                                                setReviewNotice('');setReviewRevealKey(n=>n+1);setIsSubtitleBlankMode(true);setReviewPracticeKey(n=>n+1);jumpToSubtitle(index);
+                                                setSelectedReviewId(entry.id);setReviewNotice('');setReviewRevealKey(n=>n+1);setIsSubtitleBlankMode(true);setReviewPracticeKey(n=>n+1);jumpToSubtitle(index);
                                             }}>{formatTime(entry.start)} 複習</button>
+                                            {selectedReviewId===entry.id && <span className="text-blue-700 font-semibold">目前複習</span>}
                                             <span className="inline-flex flex-wrap gap-1">{entry.words.map((word,index)=><SubtitleReviewWord key={word.key} word={word} number={index+1}/>)}</span>
                                             <span className="text-slate-500">{entry.attempts.length} 次 · {entry.mastered?'已掌握':'待複習'}</span>
                                             <button type="button" onClick={()=>{setReviewNotice('');void reviewSession.mark(entry.id,!entry.mastered);}}>{entry.mastered?'改待複習':'標為已掌握'}</button>
