@@ -494,6 +494,21 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         field.value = 'Hello'; await input.props.onDoubleClick(event()); render(props);
         assert.equal(copied, 0, 'synthetic double-click must not copy the just-revealed answer');
     });
+    test('phrase hints preserve word spaces before and after typing the separator: ' + file, () => {
+        for(const value of ['ghost','ghost d']) {
+            const render=setup(),props={...base(),subtitle:{text:'ghost dude'},text:'ghosted',
+                correction:{raw:'ghost dude',text:'ghosted',changed:true,
+                    edits:[{start:0,end:10,text:'ghosted',from:'ghost dude',to:'ghosted',kind:'spelling'}]}};
+            type(fields(render(props))[0],value);
+            const nodes=render(props),guide=nodes.find(node=>node.props?.['data-subtitle-alternative-guide']);
+            const rows=guide.props.children.map(row=>flatten(row).filter(node=>node.props?.['data-subtitle-letter-slot']!==undefined));
+            assert.equal(rows[1][5].props.children,' ','word separator must never become an underscore');
+            assert.equal(rows[1][5].props.style.whiteSpace,'pre','the browser must preserve the visible gap');
+            assert.equal(rows[1].map(slot=>slot.props.children).join(''),value==='ghost'?'ghost ____':'ghost d___');
+            assert.equal(rows[0].map(slot=>slot.props.children).join(''),value==='ghost'?'ghost__':'ghost_d');
+            assert.equal(fields(nodes)[0].props.value,value,'hint rendering cannot change the draft');
+        }
+    });
     test('position guide preserves editable draft while showing missing slots, and loading has no copy notice: ' + file, () => {
         const render = setup();
         assert.equal(fields(render({ ...base(), subtitle: undefined, text: 'Load File...' })).length, 0);

@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.280 · whole-phrase-alternatives";
+const APP_VERSION = "v5.281 · phrase-hint-spaces";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9476,7 +9476,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const showGuide = Boolean(value) && !answer?.revealed && !correct && !answer?.composing;
         const alignment = showGuide ? getSubtitlePracticeDualAlignment(part, value) : null;
         const runs = alignment?.runs || [];
-        const guide = alignment?.slots.map(slot => slot.matched ? slot.text : '_').join(' ') || '';
+        const guide = alignment?.slots.map(slot => (slot.matched || /^\s+$/u.test(slot.text)) ? slot.text : '_').join(' ') || '';
         const hasHints = runs.some(run => run.matched);
         return (
             <span key={key} className="relative inline-block align-baseline max-w-full" data-subtitle-corrected-blank={token.corrected || undefined} style={{ paddingBottom: (answer?.revealed || correct) && token.corrected ? '1.5em' : showGuide ? (part.accepted?.length > 1 ? '1.9em' : '0.95em') : undefined }}>
@@ -9535,7 +9535,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                         {(alignment.alternatives || [{alignment}]).map((choice,variantIndex) => <span key={variantIndex} className="block">
                             {choice.alignment.slots.map((slot, index) => <span key={index} aria-hidden="true"
                                 data-subtitle-letter-slot={index} data-subtitle-letter-matched={slot.matched}
-                                style={{ display: 'inline-block', width: '1ch', marginInline: '0.06ch', textAlign: 'center', color: slot.matched ? '#2f7d57' : '#64748b' }}>{slot.matched ? slot.text : '_'}</span>)}
+                                style={{ display: 'inline-block', width: '1ch', marginInline: '0.06ch', whiteSpace: 'pre', textAlign: 'center', color: slot.matched ? '#2f7d57' : '#64748b' }}>{(slot.matched || /^\s+$/u.test(slot.text)) ? slot.text : '_'}</span>)}
                         </span>)}
                     </span>
                 )}
