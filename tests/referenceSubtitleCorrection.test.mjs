@@ -89,6 +89,30 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const unrelated=resolver(frequent+'\nSomeone urged as the woods were quiet before a storm started elsewhere.').resolve({text:raw});
         assert.ok(!unrelated.aligned,'an anchor phrase alone cannot approve a different whole sentence');
     });
+    test('unequal sound-alike phrases stay one dual-answer blank without deletion markers: ' + file, () => {
+        const sentence='It is hurtful when you could instead directly say goodbye to the ghost dude, live and let live.';
+        for(const [raw,ref,from,to] of [
+            [sentence,sentence.replace('ghost dude','ghosted'),'ghost dude','ghosted'],
+            [sentence.replace('ghost dude','ghosted'),sentence,'ghosted','ghost dude']
+        ]) {
+            const cue={text:raw,start:120,end:130};
+            const result=resolver(ref).resolve(cue);
+            assert.equal(result.aligned,true);
+            assert.equal(result.reviewDifferences.length,1);
+            assert.equal(result.reviewDifferences[0].edit.from,from);
+            assert.equal(result.reviewDifferences[0].edit.to,to);
+            const projected=api.applySubtitleReferencePreference(result);
+            assert.equal(projected.text,ref);
+            assert.equal(projected.edits.length,1);
+            assert.ok(!projected.edits.some(edit=>edit.kind==='extra'));
+            const changed=api.buildSubtitlePracticeDualTokens(projected.text,'en-US',null,projected).filter(token=>token.corrected);
+            assert.equal(changed.length,1);
+            assert.deepEqual(Array.from(changed[0].parts[0].accepted),[to,from]);
+            assert.equal(cue.text,raw);assert.equal(cue.start,120);assert.equal(cue.end,130);
+        }
+        const isolated=resolver('ghosted').resolve({text:'ghost dude'});
+        assert.ok(!isolated.aligned,'sound signatures without sentence anchors cannot locate a phrase');
+    });
     test('hyphenated and joined compounds retain caption spelling and never create false deletion/replacement blanks: ' + file, () => {
         const raw='Will wanted nothing so much as to ride hell-bent for the safety of the wall, but that was not a feeling to share with your commander, especially not a commander like this one.';
         const ref=raw.replace('hell-bent','hellbent').replace(', especially','.\nEspecially');

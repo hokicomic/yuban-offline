@@ -44,7 +44,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.279 · longer-contained-answers";
+const APP_VERSION = "v5.280 · whole-phrase-alternatives";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6938,19 +6938,23 @@ const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts) => {
         while(x<a.length&&y<b.length){if(a[x]===b[y]){x++;y++;continue;}if(++changes>1)return false;if(a.length>=b.length)x++;if(b.length>=a.length)y++;}
         return changes+(x<a.length||y<b.length?1:0)<=1;
     };
-    for(const count of [2,3]) {
-        const raw=words.slice(i,i+count), refs=tokens.slice(j,j+count);
-        if(raw.length!==count||refs.length!==count||refs.some(r=>r.sourceLine!==ref.sourceLine))continue;
+    // Unequal ASR word boundaries must be one reviewable phrase, not a
+    // deletion plus an unrelated replacement. Require identical sound signatures
+    // for unequal counts, and keep exact surrounding anchors.
+    for(const [rawCount,refCount] of [[2,2],[3,3],[2,1],[1,2],[3,1],[1,3],[2,3],[3,2]]) {
+        const raw=words.slice(i,i+rawCount), refs=tokens.slice(j,j+refCount);
+        if(raw.length!==rawCount||refs.length!==refCount||refs.some(r=>r.sourceLine!==ref.sourceLine))continue;
         if(raw[0].key===refs[0].key || raw.at(-1).key===refs.at(-1).key)continue;
         if([...raw,...refs].some(w=>w.numeric||SUBTITLE_REFERENCE_PROTECTED_WORDS.has(w.key)))continue;
         const a=raw.map(w=>w.key).join(''),b=refs.map(w=>w.key).join('');
         if(a===b||Math.min(a.length,b.length)<6)continue;
         const sa=signature(a),sb=signature(b);
         if(Math.min(sa.length,sb.length)<3||sa[0]!==sb[0]||!oneEdit(sa,sb))continue;
+        if(rawCount!==refCount && (sa!==sb || Math.abs(a.length-b.length)>3))continue;
         let left=0,right=0;
         while(left<4&&words[i-left-1]?.key===tokens[j-left-1]?.key&&words[i-left-1])left++;
-        while(right<3&&words[i+count+right]?.key===tokens[j+count+right]?.key&&words[i+count+right])right++;
-        if((left>=2&&right>=2)||(left>=4&&right>=1)||(i===0&&words.length>=14&&right>=1))return {rawCount:count,refCount:count,equivalent:false};
+        while(right<3&&words[i+rawCount+right]?.key===tokens[j+refCount+right]?.key&&words[i+rawCount+right])right++;
+        if((left>=2&&right>=2)||(left>=4&&right>=1)||(i===0&&words.length>=14&&right>=1))return {rawCount,refCount,equivalent:false};
     }
     return null;
 };
