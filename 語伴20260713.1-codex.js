@@ -117,7 +117,7 @@ function openReviewSession({document:initial,folder=null,sidecar=null,storage=nu
                 const writable=await file.createWritable();
                 try{await writable.write(JSON.stringify(session.document,null,2));await writable.close();}
                 catch(error){try{await writable.abort();}catch(_){}throw error;}
-                cache();report('已保存同目錄 JSON');
+                cache();report('已保存同目錄 JSON');return true;
             }catch(error){report('JSON 寫入失敗（保留暫存）：'+error.message);}
         };
         writeQueue=writeQueue.then(work,work);return writeQueue;
@@ -132,6 +132,43 @@ function openReviewSession({document:initial,folder=null,sidecar=null,storage=nu
         await session.save();
     };
     session.import=value=>session.importMany([value]);
+    session.planCleanup=async files=>{
+        if(!folder?.removeEntry)throw new Error('目前沒有目錄刪除權限，請在檔案管理器手動清理');
+        if(await session.save()!==true)throw new Error('合併版尚未成功寫入，不能刪除舊檔');
+        const canonical=await (await (await folder.getFileHandle(session.filename)).getFile()).text();
+        const saved=validateReviewDocument(JSON.parse(canonical),initial),items=[],skipped=[];
+        for(const file of files){
+            if(file.name.toLowerCase()===session.filename.toLowerCase())continue;
+            if(!/\.json$/i.test(file.name)||/[\\/]/u.test(file.name)){skipped.push(file.name);continue;}
+            try{
+                const text=await file.text(),value=validateReviewDocument(JSON.parse(text.replace(/^\uFEFF/u,'')),initial);
+                if(JSON.stringify(mergeReviewDocuments(saved,value))!==JSON.stringify(saved))throw new Error('尚未完整合併');
+                const actual=await (await (await folder.getFileHandle(file.name)).getFile()).text();
+                if(actual!==text)throw new Error('內容已變更或不在本目錄');
+                if(!items.some(item=>item.name===file.name))items.push({name:file.name,text});
+            }catch(_){skipped.push(file.name);}
+        }
+        return {canonical,items,skipped};
+    };
+    session.cleanup=plan=>{
+        const work=async()=>{
+            let deleted=0;const skipped=[...plan.skipped];
+            for(const item of plan.items){
+                try{
+                    if(item.name.toLowerCase()===session.filename.toLowerCase()||/[\\/]/u.test(item.name)||!/\.json$/i.test(item.name))throw new Error('保留');
+                    if(typeof folder.queryPermission==='function'&&await folder.queryPermission({mode:'readwrite'})!=='granted')throw new Error('權限失效');
+                    const canonical=await (await (await folder.getFileHandle(session.filename)).getFile()).text();
+                    if(canonical!==plan.canonical)throw new Error('合併版已變更，請重新清理');
+                    const actual=await (await (await folder.getFileHandle(item.name)).getFile()).text();
+                    if(actual!==item.text)throw new Error('舊檔已變更');
+                    await folder.removeEntry(item.name);deleted++;
+                }catch(_){skipped.push(item.name);}
+            }
+            report(`已清理 ${deleted} 份舊 JSON；保留正式紀錄${skipped.length?`，${skipped.length} 份未刪除`:''}`);
+            return {deleted,skipped};
+        };
+        const result=writeQueue.then(work,work);writeQueue=result.catch(()=>{});return result;
+    };
     session.mark=(id,mastered)=>{
         session.document={...session.document,entries:session.document.entries.map(e=>e.id===id?{...e,mastered,updatedAt:nextReviewTime(session.document)}:e)};
         notify(session);return session.save();
@@ -170,7 +207,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.283 · masked-review-merge";
+const APP_VERSION = "v5.284 · merged-review-cleanup";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10804,6 +10841,7 @@ export default function App() {
     const [showReview,setShowReview]=useState(false);
     const [reviewOnlyPending,setReviewOnlyPending]=useState(true);
     const [reviewRevealKey,setReviewRevealKey]=useState(0);
+    const [reviewImportedFiles,setReviewImportedFiles]=useState([]);
     const [reviewPracticeKey,setReviewPracticeKey]=useState(0);
     const [reviewNotice,setReviewNotice]=useState('');
     const [folderPermissionNotice,setFolderPermissionNotice]=useState('');
@@ -10815,7 +10853,7 @@ export default function App() {
         const session=openReviewSession({document:createReviewDocument(track.subFile.name,content,track.name),folder,
             sidecar:selectedFolderFilesRef.current[filename.toLowerCase()],storage,
             notify:value=>{if(activeReviewRef.current===value)refreshReview(n=>n+1);}});
-        activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');
+        activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');setReviewImportedFiles([]);
         void session.ready.then(()=>{if(activeReviewRef.current===session)refreshReview(n=>n+1);if(session.document.entries.length&&!session.blocked)void session.save();});
     };
 
@@ -23486,7 +23524,7 @@ ${userQ}`;
                                                 if(files.length>50 || files.reduce((total,file)=>total+file.size,0)>25*1024*1024)throw new Error('請每批選擇最多 50 份、合計 25 MB 以內的 JSON');
                                                 const values=await Promise.all(files.map(async file=>{try{return JSON.parse((await file.text()).replace(/^\uFEFF/u,''));}catch(_){throw new Error(`${file.name}：不是有效 JSON，本批未匯入`);}}));
                                                 await session.importMany(values);
-                                                if(activeReviewRef.current===session){setReviewRevealKey(n=>n+1);setReviewNotice(`已合併 ${files.length} 份 JSON，重複紀錄不重算；${session.status}`);}
+                                                if(activeReviewRef.current===session){setReviewImportedFiles(previous=>[...new Map([...previous,...files].map(file=>[file.name,file])).values()]);setReviewRevealKey(n=>n+1);setReviewNotice(`已合併 ${files.length} 份 JSON，重複紀錄不重算；${session.status}`);}
                                             }catch(error){if(activeReviewRef.current===session)setReviewNotice(error.message);}
                                         }}/></label>
                                         <button type="button" onClick={async()=>{
@@ -23494,6 +23532,18 @@ ${userQ}`;
                                                 const granted=await session.folder.requestPermission({mode:'readwrite'});if(granted!=='granted'){setReviewNotice('未取得寫入權限，保留暫存');return;}setReviewNotice('');await session.save();}
                                             catch(error){setReviewNotice(error.message);}
                                         }}>重新授權</button>
+                                        <button type="button" disabled={!reviewImportedFiles.length} onClick={async()=>{
+                                            const session=reviewSession;
+                                            try{
+                                                window.dispatchEvent(new Event('yuban-review-flush'));
+                                                const plan=await session.planCleanup(reviewImportedFiles);
+                                                if(activeReviewRef.current!==session)return;
+                                                if(!plan.items.length){setReviewNotice('沒有可安全刪除的舊檔；正式 JSON 保留，其他檔案請手動清理');return;}
+                                                if(!window.confirm(`合併版已保存並讀回驗證。永久刪除以下 ${plan.items.length} 份舊 JSON？刪除後無法由語伴復原。\n${plan.items.map(item=>item.name).join('\n')}\n保留：${session.filename}`))return;
+                                                const result=await session.cleanup(plan);
+                                                if(activeReviewRef.current===session){setReviewImportedFiles(previous=>previous.filter(file=>result.skipped.includes(file.name)));setReviewNotice(session.status);}
+                                            }catch(error){if(activeReviewRef.current===session)setReviewNotice(error.message);}
+                                        }}>清理已合併舊檔</button>
                                         <label><input type="checkbox" checked={reviewOnlyPending} onChange={event=>setReviewOnlyPending(event.target.checked)}/>只看待複習</label>
                                     </div>
                                     <div className="text-slate-400 break-all">{reviewSession.filename} · 揭曉即記錄；Enter／離開句子記錄已輸入但未完成的字；打字途中不判錯。</div>

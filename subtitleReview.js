@@ -102,7 +102,7 @@ export function openReviewSession({document:initial,folder=null,sidecar=null,sto
                 const writable=await file.createWritable();
                 try{await writable.write(JSON.stringify(session.document,null,2));await writable.close();}
                 catch(error){try{await writable.abort();}catch(_){}throw error;}
-                cache();report('已保存同目錄 JSON');
+                cache();report('已保存同目錄 JSON');return true;
             }catch(error){report('JSON 寫入失敗（保留暫存）：'+error.message);}
         };
         writeQueue=writeQueue.then(work,work);return writeQueue;
@@ -117,6 +117,43 @@ export function openReviewSession({document:initial,folder=null,sidecar=null,sto
         await session.save();
     };
     session.import=value=>session.importMany([value]);
+    session.planCleanup=async files=>{
+        if(!folder?.removeEntry)throw new Error('目前沒有目錄刪除權限，請在檔案管理器手動清理');
+        if(await session.save()!==true)throw new Error('合併版尚未成功寫入，不能刪除舊檔');
+        const canonical=await (await (await folder.getFileHandle(session.filename)).getFile()).text();
+        const saved=validateReviewDocument(JSON.parse(canonical),initial),items=[],skipped=[];
+        for(const file of files){
+            if(file.name.toLowerCase()===session.filename.toLowerCase())continue;
+            if(!/\.json$/i.test(file.name)||/[\\/]/u.test(file.name)){skipped.push(file.name);continue;}
+            try{
+                const text=await file.text(),value=validateReviewDocument(JSON.parse(text.replace(/^\uFEFF/u,'')),initial);
+                if(JSON.stringify(mergeReviewDocuments(saved,value))!==JSON.stringify(saved))throw new Error('尚未完整合併');
+                const actual=await (await (await folder.getFileHandle(file.name)).getFile()).text();
+                if(actual!==text)throw new Error('內容已變更或不在本目錄');
+                if(!items.some(item=>item.name===file.name))items.push({name:file.name,text});
+            }catch(_){skipped.push(file.name);}
+        }
+        return {canonical,items,skipped};
+    };
+    session.cleanup=plan=>{
+        const work=async()=>{
+            let deleted=0;const skipped=[...plan.skipped];
+            for(const item of plan.items){
+                try{
+                    if(item.name.toLowerCase()===session.filename.toLowerCase()||/[\\/]/u.test(item.name)||!/\.json$/i.test(item.name))throw new Error('保留');
+                    if(typeof folder.queryPermission==='function'&&await folder.queryPermission({mode:'readwrite'})!=='granted')throw new Error('權限失效');
+                    const canonical=await (await (await folder.getFileHandle(session.filename)).getFile()).text();
+                    if(canonical!==plan.canonical)throw new Error('合併版已變更，請重新清理');
+                    const actual=await (await (await folder.getFileHandle(item.name)).getFile()).text();
+                    if(actual!==item.text)throw new Error('舊檔已變更');
+                    await folder.removeEntry(item.name);deleted++;
+                }catch(_){skipped.push(item.name);}
+            }
+            report(`已清理 ${deleted} 份舊 JSON；保留正式紀錄${skipped.length?`，${skipped.length} 份未刪除`:''}`);
+            return {deleted,skipped};
+        };
+        const result=writeQueue.then(work,work);writeQueue=result.catch(()=>{});return result;
+    };
     session.mark=(id,mastered)=>{
         session.document={...session.document,entries:session.document.entries.map(e=>e.id===id?{...e,mastered,updatedAt:nextReviewTime(session.document)}:e)};
         notify(session);return session.save();

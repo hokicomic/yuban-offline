@@ -120,3 +120,46 @@ test('a mismatched file in a batch leaves current records and the original disk 
     await assert.rejects(s.importMany([recordReviewAttempt(base(),attempt('new')),createReviewDocument('different.lrc','other','other.mp3')]),/不符/);
     assert.equal(JSON.stringify(s.document),before);assert.equal(folder.content,diskBefore);
 });
+function cleanupFolder(){
+    const files=new Map(),removed=[];
+    return {files,removed,queryPermission:async()=>'granted',
+        async getFileHandle(name,{create=false}={}){
+            if(!files.has(name)&&!create)throw Object.assign(new Error('missing'),{name:'NotFoundError'});
+            return {getFile:async()=>({text:async()=>files.get(name)}),createWritable:async()=>({
+                async write(text){this.text=text;},async close(){files.set(name,this.text);},async abort(){}})};
+        },async removeEntry(name){removed.push(name);files.delete(name);}};
+}
+test('cleanup removes verified imported copies only after merged disk readback, keeping the canonical file',async()=>{
+    const folder=cleanupFolder(),doc=recordReviewAttempt(base(),attempt('phone')),text=JSON.stringify(doc);
+    folder.files.set('phone.json',text);folder.files.set('unrelated.json','{}');
+    const session=openReviewSession({document:base(),folder,storage:memory()});await session.ready;await session.import(doc);
+    const plan=await session.planCleanup([{name:'phone.json',text:async()=>text},{name:session.filename,text:async()=>text}]);
+    assert.equal(plan.items.length,1);const result=await session.cleanup(plan);
+    assert.equal(result.deleted,1);assert.deepEqual(folder.removed,['phone.json']);
+    assert.ok(folder.files.has(session.filename));assert.ok(folder.files.has('unrelated.json'));
+});
+test('cleanup skips files outside the selected directory, modified copies, and records not yet merged',async()=>{
+    const folder=cleanupFolder(),doc=recordReviewAttempt(base(),attempt('phone')),text=JSON.stringify(doc);
+    folder.files.set('changed.json','changed externally');
+    const session=openReviewSession({document:base(),folder,storage:memory()});await session.ready;await session.import(doc);
+    const extra=recordReviewAttempt(base(),attempt('new'));
+    const plan=await session.planCleanup([{name:'outside.json',text:async()=>text},{name:'changed.json',text:async()=>text},
+        {name:'unmerged.json',text:async()=>JSON.stringify(extra)}]);
+    assert.equal(plan.items.length,0);assert.equal(plan.skipped.length,3);assert.equal(folder.removed.length,0);
+});
+test('cleanup rechecks both the canonical and source contents after confirmation',async()=>{
+    for(const changed of ['phone.json','book.lrc.review.json']){
+        const folder=cleanupFolder(),doc=recordReviewAttempt(base(),attempt('phone')),text=JSON.stringify(doc);
+        folder.files.set('phone.json',text);
+        const session=openReviewSession({document:base(),folder,storage:memory()});await session.ready;await session.import(doc);
+        const plan=await session.planCleanup([{name:'phone.json',text:async()=>text}]);folder.files.set(changed,'changed after confirmation');
+        assert.equal((await session.cleanup(plan)).deleted,0);assert.equal(folder.removed.length,0);
+    }
+});
+test('cleanup is unavailable without folder access or after an unsuccessful save',async()=>{
+    const mobile=openReviewSession({document:base(),storage:memory()});await mobile.ready;
+    await assert.rejects(mobile.planCleanup([]),/手動清理/);
+    const folder=cleanupFolder();folder.queryPermission=async()=>'denied';
+    const readOnly=openReviewSession({document:base(),folder,storage:memory()});await readOnly.ready;
+    await assert.rejects(readOnly.planCleanup([]),/尚未成功寫入/);assert.equal(folder.removed.length,0);
+});
