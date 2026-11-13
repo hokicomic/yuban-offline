@@ -34,7 +34,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             const engine = api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + [previous, sentence, following].join('\n')));
             const preceding = engine.resolve(subtitles[0]);
             const seeks = [];
-            const context = {
+            const context = { reviewPlaybackRef:{current:{enabled:false}},
                 subtitles, currentIndex: 0, playbackMode: 'single',
                 playerRef: {current: {paused: false, seeking: false, ended: false}},
                 currentRepeatRef: {current: 0}, isWaitingShadowRef: {current: false}, isGapPausing: {current: false},

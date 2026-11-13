@@ -83,6 +83,42 @@ function findReviewCue(subtitles,entry) {
     if(exact>=0)return exact;
     return subtitles.findIndex(s=>s.start<=entry.start+.05&&s.end>entry.start);
 }
+function getReviewPlaybackIndices(subtitles,document) {
+    return [...new Set((document?.entries || []).filter(entry=>!entry.mastered).map(entry=>findReviewCue(subtitles,entry)).filter(index=>index>=0))].sort((a,b)=>a-b);
+}
+function stepReviewIndex(indices,current,direction=1) {
+    if(!indices.length)return -1;
+    const position=indices.indexOf(current);
+    if(position>=0)return indices[(position+direction+indices.length)%indices.length];
+    return direction<0?[...indices].reverse().find(index=>index<current)??indices.at(-1):indices.find(index=>index>current)??indices[0];
+}
+// Worker and native EOF share this gate; filtered continuous playback must
+// never fall through to the ordinary adjacent-subtitle/playlist logic.
+function tickReviewPlayback(state,ended=false) {
+    if(!state.enabled || state.echo)return false;
+    const {player,indices,currentIndex}=state;
+    if(!player)return true;
+    if(!indices.length){state.stop();return true;}
+    if(player.seeking || state.busy())return true;
+    if(!state.playing&&!ended)return true;
+    state.onTime(player.currentTime);
+    if(state.pending!=null){
+        if(currentIndex!==state.pending)return true;
+        const range=state.range(currentIndex);
+        if(player.currentTime>=range.end && !ended)return true;
+        state.pending=null;
+    }
+    let target=-1;
+    if(!indices.includes(currentIndex))target=stepReviewIndex(indices,currentIndex);
+    else {
+        const range=state.range(currentIndex);
+        if(ended || player.currentTime>=range.end-.02)
+            target=state.mode==='sentence'&&state.loop==='single'?currentIndex:stepReviewIndex(indices,currentIndex);
+        else if(player.currentTime<range.start-.1)target=currentIndex;
+    }
+    if(target>=0){state.pending=target;state.jump(target);}
+    return true;
+}
 let writeQueue=Promise.resolve();
 function openReviewSession({document:initial,folder=null,sidecar=null,storage=null,notify=()=>{}}) {
     const session={document:initial,filename:initial.source.subtitleName+'.review.json',folder,blocked:false,status:'載入錯題紀錄中'};
@@ -207,7 +243,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.285 · selected-review-highlight";
+const APP_VERSION = "v5.286 · review-only-playback";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10837,15 +10873,18 @@ export default function App() {
     const openedFolderHandleRef = useRef(null);
     const [reviewSession,setReviewSession]=useState(null);
     const activeReviewRef=useRef(null);
-    const [,refreshReview]=useState(0);
+    const [reviewRevision,refreshReview]=useState(0);
     const [showReview,setShowReview]=useState(false);
     const [reviewOnlyPending,setReviewOnlyPending]=useState(true);
     const [reviewRevealKey,setReviewRevealKey]=useState(0);
     const [selectedReviewId,setSelectedReviewId]=useState(null);
+    const [reviewOnly,setReviewOnly]=useState(false);
+    const reviewPlaybackRef=useRef({enabled:false,pending:null});
     const [reviewImportedFiles,setReviewImportedFiles]=useState([]);
     const [reviewPracticeKey,setReviewPracticeKey]=useState(0);
     const [reviewNotice,setReviewNotice]=useState('');
     const [folderPermissionNotice,setFolderPermissionNotice]=useState('');
+    const reviewIndices=useMemo(()=>getReviewPlaybackIndices(subtitles,reviewSession?.document),[subtitles,reviewSession,reviewRevision]);
     const onReviewRecord=useCallback((session,attempt)=>{session?.record(attempt);},[]);
     const beginSubtitleReview=(track,content)=>{
         let storage=null;try{storage=window.localStorage;}catch(_){}
@@ -10854,7 +10893,7 @@ export default function App() {
         const session=openReviewSession({document:createReviewDocument(track.subFile.name,content,track.name),folder,
             sidecar:selectedFolderFilesRef.current[filename.toLowerCase()],storage,
             notify:value=>{if(activeReviewRef.current===value)refreshReview(n=>n+1);}});
-        activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');setReviewImportedFiles([]);setSelectedReviewId(null);
+        reviewPlaybackRef.current.pending=null;activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');setReviewImportedFiles([]);setSelectedReviewId(null);
         void session.ready.then(()=>{if(activeReviewRef.current===session)refreshReview(n=>n+1);if(session.document.entries.length&&!session.blocked)void session.save();});
     };
 
@@ -11668,7 +11707,39 @@ export default function App() {
         if (!shouldPlay) setIsPlaying(false);
     };
 
+    Object.assign(reviewPlaybackRef.current,{
+        enabled:reviewOnly,echo:isEchoMode,indices:reviewIndices,currentIndex,player:playerRef.current,playing:isPlaying,
+        mode:playbackMode,loop:loopMode,
+        busy:()=>mediaSeekRef.current.active || mediaPlayRef.current.active || isGapPausing.current,
+        range:index=>playbackMode==='continuous'?{start:subtitles[index].start,end:subtitles[index].end}:getBufferedRange(subtitles[index]),
+        onTime:setCurrentTime,
+        stop:()=>{cancelWorkerTimer();playerRef.current?.pause();setIsPlaying(false);setReviewNotice('目前沒有可播放的待複習錯題');},
+        jump:index=>{
+            const entry=reviewSession?.document.entries.find(entry=>!entry.mastered&&findReviewCue(subtitles,entry)===index);
+            setSelectedReviewId(entry?.id || null);setReviewRevealKey(n=>n+1);
+            if(playbackMode==='continuous'){
+                cancelWorkerTimer({preservePlayback:Boolean(playerRef.current&&!playerRef.current.paused)});
+                setIsWaitingShadow(false);isWaitingShadowRef.current=false;setShadowCountdown(0);
+                if(index!==currentIndex){isGapPausing.current=true;setCurrentIndex(index);}
+                seekThenMaybePlay(subtitles[index].start,true,null,{bufferedEnd:subtitles[index].end});
+            }else jumpToSubtitle(index);
+        }
+    });
+    useEffect(()=>{
+        const state=reviewPlaybackRef.current;
+        state.pending=null;
+        if(!reviewOnly || isEchoMode)return;
+        if(!reviewIndices.length)state.stop();
+        else if(isPlaying && !reviewIndices.includes(currentIndex)){
+            const index=stepReviewIndex(reviewIndices,currentIndex);state.pending=index;state.jump(index);
+        }
+    },[reviewOnly,reviewIndices,isEchoMode]);
+
     const handlePreviousPlaybackControl = () => {
+        if(reviewPlaybackRef.current.enabled && !isEchoMode){
+            const state=reviewPlaybackRef.current,index=stepReviewIndex(state.indices,currentIndex,-1);
+            if(index<0)state.stop();else {state.pending=index;state.jump(index);}return;
+        }
         if (playbackMode === 'continuous') {
             seekByContinuousOffset(-10);
             return;
@@ -11677,6 +11748,10 @@ export default function App() {
     };
 
     const handleNextPlaybackControl = () => {
+        if(reviewPlaybackRef.current.enabled && !isEchoMode){
+            const state=reviewPlaybackRef.current,index=stepReviewIndex(state.indices,currentIndex,1);
+            if(index<0)state.stop();else {state.pending=index;state.jump(index);}return;
+        }
         if (playbackMode === 'continuous') {
             seekByContinuousOffset(10);
             return;
@@ -12677,6 +12752,16 @@ export default function App() {
             seekThenMaybePlay(target, true, null, { reload: true });
             return;
         }
+        if(reviewPlaybackRef.current.enabled && !isEchoMode){
+            const state=reviewPlaybackRef.current;
+            state.pending=null;
+            if(!state.indices.length){state.stop();return;}
+            const range=state.indices.includes(currentIndex)?state.range(currentIndex):null;
+            if(!range || player.currentTime<range.start || player.currentTime>=range.end){
+                const index=range?currentIndex:stepReviewIndex(state.indices,currentIndex);
+                state.pending=index;state.jump(index);return;
+            }
+        }
         const wasWaiting = isWaitingShadowRef.current;
         cancelWorkerTimer();
         setIsWaitingShadow(false);
@@ -12904,6 +12989,8 @@ export default function App() {
                 progressSeekRef.current.pendingIndex = null;
             }
 
+            if (type === 'TIMER_DONE' && reviewPlaybackRef.current.enabled && !reviewPlaybackRef.current.echo)return;
+            if (type === 'TICK' && tickReviewPlayback(reviewPlaybackRef.current)) return;
             if (type === 'TICK') {
                 if (player.seeking || isGapPausingRef.current) return;
                 const endedSingleSentence = player.ended && playbackMode !== 'continuous' && loopMode === 'single';
@@ -23242,6 +23329,7 @@ ${userQ}`;
                                 });
                                 setMediaError(buildMediaPlaybackErrorMessage(currentPlaylistTrack?.mediaFile, e?.currentTarget?.error || null));
                             }} onPlaying={(event) => { const player = event.currentTarget; if (!mediaSeekRef.current.active && !player.paused && !player.seeking && player.readyState >= 2) setIsPlaying(true); }} onPause={(event) => { if (event.currentTarget.paused) setIsPlaying(false); }} onRateChange={(e) => setPlaybackRate(e.target.playbackRate)} onEnded={() => {
+                                if(tickReviewPlayback(reviewPlaybackRef.current,true))return;
                                 // Ensure progress reaches 100% when the media completes
                                 markAllSubtitlesWatched();
                                 // In sentence-loop drill, never auto-switch track at media end.
@@ -23725,11 +23813,12 @@ ${userQ}`;
 
                         {!isEchoMode && <div className="flex flex-row flex-wrap items-center gap-x-6 gap-y-2 px-3 py-2 w-full md:flex-nowrap md:items-center md:overflow-x-auto md:no-scrollbar">
                             <div className="flex items-center gap-3 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
-                                <button onClick={handlePreviousPlaybackControl} aria-keyshortcuts="-" title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '退10秒' : '上句'}</span></button>
+                                <button onClick={handlePreviousPlaybackControl} aria-keyshortcuts="-" title={playbackMode === 'continuous' && !reviewOnly ? '退回 10 秒' : '上一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipBack size={18} /><span className="text-[9px]">{playbackMode === 'continuous' && !reviewOnly ? '退10秒' : '上句'}</span></button>
                                 <button onClick={togglePlay} title="播放／暫停（空白鍵）" aria-keyshortcuts="Space" className="p-2 text-gray-900 hover:scale-110 transition-transform bg-gray-100 rounded-full">{isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}</button>
-                                <button onClick={handleNextPlaybackControl} aria-keyshortcuts="/" title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' ? '進10秒' : '下句'}</span></button>
+                                <button onClick={handleNextPlaybackControl} aria-keyshortcuts="/" title={playbackMode === 'continuous' && !reviewOnly ? '前進 10 秒' : '下一句'} className="flex flex-col items-center gap-0.5 text-gray-600 hover:text-black"><SkipForward size={18} /><span className="text-[9px]">{playbackMode === 'continuous' && !reviewOnly ? '進10秒' : '下句'}</span></button>
                             </div>
                             <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習" data-subtitle-focus-restore>
+                                <label className="inline-flex items-center gap-1 text-xs text-amber-700 shrink-0"><input type="checkbox" checked={reviewOnly} onChange={event=>{cancelWorkerTimer({preservePlayback:true});isWaitingShadowRef.current=false;setIsWaitingShadow(false);setShadowCountdown(0);reviewPlaybackRef.current.pending=null;setReviewNotice('');setReviewOnly(event.target.checked);}}/>篩錯題<span>（{reviewIndices.length}）</span></label>
                                 <button onClick={() => { const modes = ['single', 'all', 'none']; setLoopMode(modes[(modes.indexOf(loopMode) + 1) % modes.length]); }} className={`flex flex-col items-center gap-0.5 px-2 py-1 rounded transition-colors ${loopMode !== 'none' ? 'text-blue-600 bg-blue-50' : 'text-gray-400'}`}>
                                     {loopMode === 'single' && <><Repeat1 size={16} /><span className="text-[9px]">單句</span></>}
                                     {loopMode === 'all' && <><Repeat size={16} /><span className="text-[9px]">全部</span></>}
@@ -23867,17 +23956,18 @@ ${userQ}`;
                         {renderSeekTimeControls()}
                         <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
                             <div className="flex items-center gap-2 shrink-0" aria-label="播放控制" data-subtitle-focus-restore>
-                                <button onClick={handlePreviousPlaybackControl} aria-keyshortcuts="-" title={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
+                                <button onClick={handlePreviousPlaybackControl} aria-keyshortcuts="-" title={playbackMode === 'continuous' && !reviewOnly ? '退回 10 秒' : '上一句'} aria-label={playbackMode === 'continuous' && !reviewOnly ? '退回 10 秒' : '上一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipBack size={16} />
                                 </button>
                                 <button onClick={togglePlay} title="播放／暫停（空白鍵）" aria-keyshortcuts="Space" className="flex items-center justify-center p-2 rounded-full bg-gray-100 text-gray-900 hover:scale-105 transition-transform">
                                     {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
                                 </button>
-                                <button onClick={handleNextPlaybackControl} aria-keyshortcuts="/" title={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
+                                <button onClick={handleNextPlaybackControl} aria-keyshortcuts="/" title={playbackMode === 'continuous' && !reviewOnly ? '前進 10 秒' : '下一句'} aria-label={playbackMode === 'continuous' && !reviewOnly ? '前進 10 秒' : '下一句'} className="flex items-center justify-center p-1.5 rounded-full text-gray-600 hover:bg-gray-100 hover:text-black">
                                     <SkipForward size={16} />
                                 </button>
                             </div>
                             <div className="ml-auto flex flex-wrap items-center justify-end gap-1" aria-label="播放模式與練習" data-subtitle-focus-restore>
+                                <label className="inline-flex items-center gap-1 text-xs text-amber-700 shrink-0"><input type="checkbox" checked={reviewOnly} onChange={event=>{cancelWorkerTimer({preservePlayback:true});isWaitingShadowRef.current=false;setIsWaitingShadow(false);setShadowCountdown(0);reviewPlaybackRef.current.pending=null;setReviewNotice('');setReviewOnly(event.target.checked);}}/>篩錯題<span>（{reviewIndices.length}）</span></label>
                             <div className="flex items-center gap-1 shrink-0">
                                 <button
                                     type="button"

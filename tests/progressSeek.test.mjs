@@ -1,3 +1,4 @@
+import {tickReviewPlayback} from '../subtitleReview.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -13,7 +14,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             subtitles: [{ start: 0, end: 10 }, { start: 7200, end: 7210 }],
             currentIndex: 0, isEchoMode: false, isShadowing: false, playbackMode: 'continuous',
             setCurrentIndex: index => { state.currentIndex = index; } };
-        const c = { workerRef: { current: {} }, latestStateRef: { current: state },
+        const c = { tickReviewPlayback,reviewPlaybackRef:{current:{enabled:false}}, workerRef: { current: {} }, latestStateRef: { current: state },
             progressSeekRef: { current: { dragging: false, pendingIndex: null } },
             mediaSeekRef: { current: { active: true } }, setCurrentTime() {} };
         vm.runInNewContext(source.slice(start, end), c);

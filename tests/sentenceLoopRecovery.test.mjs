@@ -1,3 +1,4 @@
+import {tickReviewPlayback} from '../subtitleReview.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -21,7 +22,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             setIsPlaying: value => { state.isPlaying = value; },
             setIsWaitingShadow() {}, setShadowCountdown() {},
             worker: { postMessage: msg => timers.push(msg) } };
-        const c = { workerRef: { current: {} }, latestStateRef: { current: state },
+        const c = { tickReviewPlayback,reviewPlaybackRef:{current:{enabled:false}}, workerRef: { current: {} }, latestStateRef: { current: state },
             progressSeekRef: { current: { dragging: false, pendingIndex: null } },
             mediaSeekRef: { current: { active: false } }, timerTokenRef: { current: 0 },
             setCurrentTime() {}, seekThenMaybePlay: (time, resume) => {
@@ -37,6 +38,23 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             c.mediaSeekRef.current.active = false; player.paused = false; state.isPlaying = true; };
         return { c, player, state, requests, timers, send, located };
     };
+    test('filtered worker advances only within review cues and ignores obsolete shadow timers: ' + file, () => {
+        const {c,player,send}=setup(),jumps=[];
+        c.reviewPlaybackRef.current={enabled:true,echo:false,indices:[0,2],currentIndex:0,playing:true,pending:null,
+            player,mode:'continuous',loop:'all',busy:()=>false,range:()=>({start:10,end:15}),onTime(){},stop(){assert.fail('not empty');},jump:index=>jumps.push(index)};
+        player.time=15.1;send('TICK');assert.deepEqual(jumps,[2]);
+        send('TICK');assert.deepEqual(jumps,[2],'the shared worker gate waits for the filtered seek');
+        send('TIMER_DONE');assert.deepEqual(jumps,[2],'shadow timers cannot escape into normal navigation');
+    });
+    test('filtered native EOF never marks all subtitles watched or transitions the playlist: ' + file, () => {
+        const {c,player,state}=setup(),jumps=[];
+        c.reviewPlaybackRef.current={enabled:true,echo:false,indices:[0],currentIndex:0,playing:false,pending:null,
+            player,mode:'continuous',loop:'all',busy:()=>false,range:()=>({start:10,end:15}),onTime(){},stop(){},jump:index=>jumps.push(index)};
+        Object.assign(c,{markAllSubtitlesWatched(){assert.fail('unplayed subtitles must remain unwatched');},handlePlaylistEnd(){assert.fail('filtered EOF cannot change tracks');}});
+        const body=source.match(/onEnded=\{\(\) => \{([\s\S]*?)\}\} \/>/)[1];
+        player.time=15;player.ended=true;player.paused=true;state.isPlaying=false;
+        vm.runInNewContext('() => {'+body+'}',c)();assert.deepEqual(jumps,[0]);
+    });
     test('single sentence directly rewinds at B across slow seeks without a gap timer: ' + file, () => {
         const { c, player, state, timers, send, located } = setup();
         for (let cycle = 0; cycle < 3; cycle++) {

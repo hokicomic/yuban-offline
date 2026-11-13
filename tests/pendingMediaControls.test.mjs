@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             let pauses = 0, plays = 0;
             const player = { paused: false, currentTime: 10783,
                 pause() { this.paused = true; pauses++; } };
-            const c = { playerRef: { current: player }, trackLoadRef: { current: { active: false } },
+            const c = { reviewPlaybackRef:{current:{enabled:false}}, playerRef: { current: player }, trackLoadRef: { current: { active: false } },
                 mediaPlayRef: { current: { active: active === 'play', cancel: () => retired.push('play') } },
                 mediaSeekRef: { current: { active: active === 'seek', cancel: () => retired.push('seek') } },
                 workerRef: { current: { postMessage: message => messages.push(message) } },

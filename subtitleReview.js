@@ -68,6 +68,42 @@ export function findReviewCue(subtitles,entry) {
     if(exact>=0)return exact;
     return subtitles.findIndex(s=>s.start<=entry.start+.05&&s.end>entry.start);
 }
+export function getReviewPlaybackIndices(subtitles,document) {
+    return [...new Set((document?.entries || []).filter(entry=>!entry.mastered).map(entry=>findReviewCue(subtitles,entry)).filter(index=>index>=0))].sort((a,b)=>a-b);
+}
+export function stepReviewIndex(indices,current,direction=1) {
+    if(!indices.length)return -1;
+    const position=indices.indexOf(current);
+    if(position>=0)return indices[(position+direction+indices.length)%indices.length];
+    return direction<0?[...indices].reverse().find(index=>index<current)??indices.at(-1):indices.find(index=>index>current)??indices[0];
+}
+// Worker and native EOF share this gate; filtered continuous playback must
+// never fall through to the ordinary adjacent-subtitle/playlist logic.
+export function tickReviewPlayback(state,ended=false) {
+    if(!state.enabled || state.echo)return false;
+    const {player,indices,currentIndex}=state;
+    if(!player)return true;
+    if(!indices.length){state.stop();return true;}
+    if(player.seeking || state.busy())return true;
+    if(!state.playing&&!ended)return true;
+    state.onTime(player.currentTime);
+    if(state.pending!=null){
+        if(currentIndex!==state.pending)return true;
+        const range=state.range(currentIndex);
+        if(player.currentTime>=range.end && !ended)return true;
+        state.pending=null;
+    }
+    let target=-1;
+    if(!indices.includes(currentIndex))target=stepReviewIndex(indices,currentIndex);
+    else {
+        const range=state.range(currentIndex);
+        if(ended || player.currentTime>=range.end-.02)
+            target=state.mode==='sentence'&&state.loop==='single'?currentIndex:stepReviewIndex(indices,currentIndex);
+        else if(player.currentTime<range.start-.1)target=currentIndex;
+    }
+    if(target>=0){state.pending=target;state.jump(target);}
+    return true;
+}
 let writeQueue=Promise.resolve();
 export function openReviewSession({document:initial,folder=null,sidecar=null,storage=null,notify=()=>{}}) {
     const session={document:initial,filename:initial.source.subtitleName+'.review.json',folder,blocked:false,status:'載入錯題紀錄中'};
