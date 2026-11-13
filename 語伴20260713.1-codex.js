@@ -243,7 +243,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.286 · review-only-playback";
+const APP_VERSION = "v5.287 · deletion-only-hints";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9150,9 +9150,6 @@ const buildSubtitlePracticeDualTokens = (source, language, nameHints, projection
             const leading = edit.text.length - edit.text.trimStart().length;
             ranges.push({start:edit.start+offset+leading,end:edit.start+offset+edit.text.trimEnd().length,
                 original:String(edit.from ?? projection.raw.slice(edit.start,edit.end)).trim()});
-        } else if (edit.kind === 'duplicate') {
-            const previous = positioned.filter(token => token.kind === 'word' && token.end <= edit.start+offset).at(-1);
-            if (previous) ranges.push({start:previous.start,end:previous.end,original:previous.parts.map(part=>part.text).join('')+' '+String(edit.from || '').trim()});
         }
         offset += edit.text.length - (edit.end-edit.start);
     }

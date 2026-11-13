@@ -523,6 +523,21 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         field.value = 'Hello'; await input.props.onDoubleClick(event()); render(props);
         assert.equal(copied, 0, 'synthetic double-click must not copy the just-revealed answer');
     });
+    test('removed duplicate words stay deletion hints instead of forcing a longer repeated answer: ' + file, () => {
+        const render=setup(),raw='Or as Maria sings in the sound of music, nothing Nothing comes from nothing, nothing ever could.';
+        const start=raw.indexOf(' Nothing'),text=raw.slice(0,start)+raw.slice(start+8);
+        const props={...base(),subtitle:{text:raw,start:1,end:10},text,correction:{raw,text,changed:true,
+            edits:[{start,end:start+8,text:'',from:'Nothing',to:'',kind:'duplicate'}]}};
+        let nodes=render(props),inputs=fields(nodes);
+        const input=inputs.find(field=>field.props.style.width && field.props['data-subtitle-blank']==='8:0');
+        const index=inputs.indexOf(input);
+        assert.ok(index>=0);type(input,'nothing');nodes=render(props);
+        const answered=fields(nodes)[index];assert.equal(answered.props['data-subtitle-part-complete'],true);
+        assert.equal(answered.props['data-subtitle-longer-answer-pending'],undefined);
+        assert.ok(!nodes.some(node=>node.props?.['data-subtitle-alternative-guide']));
+        const marker=nodes.find(node=>node.props?.['data-subtitle-deletion-marker']);assert.ok(marker);assert.equal(marker.props.title,'已刪除：Nothing');
+        assert.equal(props.subtitle.text,raw);
+    });
     test('phrase hints preserve word spaces before and after typing the separator: ' + file, () => {
         for(const value of ['ghost','ghost d']) {
             const render=setup(),props={...base(),subtitle:{text:'ghost dude'},text:'ghosted',
