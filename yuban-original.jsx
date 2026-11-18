@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.287 · deletion-only-hints";
+const APP_VERSION = "v5.288 · spelled-word-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6889,7 +6889,7 @@ const isSubtitleReferenceDuplicateGap = (raw,words,i,tokens,j) => {
 // a word are deliberately separate. Work is bounded by rare anchors and a band.
 // Bounded phrase equivalence handles contractions and ASR word-boundary errors.
 // Sound resemblance only locates a candidate; phrase rewrites remain reviewable.
-const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts) => {
+const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts,rawText) => {
     const expansions = key => {
         const match=key.match(/^(he|she|it|they|we|you|i)'(d|re|ve|ll|m)$/u);
         if (!match) return [];
@@ -6916,6 +6916,23 @@ const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts) => {
     const pronouns=new Set(['he','she','it','they','we','you','i']);
     if(pronouns.has(ref.key) && expansions(word.key).some(pair=>pair[1]===tokens[j+1]?.key) && tokens[j+1]?.sourceLine===ref.sourceLine)
         return {rawCount:1,refCount:2,equivalent:false};
+    // ASR can spell a word as initials (A. G. U. / ague). Count it as
+    // one reviewable span only with exact anchors on both sides. This is not
+    // a licence to expand arbitrary acronyms or guess a word in isolation.
+    for(const [rawCount,refCount] of [[2,1],[3,1],[1,2],[1,3]]){
+        const rawWords=words.slice(i,i+rawCount),refs=tokens.slice(j,j+refCount);
+        if(rawWords.length!==rawCount || refs.length!==refCount || refs.some(item=>item.sourceLine!==ref.sourceLine))continue;
+        const letters=rawCount>1?rawWords:refs,whole=rawCount>1?refs[0]:rawWords[0];
+        if(!letters.every(item=>/^[A-Z]$/u.test(item.text)) || !/^[a-z]{2,4}$/u.test(whole.key))continue;
+        const original=rawCount>1?rawText:lineTexts?.get(ref.sourceLine);
+        if(typeof original!=='string' || !letters.slice(1).every((item,index)=>/^[.\s]*$/u.test(original.slice(letters[index].end,item.start))))continue;
+        const spelling=letters.map(item=>item.key).join('');
+        if(whole.key!==spelling && whole.key!==spelling+'e')continue;
+        let left=0,right=0;
+        while(left<4&&words[i-left-1]&&words[i-left-1].key===tokens[j-left-1]?.key)left++;
+        while(right<3&&words[i+rawCount+right]&&words[i+rawCount+right].key===tokens[j+refCount+right]?.key)right++;
+        if(left>=2&&right>=2)return {rawCount,refCount,equivalent:whole.key===spelling};
+    }
     const signature=text=>text.replace(/'/g,'').replace(/ph/g,'f').replace(/sh|ch/g,'s').replace(/ck/g,'k').replace(/ght/g,'t').replace(/[aeiouy]/g,'').replace(/(.)\1+/g,'$1');
     const oneEdit=(a,b)=>{
         if(a===b)return true;
@@ -6964,7 +6981,7 @@ const locateSubtitleReferenceFollowing = (words,tokens,lineTexts,lineStarts,line
         const word=words[i],ref=tokens[j];
         if(consumed.length && ref.sourceLine-consumed.at(-1).sourceLine>4)return null;
         if(word.key===ref.key){exact++;consumed.push(ref);i++;j++;continue;}
-        const span=getSubtitleReferenceSpanMatch(words,i,tokens,j,lineTexts);
+        const span=getSubtitleReferenceSpanMatch(words,i,tokens,j,lineTexts,raw);
         if(span?.equivalent){exact+=span.rawCount;consumed.push(...tokens.slice(j,j+span.refCount));i+=span.rawCount;j+=span.refCount;continue;}
         if(words.length<5 || differences.length)return null;
         differences.push({word,ref});consumed.push(ref);i++;j++;
@@ -6990,7 +7007,7 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
     for (const start of starts) {
         let evidence=0;
         for (let i=0;i<n;i++) {
-            for (let delta=-band;delta<=band;delta++) if (start+i+delta>=start && (tokens[start+i+delta]?.key===words[i].key || ((words[i].key.includes("'") || tokens[start+i+delta]?.key.includes("'")) && getSubtitleReferenceSpanMatch(words,i,tokens,start+i+delta,lineTexts)?.equivalent))) {evidence++;break;}
+            for (let delta=-band;delta<=band;delta++) if (start+i+delta>=start && (tokens[start+i+delta]?.key===words[i].key || ((words[i].key.includes("'") || tokens[start+i+delta]?.key.includes("'")) && getSubtitleReferenceSpanMatch(words,i,tokens,start+i+delta,lineTexts,raw)?.equivalent))) {evidence++;break;}
         }
         if (evidence>=Math.ceil(n*0.70)) plausible.push(start);
     }
@@ -7009,7 +7026,7 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
                 const joined=countSubtitleReferenceJoinedWords(words,i,ref,raw);
                 if(joined) relax(i+joined,j+1,value,joined+2);
                 if(i>0 && ref.possibleFootnote && !words[i].numeric) relax(i,j+1,value,7);
-                const span=getSubtitleReferenceSpanMatch(words,i,tokens,start+j,lineTexts);
+                const span=getSubtitleReferenceSpanMatch(words,i,tokens,start+j,lineTexts,raw);
                 if(span && i+span.rawCount<=n && j+span.refCount<=m) relax(i+span.rawCount,j+span.refCount,value+(span.equivalent?0:1),8+(span.equivalent?0:9)+(span.rawCount-1)*3+span.refCount-1);
             }
             if(i>0 && i<n && j<m) relax(i,j+1,value+1,2);
@@ -7053,9 +7070,12 @@ const locateSubtitleReferenceContext = (words, tokens, lineTexts, starts, raw, {
             const anchored=(left>=2 && right>=2)||(pos===0 && right>=6)||(pos===operations.length-1 && left>=6)||(left>=4 && right>=1 && pos+right===operations.length-1)||(right>=4 && left>=1 && pos-left===0);
             let edit,automatic=false;
             if(op.kind==='phrase'){
-                const last=tokens[op.j+op.refCount-1];
-                const replacement=lineTexts.get(ref.sourceLine).slice(ref.start,last.end);
-                edit={start:word.start,end:words[op.i+op.rawCount-1].end,text:replacement,from:raw.slice(word.start,words[op.i+op.rawCount-1].end),to:replacement,kind:'spelling'};
+                const referenceLine=lineTexts.get(ref.sourceLine);
+                const spanEnd=(items,text)=>items.at(-1).end+(items.length>1 && items.every(item=>/^[A-Z]$/u.test(item.text)) && text[items.at(-1).end]==='.'?1:0);
+                const rawEnd=spanEnd(words.slice(op.i,op.i+op.rawCount),raw);
+                const refEnd=spanEnd(tokens.slice(op.j,op.j+op.refCount),referenceLine);
+                const replacement=referenceLine.slice(ref.start,refEnd);
+                edit={start:word.start,end:rawEnd,text:replacement,from:raw.slice(word.start,rawEnd),to:replacement,kind:'spelling'};
             } else if(op.kind==='replace'){
                 edit={start:word.start,end:word.end,text:ref.text,from:word.text,to:ref.text,kind:isSubtitleReferenceNameWord(ref)?'name':'spelling'};
                 automatic=n>=10 && coverage>=0.90 && content>=4 && anchored && !word.numeric && !ref.numeric &&
@@ -7309,7 +7329,7 @@ const createSubtitleReferenceResolver = searchIndex => {
                     const word = words[i], ref = tokens[j];
                     if (consumed.length && ref.sourceLine - consumed[consumed.length - 1].sourceLine > 4) break;
                     if (word.key === ref.key) { exact++; consumed.push(ref); i++; j++; continue; }
-                    const span=getSubtitleReferenceSpanMatch(words,i,tokens,j,lineTexts);
+                    const span=getSubtitleReferenceSpanMatch(words,i,tokens,j,lineTexts,raw);
                     if(span?.equivalent){exact+=Math.max(span.rawCount,span.refCount);consumed.push(...tokens.slice(j,j+span.refCount));i+=span.rawCount;j+=span.refCount;continue;}
                     if (ref.possibleFootnote && consumed.length && !word.numeric) {
                         consumed.push(ref); j++; continue;

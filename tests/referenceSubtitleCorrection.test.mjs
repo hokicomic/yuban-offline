@@ -113,6 +113,26 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const isolated=resolver('ghosted').resolve({text:'ghost dude'});
         assert.ok(!isolated.aligned,'sound signatures without sentence anchors cannot locate a phrase');
     });
+    test('anchored spelled initials and an independent ASR error locate the whole following cue: ' + file, () => {
+        const previous='turned up St. Vitus’s Dance—found, as I expected, that I had that too';
+        const original='began to get interested in my case, and determined to sift it to the bottom, and so started alphabetically—read up ague, and learnt that I was sickening for it, and that the acute stage would commence in about another fortnight.';
+        const raw='Began to get interested in my case and determined to sift it to the bottom, and so started alphabetically, read up A. G. U., and learnt that I was sickling for it, and that the acute stage would commence in about another fortnight.';
+        const next='Bright’s disease, I was relieved to find, I had only in a modified form.';
+        const book=resolver(previous+'—'+original+' '+next),prior={text:previous},cue={text:raw,start:10,end:30};
+        assert.equal(book.resolve(prior).aligned,true);
+        const result=book.resolveFollowing(cue,prior,{sourceLine:1,sequential:true});
+        assert.equal(result.aligned,true);
+        assert.ok(result.reviewDifferences.some(item=>item.edit.from==='A. G. U.' && item.edit.to==='ague'));
+        const projected=api.applySubtitleReferencePreference(result);
+        assert.equal(projected.text,raw.replace('A. G. U.','ague').replace('sickling','sickening'));
+        assert.equal(projected.text.includes('ague.,'),false,'remove abbreviation punctuation together with its letters');
+        assert.equal(result.ranges[0].text,original.slice(0,-1),'neither preceding nor following sentences may be borrowed');
+        const dual=api.buildSubtitlePracticeDualTokens(projected.text,'en-US',null,projected).find(token=>token.originalText==='A. G. U.');
+        assert.deepEqual(Array.from(dual.parts[0].accepted),['ague','A. G. U.']);
+        assert.equal(cue.text,raw);assert.equal(cue.start,10);assert.equal(cue.end,30);
+        assert.ok(!resolver('ague').resolve({text:'A. G. U.'}).aligned,'isolated initials cannot choose a source word');
+        assert.ok(!resolver(original).resolve({text:raw.replace('A. G. U.','A. G. V.')}).aligned,'context cannot manufacture a different spelling');
+    });
     test('hyphenated and joined compounds retain caption spelling and never create false deletion/replacement blanks: ' + file, () => {
         const raw='Will wanted nothing so much as to ride hell-bent for the safety of the wall, but that was not a feeling to share with your commander, especially not a commander like this one.';
         const ref=raw.replace('hell-bent','hellbent').replace(', especially','.\nEspecially');
