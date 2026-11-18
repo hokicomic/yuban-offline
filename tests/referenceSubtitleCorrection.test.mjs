@@ -133,6 +133,28 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.ok(!resolver('ague').resolve({text:'A. G. U.'}).aligned,'isolated initials cannot choose a source word');
         assert.ok(!resolver(original).resolve({text:raw.replace('A. G. U.','A. G. V.')}).aligned,'context cannot manufacture a different spelling');
     });
+    test('misheard contraction boundaries remain complete phrase alternatives, including the final word: ' + file, () => {
+        const prefix='He is an old chum of mine, and feels my pulse, and looks at my tongue, and talks about the weather all for nothing when I fancy ';
+        for(const [raw,ref,from,to,expected] of [
+            [prefix+'I mill.',prefix+"I’m ill; so I thought I would do him a good turn.",'I mill','I’m ill',prefix+'I’m ill.'],
+            [prefix+'I mill before the next meeting.',prefix+"I'm ill before the next meeting.",'I mill',"I'm ill",prefix+"I'm ill before the next meeting."],
+            [prefix+"I'm ill.",prefix+'I mill; so I thought I would do him a good turn.',"I'm ill",'I mill',prefix+'I mill.']
+        ]){
+            const cue={text:raw,start:1,end:10},result=resolver(ref).resolve(cue);
+            assert.equal(result.aligned,true);
+            assert.equal(result.reviewDifferences.length,1);
+            assert.equal(result.reviewDifferences[0].edit.from,from);
+            assert.equal(result.reviewDifferences[0].edit.to,to);
+            const projected=api.applySubtitleReferencePreference(result);
+            assert.equal(projected.text,expected,'neither ill nor its consonant may be dropped');
+            assert.equal(projected.edits.length,1);
+            assert.ok(!projected.edits.some(edit=>edit.kind==='extra'));
+            const dual=api.buildSubtitlePracticeDualTokens(projected.text,'en-US',null,projected).find(token=>token.corrected);
+            assert.deepEqual(Array.from(dual.parts[0].accepted),[to,from]);
+            assert.equal(cue.text,raw);assert.equal(cue.start,1);assert.equal(cue.end,10);
+        }
+        assert.ok(!resolver("I'm ill.").resolve({text:'I mill.'}).aligned,'two isolated words cannot choose a whole-book location');
+    });
     test('hyphenated and joined compounds retain caption spelling and never create false deletion/replacement blanks: ' + file, () => {
         const raw='Will wanted nothing so much as to ride hell-bent for the safety of the wall, but that was not a feeling to share with your commander, especially not a commander like this one.';
         const ref=raw.replace('hell-bent','hellbent').replace(', especially','.\nEspecially');

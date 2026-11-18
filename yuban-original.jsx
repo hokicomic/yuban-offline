@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.288 · spelled-word-alignment";
+const APP_VERSION = "v5.289 · contraction-boundary-review";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6916,6 +6916,24 @@ const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts,rawText) => {
     const pronouns=new Set(['he','she','it','they','we','you','i']);
     if(pronouns.has(ref.key) && expansions(word.key).some(pair=>pair[1]===tokens[j+1]?.key) && tokens[j+1]?.sourceLine===ref.sourceLine)
         return {rawCount:1,refCount:2,equivalent:false};
+    // A contraction's consonant can be attached to the next ASR word:
+    // I mill / I'm ill, I'll end / I llend. Exact concatenated letters and
+    // surrounding anchors identify the whole phrase, including at cue end.
+    for(const count of [2,3]){
+        const rawWords=words.slice(i,i+count),refs=tokens.slice(j,j+count);
+        if(rawWords.length!==count || refs.length!==count || refs.some(item=>item.sourceLine!==ref.sourceLine))continue;
+        if(rawWords[0].key===refs[0].key || rawWords.at(-1).key===refs.at(-1).key)continue;
+        const a=rawWords.map(item=>item.key).join(''),b=refs.map(item=>item.key).join('');
+        if(![a,b].some(text=>text.includes("'")) || a.replace(/'/g,'')!==b.replace(/'/g,'') || a.replace(/'/g,'').length<4)continue;
+        if([...rawWords,...refs].some(item=>item.numeric))continue;
+        const refText=lineTexts?.get(ref.sourceLine);
+        const gapsAreSpaces=(items,text)=>typeof text==='string' && items.slice(1).every((item,index)=>/^\s+$/u.test(text.slice(items[index].end,item.start)));
+        if(!gapsAreSpaces(rawWords,rawText)||!gapsAreSpaces(refs,refText))continue;
+        let left=0,right=0;
+        while(left<4&&words[i-left-1]&&words[i-left-1].key===tokens[j-left-1]?.key)left++;
+        while(right<2&&words[i+count+right]&&words[i+count+right].key===tokens[j+count+right]?.key)right++;
+        if((left>=2&&right>=2)||(left>=4&&i+count===words.length))return {rawCount:count,refCount:count,equivalent:false};
+    }
     // ASR can spell a word as initials (A. G. U. / ague). Count it as
     // one reviewable span only with exact anchors on both sides. This is not
     // a licence to expand arbitrary acronyms or guess a word in isolation.
