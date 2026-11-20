@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.290 · reference-candidates-clock";
+const APP_VERSION = "v5.291 · original-text-answers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7197,6 +7197,25 @@ const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled
     return {text:projection.changed?'已對到文本・已校正':'已對到文本・無需校正',tone:'text-emerald-700'};
 };
 
+const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
+    if(!ranges?.length)return "";
+    // Keep only the complete mapped sentence, including its own punctuation.
+    // A partial clause must never borrow neighbouring words or punctuation.
+    const firstRange=ranges[0],lastRange=ranges.at(-1);
+    const beforeText=lineTexts.get(firstRange.sourceLine).slice(0,firstRange.start);
+    const afterText=lineTexts.get(lastRange.sourceLine).slice(lastRange.end);
+    const opening=beforeText.match(/[“"‘(\[]*$/u)?.[0] || '';
+    const beforeOpening=beforeText.slice(0,beforeText.length-opening.length);
+    const startsSentence=!beforeOpening.trim() || /[.!?…][”"’')\]]*\s+$/u.test(beforeOpening);
+    const closing=afterText.match(/^[.!?…]+[”"’')\]]*/u)?.[0] || '';
+    const sourceParts=[];
+    for(let line=firstRange.sourceLine;line<=lastRange.sourceLine;line++) {
+        const source=lineTexts.get(line) || '';
+        sourceParts.push(source.slice(line===firstRange.sourceLine?firstRange.start:0,line===lastRange.sourceLine?lastRange.end:source.length));
+    }
+    return startsSentence && closing ? opening+sourceParts.join('\n')+closing : '';
+
+};
 const createSubtitleReferenceResolver = searchIndex => {
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
@@ -7283,6 +7302,7 @@ const createSubtitleReferenceResolver = searchIndex => {
         if (cached?.raw === raw && cached.results.has(contextKey)) return cached.results.get(contextKey);
         const remember = result => {
             const record = { raw, text: raw, changed: false, trusted: false, edits: [], ranges: [], ...result };
+            if(record.aligned)record.referenceText=getSubtitleReferenceSentenceText(record.ranges,lineTexts);
             const cache = cached?.raw === raw ? cached : { raw, results: new Map() };
             if (cache.results.size >= 4) cache.results.delete(cache.results.keys().next().value);
             cache.results.set(contextKey, record);
@@ -7591,9 +7611,38 @@ const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
         acceptedReviewCount: additions.filter(item=>item.side==='difference').length, reviewDifferences,
         boundaryOmissions: (projection.boundaryOmissions || []).filter(item => !accepted.has(item.signature)) };
 };
+// Word/punctuation diff keeps correction offsets valid without turning a whole
+// sentence into one giant blank. Offsets always refer to the untouched subtitle.
+const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
+    const split=text=>Array.from(text.matchAll(/[\p{L}\p{M}\p{N}]+|\s+|[^\s]/gu),match=>({text:match[0],start:match.index,end:match.index+match[0].length}));
+    const a=split(raw),b=split(reference),width=b.length+1;
+    const scores=new Uint16Array((a.length+1)*width);
+    for(let i=a.length-1;i>=0;i--)for(let j=b.length-1;j>=0;j--)
+        scores[i*width+j]=a[i].text===b[j].text?1+scores[(i+1)*width+j+1]:Math.max(scores[(i+1)*width+j],scores[i*width+j+1]);
+    const edits=[];let i=0,j=0,start=null,end=0,replacement='';
+    const flush=()=>{if(start!==null){edits.push({start,end,text:replacement,from:raw.slice(start,end),to:replacement,kind:'reference'});start=null;replacement='';}};
+    while(i<a.length || j<b.length){
+        if(i<a.length && j<b.length && a[i].text===b[j].text){flush();i++;j++;continue;}
+        if(start===null){start=i<a.length?a[i].start:raw.length;end=start;}
+        if(j<b.length && (i===a.length || scores[i*width+j+1]>=scores[(i+1)*width+j]))replacement+=b[j++].text;
+        else end=a[i++].end;
+    }
+    flush();return edits;
+};
+const applySubtitleReferenceOriginalText = projection => {
+    if (!projection?.aligned || !projection.trusted || !projection.referenceText ||
+        projection.reviewDifferences?.length || projection.boundaryOmissions?.length) return projection;
+    const reference=projection.referenceText;
+    // Do not promote damaged ebook joins, footnotes or broken contractions to answers.
+    const words=text=>tokenizeSubtitleReferenceWords(text).map(word=>word.key).join(' ');
+    if(/[぀-ヿ㐀-鿿가-힯\u0091\u0092\uFFFD\u200B-\u200D\uFEFF]/u.test(reference) || /<[^>]*>|\[[^\]]*\]|［[^］]*］|\*+|\{\{/u.test(reference) || /\p{L}[ʼ＇‘`´]\p{L}/u.test(reference) || words(reference)!==words(projection.text) || /\b(?:don|doesn|didn|can|couldn|won|wouldn|shouldn|isn|aren|wasn|weren|haven|hasn|hadn)\s+t\b|\b(?:dont|doesnt|didnt|couldnt|wouldnt|shouldnt|isnt|arent|wasnt|werent|havent|hasnt|hadnt)\b/iu.test(reference))return projection;
+    const edits=buildSubtitleReferenceDisplayEdits(projection.raw,reference);
+    return {...projection,text:reference,changed:reference!==projection.raw,edits,referenceTextApplied:true,
+        referenceNames:projection.edits.filter(edit=>edit.kind==='name').map(edit=>edit.to || edit.text)};
+};
 const applySubtitleReferencePreference = (projection, accepted, originals) => {
     const confirmed=applySubtitleReferenceBoundaryAcceptance(projection,accepted);
-    if (!(confirmed?.aligned || confirmed?.trusted) || !confirmed.reviewDifferences?.length) return confirmed;
+    if (!(confirmed?.aligned || confirmed?.trusted) || !confirmed.reviewDifferences?.length) return originals?.size ? confirmed : applySubtitleReferenceOriginalText(confirmed);
     // Text is the default answer for located review differences, but this is a
     // provisional preference, never an implicit confirmation. Boundary omissions
     // still need the explicit action above. Original choices persist per cue.
@@ -9008,7 +9057,7 @@ const tokenizeSubtitlePractice = (text, language = 'en', nameHints = []) => {
 // Changed phrases with different word counts form one dual-answer blank.
 const buildSubtitlePracticeDualTokens = (source, language, nameHints, projection) => {
     const tokens = tokenizeSubtitlePractice(source, language, nameHints);
-    if (!projection?.changed || projection.text !== source) return tokens;
+    if (projection?.referenceTextApplied || !projection?.changed || projection.text !== source) return tokens;
     let cursor = 0;
     const positioned = tokens.map(token => { const start = cursor; cursor += token.kind === 'literal' ? token.text.length : token.parts.map(part => part.text).join('').length; return {...token, start, end: cursor}; });
     const ranges = []; let offset = 0;
@@ -9418,7 +9467,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     // never replace the source caption or become dictation answers.
     const source = String(text || '');
     const nameHints = useMemo(() => ({
-        names:[...(Array.isArray(contextNameHints)?contextNameHints:contextNameHints?.names || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || [])],
+        names:[...(Array.isArray(contextNameHints)?contextNameHints:contextNameHints?.names || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || []), ...(correction?.referenceNames || [])],
         ordinaryWords:Array.isArray(contextNameHints)?undefined:contextNameHints?.ordinaryWords
     }), [contextNameHints, correction]);
     const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
@@ -23426,6 +23475,7 @@ ${userQ}`;
                                         <label className="inline-flex items-center gap-1 cursor-pointer">
                                             <input type="checkbox" checked={referenceSubtitleCorrectionEnabled} onChange={event => setReferenceSubtitleCorrectionEnabled(event.target.checked)} />參照校正字幕
                                         </label>
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>依原文與標點</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
                                             <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.originalReviewCount > 0 &&

@@ -38,6 +38,52 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(resolver(decimal).resolve({text:decimal.replace('4.30','4.3')}).trusted,true);
         assert.equal(resolver(decimal).resolve({text:decimal.replace('4.30','four thirty')}).trusted,false);
     });
+    test('complete reference sentences supply punctuation and word-by-word answers without mutating subtitle timing: ' + file, () => {
+        const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
+        const raw='Vera Wang Zhu Zhu age 60 is a pig but she really should have been born a rooster!';
+        const next='We are, of course, referring to Chinese horoscopes.';
+        const cue={text:raw,start:30.4,end:37.5};
+        const projection=api.applySubtitleReferencePreference(resolver('VERA\n'+opening+' '+next).resolveWithNeighbours(cue,null,{text:next}));
+        assert.equal(projection.text,opening);
+        assert.equal(projection.raw,raw);assert.equal(projection.referenceTextApplied,true);
+        assert.equal(cue.text,raw);assert.equal(cue.start,30.4);assert.equal(cue.end,37.5);
+        let restored=raw;
+        for(const edit of [...projection.edits].sort((a,b)=>b.start-a.start))restored=restored.slice(0,edit.start)+edit.text+restored.slice(edit.end);
+        assert.equal(restored,opening,'display correction offsets reconstruct exact original text');
+        const clock='Every morning, at exactly four thirty, Vera’s eyelids snap open like roller shades shooting up.';
+        for(const notation of ['4.30','4:30','four thirty']) {
+            const rawClock=clock.replace('four thirty',notation).replace('morning,','morning').replace('Vera’s',"Vera's");
+            const result=api.applySubtitleReferencePreference(resolver(clock).resolve({text:rawClock}));
+            assert.equal(result.text,clock);assert.equal(result.referenceTextApplied,true);
+            const tokens=api.buildSubtitlePracticeDualTokens(result.text,'en-US',null,result);
+            const answers=tokens.filter(token=>token.kind==='word').map(token=>token.parts.map(part=>part.text).join(''));
+            assert.ok(answers.includes('four'));assert.ok(answers.includes('thirty'));
+            assert.ok(!answers.includes(notation) || notation==='four thirty');
+            assert.equal(tokens.some(token=>token.corrected),false,'no sentence-wide or ASR alternate-answer blank');
+        }
+        const prior={text:'The delegates read the report before returning home.'};
+        const shortRef='At exactly four thirty, she wakes.';
+        const sequential=resolver(prior.text+' '+shortRef);
+        sequential.resolve(prior);
+        const short=sequential.resolveFollowing({text:'At exactly 4.30 she wakes!'},prior);
+        assert.equal(short.alignmentMethod,'adjacent_cue');
+        assert.equal(api.applySubtitleReferencePreference(short).text,shortRef);
+        const quoted='“The delegates reviewed the report,” she said, “and signed the treaty.”';
+        assert.equal(api.applySubtitleReferencePreference(resolver(quoted).resolve({text:'The delegates reviewed the report she said and signed the treaty!'})).text,quoted);
+    });
+    test('uncertainty, unconfirmed differences and partial clauses do not become full-reference answers: ' + file, () => {
+        const ref='The delegates carefully reviewed all the available evidence before signing the treaty yesterday.';
+        const raw=ref.replace('carefully ','');
+        const pending=api.applySubtitleReferencePreference(resolver(ref).resolve({text:raw}));
+        assert.notEqual(pending.referenceTextApplied,true);assert.ok(pending.reviewDifferences?.length);
+        const numeric=ref.replace('all the available evidence','300 confirmed reports');
+        const mismatch=api.applySubtitleReferencePreference(resolver(numeric).resolve({text:numeric.replace('300','200')}));
+        assert.notEqual(mismatch.referenceTextApplied,true);assert.ok(mismatch.reviewDifferences?.length);
+        const ambiguous=api.applySubtitleReferencePreference(resolver(ref+'\n'+ref).resolve({text:ref}));
+        assert.notEqual(ambiguous.referenceTextApplied,true);assert.equal(ambiguous.text,ref);assert.equal(ambiguous.reason,'ambiguous');
+        const partial='carefully reviewed all the available evidence';
+        assert.notEqual(api.applySubtitleReferencePreference(resolver(ref).resolve({text:partial})).referenceTextApplied,true);
+    });
     test('real competing positions expose text and offsets; ordered neighbours choose the correct copy: ' + file, () => {
         const phrase='The delegates carefully reviewed every document before signing the treaty yesterday.';
         const next='The committee accepted their conclusions after a long discussion today.';
@@ -203,7 +249,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.equal(projection.aligned,true,form);
             assert.equal(projection.changed,false,form);
             assert.equal(projection.reviewDifferences?.length || 0,0,form);
-            assert.equal(api.applySubtitleReferencePreference(projection).text,cue.text,form);
+            assert.equal(api.applySubtitleReferencePreference(projection).text,form==='hellbent'?ref:cue.text,form);
             assert.equal(api.buildSubtitlePracticeDualTokens(cue.text,'en-US',[],projection).some(token=>token.corrected),false,form);
         }
         const reverse=resolver(raw).resolve({text:raw.replace('hell-bent','hellbent')});
