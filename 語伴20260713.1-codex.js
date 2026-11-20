@@ -243,7 +243,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.289 · contraction-boundary-review";
+const APP_VERSION = "v5.290 · reference-candidates-clock";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6916,6 +6916,23 @@ const normalizeSubtitleReferenceNumbers = (words, text) => {
     const result = [];
     for (let i = 0; i < words.length;) {
         const word = words[i];
+        // Clock notation is contextual: a bare 4.30 remains a decimal.
+        const prefix = text.slice(0, word.start);
+        const clockContext = /\b(?:at(?:\s+exactly)?|around|by|until|from|time\s+is)\s*$/iu.test(prefix);
+        const digits = word.key.match(/^(\d{1,2})[.:](\d{2})$/u);
+        const hour = readSubtitleReferenceNumber(words, i, text);
+        const minute = hour && readSubtitleReferenceNumber(words, hour.end, text);
+        const spokenClock = hour && minute && Number(hour.value) >= 1 && Number(hour.value) <= 12 &&
+            Number(minute.value) >= 0 && Number(minute.value) < 60 && /^\s+$/u.test(text.slice(words[hour.end-1].end, words[hour.end].start));
+        const clockEnd = digits ? i+1 : spokenClock ? minute.end : i;
+        const meridiem = clockEnd > i && /^\s*(?:a\.?m\.?|p\.?m\.?)(?![a-z])/iu.test(text.slice(words[clockEnd-1].end));
+        if ((clockContext || meridiem || (digits && word.key.includes(':'))) &&
+            ((digits && +digits[1] <= 23 && +digits[2] < 60) || spokenClock)) {
+            const h = digits ? +digits[1] : +hour.value, m = digits ? +digits[2] : +minute.value;
+            const end = words[clockEnd-1].end;
+            result.push({...word, text:text.slice(word.start,end), end, key:`#time:${h}:${String(m).padStart(2,'0')}`, numeric:true});
+            i=clockEnd; continue;
+        }
         let numeric = /^\d+(?:,\d{3})*(?:\.\d+)?$/u.test(word.key) ? { end: i + 1, value: String(Number(word.key.replace(/,/g, ''))) } : readSubtitleReferenceNumber(words, i, text);
         if (numeric && (!Number.isFinite(Number(numeric.value)) || Math.abs(Number(numeric.value)) > Number.MAX_SAFE_INTEGER)) numeric = null;
         if (!numeric) { result.push(word); i++; continue; }
@@ -6941,7 +6958,7 @@ const tokenizeSubtitleReferenceWords = (value, { reference = false } = {}) => {
     const text = String(value || '');
     const masked = text.replace(/\[[^\]]*\]|［[^］]*］|<[^>]*>|\*+|\{\{|\}\}/gu, match => ' '.repeat(match.length))
         .replace(/[\u0091\u0092\u2018\u02bc\uff07`´]/gu, "'");
-    const words = Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,]\d+)*/gu), match => ({
+    const words = Array.from(masked.matchAll(/[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)*|\d+(?:[.,:]\d+)*/gu), match => ({
         text: match[0], key: match[0].normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/’/g, "'"),
         start: match.index, end: match.index + match[0].length
     }));
@@ -7664,14 +7681,40 @@ const createSubtitleReferenceResolver = searchIndex => {
             if(ranked.length)candidates=verifyStarts(ranked.map(item=>item.start));
         }
         if (!candidates.length) return remember({ reason: starts.size ? 'no_bounded_word_alignment' : 'no_unique_anchor' });
-        candidates.sort((a, b) => a.cost - b.cost);
+        // Multiple search anchors may verify the very same source span.
+        // Count positions, not search paths, and keep the cheapest mapping.
+        const positions = new Map();
+        for (const candidate of candidates) {
+            const key = JSON.stringify(candidate.ranges.map(({sourceLine,start,end})=>[sourceLine,start,end]));
+            const existing = positions.get(key);
+            if (!existing || candidate.cost < existing.cost ||
+                (candidate.cost === existing.cost && candidate.edits.filter(edit=>edit.kind==='name').length > existing.edits.filter(edit=>edit.kind==='name').length)) positions.set(key,candidate);
+        }
+        candidates = [...positions.values()];
+        // A standalone uppercase chapter/person heading is not spoken prose.
+        // Prefer the identical body span when another path prepends that heading.
+        candidates = candidates.filter(candidate=>!candidates.some(other=>{
+            if(other===candidate || other.cost>candidate.cost || candidate.ranges.length<=other.ranges.length)return false;
+            const extra=candidate.ranges.slice(0,candidate.ranges.length-other.ranges.length);
+            const tail=candidate.ranges.slice(extra.length);
+            return JSON.stringify(tail)===JSON.stringify(other.ranges) && extra.every(range=>{
+                const heading=lineTexts.get(range.sourceLine).trim();
+                return heading===range.text.trim() && /^[A-Z][A-Z ’'—-]{0,39}$/u.test(heading);
+            });
+        }));
+        candidates.sort((a,b)=>a.cost-b.cost);
         let best = candidates.filter(candidate => candidate.cost === candidates[0].cost);
-        if (new Set(best.map(candidate => candidate.text)).size > 1) return remember({ reason: 'ambiguous_wording' });
         if (best.length > 1 && sourceLine >= 0) {
             const local = best.filter(candidate => candidate.ranges.some(range => Math.abs(range.sourceLine - sourceLine) <= 4));
             if (local.length === 1) best = local;
         }
-        if (best.length !== 1) return remember({ reason: 'ambiguous' });
+        if (best.length !== 1) return remember({
+            reason: new Set(best.map(candidate=>candidate.text)).size>1 ? 'ambiguous_wording' : 'ambiguous',
+            candidateCount: best.length,
+            candidates: best.map(candidate=>({text:candidate.ranges.map(range=>range.text).join(' '),
+                correctedText:candidate.text, cost:candidate.cost,
+                ranges:candidate.ranges.map(range=>({...range}))}))
+        });
         const selected = best[0];
         // A boundary omission is indistinguishable from a deliberately partial
         // cue. Offer a review action; never silently extend the spoken range.
@@ -7716,7 +7759,6 @@ const createSubtitleReferenceResolver = searchIndex => {
     };
     const resolveWithNeighbours = (cue,previousCue,nextCue,options={}) => {
         let current=resolveFollowing(cue,previousCue,options);
-        if(current.aligned || current.trusted)return current;
         // Visiting the previous/next cue in the UI used to create this evidence
         // as a side effect. Verify the loaded neighbours now, without playback.
         if(previousCue) {
@@ -23598,6 +23640,19 @@ ${userQ}`;
                                             <span>依原字幕 {currentSubtitlePresentation.originalReviewCount} 處</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'extra' ? `刪除多字：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>{currentSubtitlePresentation.provisionalReviewCount > 0 ? `暫依文本 ${currentSubtitlePresentation.provisionalReviewCount} 處` : `已校正 ${currentSubtitlePresentation.edits.length} 處`}</span>}
                                     </div>
+                                )}
+                                {isTopPanelDocumentMode && currentSubtitlePresentation?.candidates?.length > 1 && (
+                                    <details className="mb-2 text-left text-xs text-slate-600" aria-label="文本對齊候選">
+                                        <summary className="cursor-pointer">{currentSubtitlePresentation.candidateCount} 個不同位置的候選（展開查看）</summary>
+                                        <ol className="list-decimal pl-5 space-y-2 mt-2">
+                                            {currentSubtitlePresentation.candidates.map((candidate,index)=>(
+                                                <li key={index}>
+                                                    <div>文本第 {candidate.ranges[0].sourceLine+1} 行，第 {candidate.ranges[0].start+1} 字元起；比對代價 {candidate.cost}</div>
+                                                    <div>{candidate.text}</div>
+                                                </li>
+                                            ))}
+                                        </ol>
+                                    </details>
                                 )}
                                 {referenceSubtitleActive && referenceSubtitleCorrectionEnabled && !isSubtitleBlankMode && (
                                     <div className="flex flex-wrap justify-center gap-2 text-[11px] text-slate-600">

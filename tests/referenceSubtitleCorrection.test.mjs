@@ -15,6 +15,45 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
     const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
+    test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
+        const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
+        const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';
+        const next='We are, of course, referring to Chinese horoscopes.';
+        const clock='Every morning, at exactly four thirty, Vera’s eyelids snap open like roller shades shooting up.';
+        const engine=resolver('ONE\nVERA\n'+opening+' '+next+' Vera Wong is a human woman, thank you very much, but roosters have nothing on her. '+clock);
+        const first=engine.resolveWithNeighbours({text:raw},null,{text:next});
+        assert.equal(first.aligned,true,JSON.stringify(first));
+        assert.equal(first.candidates,undefined);
+        assert.match(first.text,/Vera Wong Zhuzhu/);
+        for(const notation of ['4.30','4:30','four thirty']) {
+            const cue=clock.replace('four thirty',notation);
+            const result=engine.resolveWithNeighbours({text:cue},null,null);
+            assert.equal(result.aligned,true,JSON.stringify(result));
+            assert.equal(result.reviewDifferences?.length||0,0,notation);
+            assert.equal(result.text,cue,'equivalent time keeps original subtitle spelling');
+        }
+        const wrong=engine.resolve({text:clock.replace('four thirty','4.45')});
+        assert.ok(!wrong.trusted || wrong.reviewDifferences?.length,'different times cannot silently match');
+        const decimal='The measured value was 4.30 and the researchers carefully checked every result today.';
+        assert.equal(resolver(decimal).resolve({text:decimal.replace('4.30','4.3')}).trusted,true);
+        assert.equal(resolver(decimal).resolve({text:decimal.replace('4.30','four thirty')}).trusted,false);
+    });
+    test('real competing positions expose text and offsets; ordered neighbours choose the correct copy: ' + file, () => {
+        const phrase='The delegates carefully reviewed every document before signing the treaty yesterday.';
+        const next='The committee accepted their conclusions after a long discussion today.';
+        const book=phrase+' An unrelated sentence separates the first occurrence. '+phrase+' '+next;
+        const engine=resolver(book),cue={text:phrase};
+        const ambiguous=engine.resolve(cue);
+        assert.equal(ambiguous.candidateCount,2);
+        assert.equal(ambiguous.candidates.length,2);
+        assert.notEqual(ambiguous.candidates[0].ranges[0].start,ambiguous.candidates[1].ranges[0].start);
+        for(const candidate of ambiguous.candidates)assert.equal(candidate.text,phrase.slice(0,-1));
+        const located=engine.resolveWithNeighbours(cue,null,{text:next});
+        assert.equal(located.ranges[0].start,book.lastIndexOf('The delegates'));
+        const following=engine.resolveWithNeighbours({text:next},cue,null);
+        assert.equal(following.aligned,true);
+        assert.equal(following.ranges[0].start,book.indexOf(next));
+    });
     test('damaged ebook contractions, joined words and attached footnotes cannot corrupt caption answers: ' + file, () => {
         const fixtures = [
             ["The researcher doesn t know why we don t see the visible7 universe clearly today.", "The researcher doesn't know why we don't see the visible universe clearly today."],
