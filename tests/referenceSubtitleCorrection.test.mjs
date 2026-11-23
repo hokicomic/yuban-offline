@@ -101,6 +101,30 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(markers.length,1);assert.equal(markers[0].deleted,'cold','real duplicate deletion remains visible');
         assert.equal(api.getSubtitleCorrectionDeletionMarkers({raw:'Water.',text:'Water',changed:true,edits:[{start:5,end:6,text:'',from:'.'}]}).length,0,'punctuation deletion is not a word deletion');
     });
+    test('a joined reference compound cannot veto punctuation for the complete practice sentence: ' + file, () => {
+        const first='At the door, Vera dons her orthopedic sneakers and her tortoiseshell sunglasses, and finally, the last and perhaps most vital article of clothing';
+        const tail='—a visor so enormous that there is no way that a single ray of freckle-causing, wrinkle-making sunlight could snake its way onto her face.';
+        const reference=first+tail;
+        const rawFirst='At the door, Vera dons her orthopedic sneakers and her tortoise shell sunglasses. And finally, the last and perhaps most vital article of clothing,';
+        const rawTail=tail.slice(1).replace('that there','that There');
+        const cues=[{text:rawFirst,start:10,end:20},{text:rawTail,start:20,end:30}];
+        const index=api.buildKnowledgeOriginalSearchIndex('[原文]\n'+reference+' Then, without a backward glance, Vera strides out into the world.');
+        const grouped=api.groupSubtitlesByReferenceSentences(cues,index);
+        assert.equal(grouped.length,1);
+        const projection=api.createSubtitleReferenceResolver(index).resolve(grouped[0]);
+        assert.equal(projection.trusted,true);
+        const result=api.applyCompleteSentenceReferencePreference(projection,grouped[0]);
+        const expected=reference.replace('tortoiseshell','tortoise shell');
+        assert.equal(result.text,expected);
+        assert.equal(result.referenceTextApplied,true);assert.equal(result.retainedCaptionWordBoundaries,true);
+        assert.equal(api.getSubtitleCorrectionDeletionMarkers(result).length,0);
+        const tokens=api.buildSubtitlePracticeDualTokens(result.text,'en-US',null,result);
+        assert.equal(tokens.map(token=>token.text || token.parts?.map(part=>part.text).join('') || '').join(''),expected);
+        assert.equal(cues[0].text,rawFirst);assert.equal(grouped[0].end,30);
+        const damaged='The careful researcher reviewed allofthe evidence, and signed the report—before returning home.';
+        const caption='The careful researcher reviewed all of the evidence. And signed the report, before returning home.';
+        assert.equal(api.applySubtitleReferencePreference(resolver(damaged).resolve({text:caption})).text,damaged.replace('allofthe','all of the'),'ebook joins do not become malformed answer words');
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';
@@ -374,7 +398,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.equal(projection.aligned,true,form);
             assert.equal(projection.changed,false,form);
             assert.equal(projection.reviewDifferences?.length || 0,0,form);
-            assert.equal(api.applySubtitleReferencePreference(projection).text,form==='hellbent'?ref:cue.text,form);
+            assert.equal(api.applySubtitleReferencePreference(projection).text,ref.replace('hellbent',form),form+' retains caption compound spelling while adopting reference punctuation');
             assert.equal(api.buildSubtitlePracticeDualTokens(cue.text,'en-US',[],projection).some(token=>token.corrected),false,form);
         }
         const reverse=resolver(raw).resolve({text:raw.replace('hell-bent','hellbent')});

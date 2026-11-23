@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.296 · word-aware-punctuation-diff";
+const APP_VERSION = "v5.297 · punctuation-with-word-boundaries";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7958,12 +7958,27 @@ const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
 const applySubtitleReferenceOriginalText = projection => {
     if (!projection?.aligned || !projection.trusted || !projection.referenceText ||
         projection.reviewDifferences?.length || projection.boundaryOmissions?.length) return projection;
-    const reference=projection.referenceText;
+    let reference=projection.referenceText;
+    // Preserve reliable caption word boundaries when the book has joined the
+    // exact same letters. That spelling safeguard must not veto punctuation
+    // and capitalization for the rest of the aligned sentence.
+    const originalWords=tokenizeSubtitleReferenceWords(reference),captionWords=tokenizeSubtitleReferenceWords(projection.text);
+    const boundaryEdits=[];let captionAt=0,boundariesMatch=true;
+    for(const word of originalWords) {
+        if(captionWords[captionAt]?.key===word.key){captionAt++;continue;}
+        const count=countSubtitleReferenceJoinedWords(captionWords,captionAt,word,projection.text);
+        if(!count){boundariesMatch=false;break;}
+        const from=captionWords[captionAt],to=captionWords[captionAt+count-1];
+        boundaryEdits.push({start:word.start,end:word.end,text:projection.text.slice(from.start,to.end)});
+        captionAt+=count;
+    }
+    if(boundariesMatch && captionAt===captionWords.length)
+        for(const edit of boundaryEdits.reverse())reference=reference.slice(0,edit.start)+edit.text+reference.slice(edit.end);
     // Do not promote damaged ebook joins, footnotes or broken contractions to answers.
     const words=text=>tokenizeSubtitleReferenceWords(text).map(word=>word.key).join(' ');
     if(/[぀-ヿ㐀-鿿가-힯\u0091\u0092\uFFFD\u200B-\u200D\uFEFF]/u.test(reference) || /<[^>]*>|\[[^\]]*\]|［[^］]*］|\*+|\{\{/u.test(reference) || /\p{L}[ʼ＇‘`´]\p{L}/u.test(reference) || words(reference)!==words(projection.text) || /\b(?:don|doesn|didn|can|couldn|won|wouldn|shouldn|isn|aren|wasn|weren|haven|hasn|hadn)\s+t\b|\b(?:dont|doesnt|didnt|couldnt|wouldnt|shouldnt|isnt|arent|wasnt|werent|havent|hasnt|hadnt)\b/iu.test(reference))return projection;
     const edits=buildSubtitleReferenceDisplayEdits(projection.raw,reference);
-    return {...projection,text:reference,changed:reference!==projection.raw,edits,referenceTextApplied:true,
+    return {...projection,text:reference,changed:reference!==projection.raw,edits,referenceTextApplied:true,retainedCaptionWordBoundaries:boundariesMatch && boundaryEdits.length>0,
         referenceNames:projection.edits.filter(edit=>edit.kind==='name').map(edit=>edit.to || edit.text)};
 };
 // A sentence group can prove a short leading omission using the entire
@@ -23859,7 +23874,7 @@ ${userQ}`;
                                         </label>
                                         {subtitles[currentIndex]?.referenceSentenceGroup && <span>已合併 {subtitles[currentIndex].sourceCues.length} 段字幕</span>}
                                         {currentSubtitlePresentation?.autoCompletedPrefix && <span>依完整句補回：{currentSubtitlePresentation.autoCompletedPrefix}</span>}
-                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>依原文與標點</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>{currentSubtitlePresentation.retainedCaptionWordBoundaries?'依原文標點・保留原字幕分詞':'依原文與標點'}</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
                                             <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.originalReviewCount > 0 &&
