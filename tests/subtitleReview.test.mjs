@@ -163,3 +163,17 @@ test('cleanup is unavailable without folder access or after an unsuccessful save
     const readOnly=openReviewSession({document:base(),folder,storage:memory()});await readOnly.ready;
     await assert.rejects(readOnly.planCleanup([]),/尚未成功寫入/);assert.equal(folder.removed.length,0);
 });
+
+test('completing a merged sentence masters constituent reviews without discarding their history',()=>{
+    const old=recordReviewAttempt(base(),attempt('old'),'2026-11-12T00:00:00Z');
+    const entry=old.entries[0];
+    const completed={...attempt('full',[]),originalText:'Earlier words. '+entry.originalText,displayText:'Earlier words. '+entry.displayText,start:0,end:entry.end,
+        completedWithoutHints:true,coveredCues:[{text:entry.originalText,start:entry.start}]};
+    const updated=recordReviewAttempt(old,completed,'2026-11-12T00:00:01Z');
+    assert.equal(updated.entries.length,1);assert.equal(updated.entries[0].mastered,true);
+    assert.deepEqual(updated.entries[0].words,entry.words);assert.equal(updated.entries[0].attempts.length,2);
+    assert.equal(recordReviewAttempt(updated,completed,'2026-11-12T00:00:02Z').entries[0].attempts.length,2);
+    assert.equal(old.entries[0].mastered,false,'original document is immutable');
+    const mismatch=recordReviewAttempt(old,{...completed,coveredCues:[{text:'Different words',start:entry.start}]});
+    assert.equal(mismatch.entries[0].mastered,false,'time alone cannot master a different cue');
+});

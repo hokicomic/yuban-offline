@@ -13,8 +13,40 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({getSubtitleReferenceSentenceText,buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({groupSubtitlesByReferenceSentences,getSubtitleReferenceSentenceText,buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
+    test('full-reference sentence practice joins adjacent timed cues and retains raw captions: ' + file, () => {
+        const first='After a quick wash, Vera dons her morning gear—a polo shirt with a Ralph Lauren logo so big that it covers her entire left breast';
+        const tail='(well, okay, thanks to the ravages of time and gravity, it covers the top half of her breast) and sweatpants.';
+        const next='Arm sleeves are yanked on and adjusted so that there is no exposed skin.';
+        const rawFirst=first.replace('gear—','gear, ')+'.',rawTail=tail.replace(/[()]/g,'');
+        const cues=[{text:rawFirst,start:10,end:20},{text:rawTail,start:20,end:30},{text:next,start:30,end:36}];
+        const snapshot=JSON.stringify(cues);
+        const index=api.buildKnowledgeOriginalSearchIndex('[原文]\n'+first+' '+tail+' '+next);
+        const grouped=api.groupSubtitlesByReferenceSentences(cues,index);
+        assert.equal(grouped.length,2);assert.equal(grouped[0].start,10);assert.equal(grouped[0].end,30);
+        assert.equal(grouped[0].text,rawFirst+' '+rawTail);assert.equal(grouped[0].sourceCues.length,2);
+        assert.equal(JSON.stringify(cues),snapshot,'raw subtitles and their timestamps are immutable');
+        const corrected=api.applySubtitleReferencePreference(api.createSubtitleReferenceResolver(index).resolve(grouped[0]));
+        assert.equal(corrected.text,first+' '+tail);
+        const blanks=api.buildSubtitlePracticeDualTokens(corrected.text,'en-US',null,corrected);
+        assert.equal(blanks.map(token=>token.text || token.parts?.map(part=>part.text).join('') || '').join(''),first+' '+tail);
+        assert.equal(api.groupSubtitlesByReferenceSentences(cues.slice(0,1),index).length,1,'no missing audio words are added');
+        const gap=[cues[0],{...cues[1],start:25,end:35}];
+        assert.equal(api.groupSubtitlesByReferenceSentences(gap,index),gap,'do not bridge missing audio or large gaps');
+        assert.equal(api.groupSubtitlesByReferenceSentences(cues,api.buildKnowledgeOriginalSearchIndex('[原文]\nA different book has nothing to do with this sentence.')),cues);
+        assert.equal(grouped[1],cues[2],'the following complete sentence stays separate');
+        const short=[{text:'After a quick',start:10,end:12},{text:rawFirst.slice('After a quick '.length),start:12,end:20},cues[1]];
+        assert.equal(api.groupSubtitlesByReferenceSentences(short,index)[0].sourceCues.length,3,'a short opening cue can gather its anchor from the following cue');
+    });
+    test('reference grouping respects nested parentheses, abbreviations and sentence boundaries: ' + file, () => {
+        const ref='Dr. Vera reviewed the report (including the notes (which were long)) and signed it. She went home.';
+        const cues=[{text:'Dr. Vera reviewed the report.',start:1,end:4},{text:'Including the notes which were long and signed it.',start:4,end:8},{text:'She went home.',start:8,end:10}];
+        const grouped=api.groupSubtitlesByReferenceSentences(cues,api.buildKnowledgeOriginalSearchIndex('[原文]\n'+ref));
+        assert.equal(grouped.length,2);assert.equal(grouped[0].end,8);assert.equal(grouped[1],cues[2]);
+        const repeat=api.groupSubtitlesByReferenceSentences(cues,api.buildKnowledgeOriginalSearchIndex('[原文]\n'+ref+' '+ref));
+        assert.equal(repeat.length,2,'identical source sentences do not create different audio groups');
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';

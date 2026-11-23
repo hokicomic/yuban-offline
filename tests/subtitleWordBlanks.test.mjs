@@ -319,6 +319,10 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         let inputs=fields(render(props));assert.equal(inputs[0].props.style.borderBottomColor,undefined);
         assert.equal(inputs[1].props.style.borderBottomColor,'#d97706');assert.equal(inputs[1].props.value,'');
         inputs=fields(render({...props,text:'(Hello—world!)'}));assert.equal(inputs[1].props.style.borderBottomColor,'#d97706','punctuation-only presentation changes keep review markers');
+        const grouped={text:'Earlier words. Hello world.',start:0,end:4,sourceCues:[{text:'Earlier words.',start:0,end:1},props.subtitle]};
+        inputs=fields(render({...props,subtitle:grouped,text:'Earlier words. (Hello—world!)'}));
+        assert.equal(inputs[3].props.style.borderBottomColor,'#d97706','old review word maps into its merged full-sentence position');
+        assert.equal(inputs[1].props.style.borderBottomColor,undefined,'do not mark a word in the earlier cue');
         inputs=fields(render({...props,reviewTarget:{...props.reviewTarget,mastered:true}}));assert.equal(inputs[1].props.style.borderBottomColor,undefined);
         inputs=fields(render({...props,reviewTarget:{...props.reviewTarget,displayText:'A different sentence.'}}));assert.equal(inputs[1].props.style.borderBottomColor,undefined);
         const phraseRender=setup(),phrase={...base(),subtitle:{text:'ghost dude',start:5,end:8},text:'ghosted',

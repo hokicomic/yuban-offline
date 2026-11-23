@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.293 · all-aligned-fragment-punctuation";
+const APP_VERSION = "v5.294 · complete-reference-sentence-practice";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7217,6 +7217,86 @@ const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
     return opening+sourceParts.join('\n')+closing;
 
 };
+// Build practice units from complete book sentences, while keeping the original
+// cue objects/timestamps untouched. Only contiguous, fully covered sentences
+// can replace the existing segmentation; unmatched material stays as it was.
+const groupSubtitlesByReferenceSentences = (cues, index) => {
+    if (!cues?.length || !index?.entries?.length) return cues;
+    const sentences=[];
+    let paragraph='',lastLine=-2;
+    const flush=()=>{
+        let start=0,depth=0;
+        for(let i=0;i<paragraph.length;i++) {
+            const ch=paragraph[i];
+            if(ch==='(')depth++;
+            if(ch===')')depth=Math.max(0,depth-1);
+            if(depth || !/[.!?。！？]/u.test(ch))continue;
+            if(ch==='.' && (isAbbreviation(paragraph.slice(start,i+1)) || /\d/u.test(paragraph[i-1] || '') && /\d/u.test(paragraph[i+1] || '')))continue;
+            let end=i+1;
+            while(/[.!?。！？”’"')\]}]/u.test(paragraph[end] || '') && end<paragraph.length)end++;
+            const text=paragraph.slice(start,end).trim();
+            if(text)sentences.push(text);
+            start=end;i=end-1;
+        }
+        paragraph='';
+    };
+    for(const entry of index.entries) {
+        if(entry.sourceLine!==lastLine+1)flush();
+        lastLine=entry.sourceLine;
+        if(isTitleLike(entry.raw.trim()) || /[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)){flush();continue;}
+        paragraph+=(paragraph?' ':'')+entry.raw.trim();
+    }
+    flush();
+    const keys=text=>tokenizeSubtitleReferenceWords(text).map(word=>word.key);
+    const heads=new Map();
+    for(const text of new Set(sentences)) {
+        const words=keys(text);
+        if(words.length<5 || words.length>120)continue;
+        const head=words.slice(0,4).join(' '),entries=heads.get(head) || [];
+        entries.push({text,words});heads.set(head,entries);
+    }
+    const result=[];
+    let changed=false;
+    for(let i=0;i<cues.length;i++) {
+        let leading=keys(cues[i].text);
+        for(let k=i+1;leading.length<4 && k<Math.min(cues.length,i+4);k++) {
+            if(cues[k].start-cues[k-1].end>1)break;
+            leading.push(...keys(cues[k].text));
+        }
+        const candidates=heads.get(leading.slice(0,4).join(' ')) || [];
+        const matches=[];
+        for(const candidate of candidates) {
+            const tail=candidate.words.slice(-4).join(' ');
+            let raw='';
+            for(let j=i;j<Math.min(cues.length,i+16);j++) {
+                if(j>i && (cues[j].start-cues[j-1].end>1 || cues[j].start<cues[j-1].start))break;
+                if(cues[j].end-cues[i].start>120)break;
+                raw+=(raw?' ':'')+cues[j].text;
+                const words=keys(raw);
+                if(words.length>candidate.words.length+12)break;
+                if(words.slice(-4).join(' ')!==tail)continue;
+                if(j===i)break; // Already complete; keep its existing cue identity.
+                const projection=createSubtitleReferenceResolver({entries:[{sourceLine:0,raw:candidate.text}]}).resolve({text:raw});
+                const mapped=projection.ranges;
+                const referenceWords=tokenizeSubtitleReferenceWords(candidate.text,{reference:true});
+                if(projection.aligned && !projection.boundaryOmissions?.length && mapped.length===1 &&
+                    mapped[0].start===referenceWords[0].start && mapped[0].end===referenceWords.at(-1).end)
+                    matches.push({end:j,text:raw});
+                break;
+            }
+        }
+        // Repeated wording in the book is harmless here: this operation only
+        // joins the same adjacent audio cues, and does not choose corrections.
+        const endings=[...new Set(matches.map(match=>match.end))];
+        if(endings.length===1 && endings[0]>i) {
+            const end=endings[0];
+            result.push({...cues[i],end:cues[end].end,text:matches[0].text,referenceSentenceGroup:true,sourceCues:cues.slice(i,end+1)});
+            i=end;changed=true;
+        } else result.push(cues[i]);
+    }
+    return changed?result:cues;
+};
+
 const createSubtitleReferenceResolver = searchIndex => {
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
@@ -9467,11 +9547,16 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     // Full captions are selectable reading text. Old accidental edits must
     // never replace the source caption or become dictation answers.
     const source = String(text || '');
-    const reviewWordingMatches = useMemo(() => {
-        const words = value => JSON.stringify(tokenizeSubtitlePractice(value, language)
+    const reviewWordOffset = useMemo(() => {
+        if(!reviewTarget)return -1;
+        const words = value => tokenizeSubtitlePractice(value, language)
             .filter(token => token.kind === 'word')
-            .map(token => token.parts.filter(part => part.kind === 'letters').map(part => part.text).join('').normalize('NFKC').toLowerCase()));
-        return Boolean(reviewTarget) && words(reviewTarget.displayText) === words(source);
+            .map(token => token.parts.filter(part => part.kind === 'letters').map(part => part.text).join('').normalize('NFKC').toLowerCase());
+        const expected=words(reviewTarget.displayText),actual=words(source),matches=[];
+        if(!expected.length)return -1;
+        for(let i=0;i+expected.length<=actual.length;i++)
+            if(expected.every((word,j)=>word===actual[i+j]))matches.push(i);
+        return matches.length===1?matches[0]:-1;
     }, [reviewTarget?.displayText, source, language]);
     const nameHints = useMemo(() => ({
         names:[...(Array.isArray(contextNameHints)?contextNameHints:contextNameHints?.names || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || []), ...(correction?.referenceNames || [])],
@@ -9505,6 +9590,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const progress=getSubtitlePracticeProgress(draft.tokens,draft.answers);
         onReviewRecord(draft.session,{attemptId:draft.id,start:draft.subtitle.start,end:draft.subtitle.end,
             originalText:String(draft.subtitle.text || ''),displayText:draft.source,words,
+            coveredCues:draft.subtitle.sourceCues?.map(cue=>({text:cue.text,start:cue.start})),
             completedWithoutHints:progress.done && progress.hints===0});
     };
     React.useEffect(()=>{
@@ -9633,9 +9719,10 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     );
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
-        const reviewWord=reviewTarget && !reviewTarget.mastered && reviewTarget.originalText===subtitle?.text &&
-            Math.abs(reviewTarget.start-Number(subtitle?.start))<.05 && reviewWordingMatches &&
-            reviewTarget.words.some(word=>word.wordIndex===token.index && word.partIndex===part.index &&
+        const reviewSubtitleMatches=reviewTarget && ((reviewTarget.originalText===subtitle?.text && Math.abs(reviewTarget.start-Number(subtitle?.start))<.05) ||
+            subtitle?.sourceCues?.some(cue=>cue.text===reviewTarget.originalText && Math.abs(cue.start-reviewTarget.start)<.05));
+        const reviewWord=reviewTarget && !reviewTarget.mastered && reviewSubtitleMatches && reviewWordOffset>=0 &&
+            reviewTarget.words.some(word=>word.wordIndex+reviewWordOffset===token.index && word.partIndex===part.index &&
                 word.accepted.some(expected=>getSubtitlePracticePartOptions(part).includes(expected)));
         const value = answer?.values?.[part.index] || '';
         const correct = isSubtitlePracticePartAccepted(part, value);
@@ -9809,7 +9896,7 @@ export default function GeminiPlayer() {
     const [selectedFolderSession,setSelectedFolderSession] = useState(null);
     const [currentTrackIndex, setCurrentTrackIndex] = useState(-1);
     const [rawSubtitles, setRawSubtitles] = useState([]);
-    const [subtitles, setSubtitles] = useState([]);
+    const [subtitleSegments, setSubtitles] = useState([]);
     const [isSmartMode, setIsSmartMode] = useState(true);
     // Segmentation and playback are intentionally independent: generated subtitle
     // groups can still drive highlighting while media plays continuously.
@@ -9858,6 +9945,33 @@ export default function GeminiPlayer() {
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
     const [embeddedKnowledgeError, setEmbeddedKnowledgeError] = useState("");
+    const [useReferenceSentences, setUseReferenceSentences] = useState(() => {
+        try { return localStorage.getItem('yuban-reference-sentences') !== 'false'; } catch (_) { return true; }
+    });
+    const practiceReferenceIndex = useMemo(() => buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText, {
+        allowWholeDocumentFallback: !/(?:知識點|knowledge\s*point|lrc)/i.test(embeddedKnowledgeFileInfo?.filename || '')
+    }), [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename]);
+    const subtitles = useMemo(() => useReferenceSentences && referenceSubtitleCorrectionEnabled && !embeddedKnowledgeLoading && !embeddedKnowledgeError
+        ? groupSubtitlesByReferenceSentences(subtitleSegments, practiceReferenceIndex) : subtitleSegments,
+    [subtitleSegments, practiceReferenceIndex, useReferenceSentences, referenceSubtitleCorrectionEnabled, embeddedKnowledgeLoading, embeddedKnowledgeError]);
+    const previousPracticeSubtitlesRef = useRef(subtitles);
+    const previousPracticeSegmentsRef = useRef(subtitleSegments);
+    useEffect(() => {
+        const previous=previousPracticeSubtitlesRef.current;
+        const segmentsChanged=previousPracticeSegmentsRef.current!==subtitleSegments;
+        previousPracticeSubtitlesRef.current=subtitles;
+        previousPracticeSegmentsRef.current=subtitleSegments;
+        if(previous===subtitles || !subtitles.length)return;
+        setCurrentIndex(index=>{
+            const selected=(segmentsChanged?subtitleSegments:previous)[index];
+            if(!selected)return Math.min(Math.max(index,0),subtitles.length-1);
+            const mapped=subtitles.findIndex(cue=>cue.start<=selected.start+.001 && cue.end>selected.start);
+            return mapped>=0?mapped:Math.min(Math.max(index,0),subtitles.length-1);
+        });
+    }, [subtitles]);
+    useEffect(() => {
+        try { localStorage.setItem('yuban-reference-sentences',String(useReferenceSentences)); } catch (_) {}
+    }, [useReferenceSentences]);
     const [embeddedKnowledgeAutoFollow, setEmbeddedKnowledgeAutoFollow] = useState(true);
     const [embeddedKnowledgeFollowStatus, setEmbeddedKnowledgeFollowStatus] = useState("");
     const [embeddedKnowledgeLocatedCue, setEmbeddedKnowledgeLocatedCue] = useState(null);
@@ -23482,6 +23596,10 @@ ${userQ}`;
                                         <label className="inline-flex items-center gap-1 cursor-pointer">
                                             <input type="checkbox" checked={referenceSubtitleCorrectionEnabled} onChange={event => setReferenceSubtitleCorrectionEnabled(event.target.checked)} />參照校正字幕
                                         </label>
+                                        <label className="inline-flex items-center gap-1 cursor-pointer" title="將可靠對齊且連續的字幕合成原文完整句，播放與填空共用整句時間範圍；無法完整對齊時保留原分段。">
+                                            <input type="checkbox" checked={useReferenceSentences} onChange={event => setUseReferenceSentences(event.target.checked)} />原文完整句
+                                        </label>
+                                        {subtitles[currentIndex]?.referenceSentenceGroup && <span>已合併 {subtitles[currentIndex].sourceCues.length} 段字幕</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>依原文與標點</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
                                             <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
@@ -23526,7 +23644,7 @@ ${userQ}`;
                                             className="rounded-full border border-slate-200 px-2 py-0.5">{currentSubtitlePresentation?.acceptedReviewCount > 0 ? '撤銷確認' : '撤銷補字'}</button>}
                                     </div>
                                 )}
-                                <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05)} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.id===selectedReviewId && findReviewCue([subtitles[currentIndex]].filter(Boolean),entry)===0) || reviewSession?.document.entries.find(entry=>!entry.mastered && (entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05 || subtitles[currentIndex]?.sourceCues?.some(cue=>cue.text===entry.originalText && Math.abs(cue.start-entry.start)<.05)))} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}

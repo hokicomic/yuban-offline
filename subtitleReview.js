@@ -49,6 +49,15 @@ const nextReviewTime=doc=>new Date(Math.max(Date.now(),...doc.entries.map(e=>Dat
 export function recordReviewAttempt(doc,attempt,now=nextReviewTime(doc)) {
     const start=Number(attempt.start),end=Number(attempt.end);
     if(!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<start)return doc;
+    // Completing an expanded full-sentence exercise also completes its older
+    // constituent-cue reviews. Keep their IDs, words and history for exports.
+    if(attempt.completedWithoutHints && Array.isArray(attempt.coveredCues)) {
+        doc={...doc,entries:doc.entries.map(entry=>{
+            if(!attempt.coveredCues.some(cue=>cue.text===entry.originalText && Math.abs(Number(cue.start)-entry.start)<.05) ||
+                entry.attempts.some(item=>item.id===attempt.attemptId))return entry;
+            return {...entry,mastered:true,updatedAt:now,attempts:[...entry.attempts,{id:attempt.attemptId,at:now,words:[]}]};
+        })};
+    }
     const id=reviewHash(JSON.stringify([start,end,attempt.originalText]));
     const old=doc.entries.find(e=>e.id===id);
     const priorAttempt=old?.attempts.find(a=>a.id===attempt.attemptId);
