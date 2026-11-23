@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.292 · reference-fragment-punctuation";
+const APP_VERSION = "v5.293 · all-aligned-fragment-punctuation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7205,21 +7205,16 @@ const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
     const beforeText=lineTexts.get(firstRange.sourceLine).slice(0,firstRange.start);
     const afterText=lineTexts.get(lastRange.sourceLine).slice(lastRange.end);
     const opening=beforeText.match(/[“"‘(\[]*$/u)?.[0] || '';
-    const closing=afterText.match(/^[)”’"\]]*[.!?…]+[”"’')\]]*/u)?.[0] || '';
+    const closing=afterText.match(/^[,.;:!?…。，；：！？—–)”’"'\]}]*/u)?.[0] || '';
     const sourceParts=[];
     for(let line=firstRange.sourceLine;line<=lastRange.sourceLine;line++) {
         const source=lineTexts.get(line) || '';
         sourceParts.push(source.slice(line===firstRange.sourceLine?firstRange.start:0,line===lastRange.sourceLine?lastRange.end:source.length));
     }
-    const reference=opening+sourceParts.join('\n')+closing;
-    // Never invent an opener outside this cue or import a neighbouring word to
-    // complete a bracket pair. Incomplete spans retain the original subtitle.
-    let depth=0;
-    for(const character of reference) {
-        if(character==='(')depth++;
-        if(character===')' && --depth<0)return '';
-    }
-    return closing && depth===0 ? reference : '';
+    // Cue boundaries come from the recording, not the book's sentence breaks.
+    // Keep punctuation on the mapped fragment, even if a parenthesis spans
+    // several cues; never extend the fragment to fetch its missing words.
+    return opening+sourceParts.join('\n')+closing;
 
 };
 const createSubtitleReferenceResolver = searchIndex => {
@@ -9472,6 +9467,12 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     // Full captions are selectable reading text. Old accidental edits must
     // never replace the source caption or become dictation answers.
     const source = String(text || '');
+    const reviewWordingMatches = useMemo(() => {
+        const words = value => JSON.stringify(tokenizeSubtitlePractice(value, language)
+            .filter(token => token.kind === 'word')
+            .map(token => token.parts.filter(part => part.kind === 'letters').map(part => part.text).join('').normalize('NFKC').toLowerCase()));
+        return Boolean(reviewTarget) && words(reviewTarget.displayText) === words(source);
+    }, [reviewTarget?.displayText, source, language]);
     const nameHints = useMemo(() => ({
         names:[...(Array.isArray(contextNameHints)?contextNameHints:contextNameHints?.names || []), ...(correction?.edits?.filter(edit => edit.kind === 'name').map(edit => edit.to || edit.text) || []), ...(correction?.referenceNames || [])],
         ordinaryWords:Array.isArray(contextNameHints)?undefined:contextNameHints?.ordinaryWords
@@ -9633,7 +9634,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
         const reviewWord=reviewTarget && !reviewTarget.mastered && reviewTarget.originalText===subtitle?.text &&
-            Math.abs(reviewTarget.start-Number(subtitle?.start))<.05 && reviewTarget.displayText===source &&
+            Math.abs(reviewTarget.start-Number(subtitle?.start))<.05 && reviewWordingMatches &&
             reviewTarget.words.some(word=>word.wordIndex===token.index && word.partIndex===part.index &&
                 word.accepted.some(expected=>getSubtitlePracticePartOptions(part).includes(expected)));
         const value = answer?.values?.[part.index] || '';

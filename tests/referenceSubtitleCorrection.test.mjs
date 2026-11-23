@@ -90,9 +90,27 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.equal(api.getSubtitleReferenceSentenceText([{sourceLine:1,start:first,end:last}],new Map([[1,ref]])),expected);
         }
         const incomplete=api.applySubtitleReferencePreference(resolver('An introduction (she carefully reviewed the final report and returned home).').resolve({text:'She carefully reviewed the final report.'}));
-        assert.notEqual(incomplete.referenceTextApplied,true,'do not borrow the remaining words to close a parenthesis');
+        assert.equal(incomplete.text,'(she carefully reviewed the final report','keep the mapped fragment without borrowing words or inventing its closing parenthesis');
     });
-    test('uncertainty, unconfirmed differences and partial clauses do not become full-reference answers: ' + file, () => {
+    test('cue ending before a parenthesis uses the original dash without adding a full stop: ' + file, () => {
+        const first='After a quick wash, Vera dons her morning gear—a polo shirt with a Ralph Lauren logo so big that it covers her entire left breast';
+        const tail='(well, okay, thanks to the ravages of time and gravity, it covers the top half of her breast) and sweatpants.';
+        const raw=first.replace('gear—','gear, ')+'.';
+        const engine=resolver(first+' '+tail);
+        const result=api.applySubtitleReferencePreference(engine.resolve({text:raw,start:80,end:100}));
+        assert.equal(result.aligned,true);assert.equal(result.referenceTextApplied,true);
+        assert.equal(result.text,first);assert.equal(result.raw,raw);
+        assert.equal(result.text.includes('well'),false,'no words from the next cue');
+        const tokens=api.buildSubtitlePracticeDualTokens(result.text,'en-US',null,result);
+        assert.equal(tokens.map(token=>token.text || token.parts?.map(part=>part.text).join('') || '').join(''),first);
+        const next=api.applySubtitleReferencePreference(engine.resolve({text:tail.replace(/[()]/g,'')}));
+        assert.equal(next.text,tail,'the following cue still retains both parentheses');
+        const ref='Earlier words. The delegates reviewed the report—then signed it, before returning home.';
+        const fragment='The delegates reviewed the report—then signed it,';
+        const aligned=api.applySubtitleReferencePreference(resolver(ref).resolve({text:'The delegates reviewed the report then signed it.'}));
+        assert.equal(aligned.text,fragment,'a cue ending at a comma also keeps internal punctuation');
+    });
+    test('uncertainty stays reviewable while reliable partial cues use only mapped text: ' + file, () => {
         const ref='The delegates carefully reviewed all the available evidence before signing the treaty yesterday.';
         const raw=ref.replace('carefully ','');
         const pending=api.applySubtitleReferencePreference(resolver(ref).resolve({text:raw}));
@@ -103,7 +121,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const ambiguous=api.applySubtitleReferencePreference(resolver(ref+'\n'+ref).resolve({text:ref}));
         assert.notEqual(ambiguous.referenceTextApplied,true);assert.equal(ambiguous.text,ref);assert.equal(ambiguous.reason,'ambiguous');
         const partial='carefully reviewed all the available evidence';
-        assert.notEqual(api.applySubtitleReferencePreference(resolver(ref).resolve({text:partial})).referenceTextApplied,true);
+        assert.equal(api.applySubtitleReferencePreference(resolver(ref).resolve({text:partial})).text,partial);
     });
     test('real competing positions expose text and offsets; ordered neighbours choose the correct copy: ' + file, () => {
         const phrase='The delegates carefully reviewed every document before signing the treaty yesterday.';
