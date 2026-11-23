@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.294 · complete-reference-sentence-practice";
+const APP_VERSION = "v5.295 · sentence-boundary-omission-recovery";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7252,8 +7252,12 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
     for(const text of new Set(sentences)) {
         const words=keys(text);
         if(words.length<5 || words.length>120)continue;
-        const head=words.slice(0,4).join(' '),entries=heads.get(head) || [];
-        entries.push({text,words});heads.set(head,entries);
+        for(let skip=0;skip<=Math.min(3,words.length-12);skip++) {
+            const omitted=words.slice(0,skip);
+            if(omitted.some(word=>/^(?:no|not|never|neither|without|cannot)$/u.test(word) || /\d/u.test(word)))continue;
+            const head=words.slice(skip,skip+4).join(' '),entries=heads.get(head) || [];
+            entries.push({text,words,skip});heads.set(head,entries);
+        }
     }
     const result=[];
     let changed=false;
@@ -7266,6 +7270,9 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
         const candidates=heads.get(leading.slice(0,4).join(' ')) || [];
         const matches=[];
         for(const candidate of candidates) {
+            // A word already assigned to the preceding cue is not an ASR
+            // omission: do not duplicate it or reuse that cue's audio.
+            if(candidate.skip && i>0 && keys(cues[i-1].text).slice(-candidate.skip).join(' ')===candidate.words.slice(0,candidate.skip).join(' '))continue;
             const tail=candidate.words.slice(-4).join(' ');
             let raw='';
             for(let j=i;j<Math.min(cues.length,i+16);j++) {
@@ -7275,22 +7282,28 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
                 const words=keys(raw);
                 if(words.length>candidate.words.length+12)break;
                 if(words.slice(-4).join(' ')!==tail)continue;
-                if(j===i)break; // Already complete; keep its existing cue identity.
+                if(j===i && !candidate.skip)break; // Already complete; keep its existing cue identity.
                 const projection=createSubtitleReferenceResolver({entries:[{sourceLine:0,raw:candidate.text}]}).resolve({text:raw});
                 const mapped=projection.ranges;
                 const referenceWords=tokenizeSubtitleReferenceWords(candidate.text,{reference:true});
-                if(projection.aligned && !projection.boundaryOmissions?.length && mapped.length===1 &&
-                    mapped[0].start===referenceWords[0].start && mapped[0].end===referenceWords.at(-1).end)
-                    matches.push({end:j,text:raw});
+                const exactRemainder=words.join(' ')===candidate.words.slice(candidate.skip).join(' ');
+                const missingPrefix=candidate.skip>0 && exactRemainder;
+                if(projection.aligned && mapped.length===1 &&
+                    mapped[0].start===referenceWords[candidate.skip].start && mapped[0].end===referenceWords.at(-1).end &&
+                    (!candidate.skip || missingPrefix))
+                    matches.push({end:j,text:raw,reference:candidate.text,
+                        prefix:missingPrefix?candidate.text.slice(0,referenceWords[candidate.skip].start):''});
                 break;
             }
         }
         // Repeated wording in the book is harmless here: this operation only
         // joins the same adjacent audio cues, and does not choose corrections.
         const endings=[...new Set(matches.map(match=>match.end))];
-        if(endings.length===1 && endings[0]>i) {
+        const originals=[...new Set(matches.map(match=>match.reference))];
+        if(endings.length===1 && originals.length===1 && (endings[0]>i || matches[0].prefix)) {
             const end=endings[0];
-            result.push({...cues[i],end:cues[end].end,text:matches[0].text,referenceSentenceGroup:true,sourceCues:cues.slice(i,end+1)});
+            result.push({...cues[i],end:cues[end].end,text:matches[0].text,referenceSentenceGroup:true,
+                referenceSentenceText:matches[0].reference,referenceSentencePrefix:matches[0].prefix,sourceCues:cues.slice(i,end+1)});
             i=end;changed=true;
         } else result.push(cues[i]);
     }
@@ -7720,6 +7733,24 @@ const applySubtitleReferenceOriginalText = projection => {
     const edits=buildSubtitleReferenceDisplayEdits(projection.raw,reference);
     return {...projection,text:reference,changed:reference!==projection.raw,edits,referenceTextApplied:true,
         referenceNames:projection.edits.filter(edit=>edit.kind==='name').map(edit=>edit.to || edit.text)};
+};
+// A sentence group can prove a short leading omission using the entire
+// remaining sentence, rather than treating any partial cue as missing words.
+const applyCompleteSentenceReferencePreference = (projection,cue,accepted,originals) => {
+    const prefix=cue?.referenceSentencePrefix;
+    if(prefix && projection?.aligned && projection.trusted && !projection.reviewDifferences?.length && !originals?.size) {
+        const words=text=>tokenizeSubtitleReferenceWords(text).map(word=>word.key).join(' ');
+        const first=projection.ranges[0];
+        if(first && first.start>=prefix.length && words(prefix+projection.text)===words(cue.referenceSentenceText) &&
+            !(projection.boundaryOmissions || []).some(item=>item.side!=='leading' || words(item.text)!==words(prefix))) {
+            const ranges=projection.ranges.map((range,i)=>i?range:{...range,start:range.start-prefix.length,text:prefix+range.text});
+            const at=tokenizeSubtitleReferenceWords(projection.raw)[0]?.start || 0;
+            const text=projection.raw.slice(0,at)+prefix+projection.raw.slice(at);
+            projection={...projection,text,ranges,changed:true,referenceText:cue.referenceSentenceText,boundaryOmissions:[],
+                autoCompletedPrefix:prefix.trim(),edits:[...projection.edits,{start:at,end:at,text:prefix,from:'',to:prefix.trim(),kind:'omission'}]};
+        }
+    }
+    return applySubtitleReferencePreference(projection,accepted,originals);
 };
 const applySubtitleReferencePreference = (projection, accepted, originals) => {
     const confirmed=applySubtitleReferenceBoundaryAcceptance(projection,accepted);
@@ -20612,7 +20643,7 @@ ${userQ}`;
         });
     }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText,
         embeddedKnowledgePlaybackProgressRef.current.maxSourceLine, embeddedKnowledgePlaybackProgressRef.current.anchorState, embeddedKnowledgePlaybackProgressRef.current.subtitleIndex]);
-    const currentSubtitlePresentation = useMemo(() => applySubtitleReferencePreference(currentSubtitleProjection,
+    const currentSubtitlePresentation = useMemo(() => applyCompleteSentenceReferencePreference(currentSubtitleProjection,subtitles[currentIndex],
         subtitles[currentIndex] && referenceBoundaryAcceptancesRef.current.get(subtitles[currentIndex]),
         subtitles[currentIndex] && referenceOriginalDifferencesRef.current.get(subtitles[currentIndex])),
     [currentSubtitleProjection, subtitles, currentIndex, referenceBoundaryRevision]);
@@ -20666,7 +20697,7 @@ ${userQ}`;
         const projection = subtitleReferenceResolver.resolveWithNeighbours(cue, subtitles[embeddedKnowledgeRenderIndex - 1], subtitles[embeddedKnowledgeRenderIndex + 1], {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
-        return applySubtitleReferencePreference(projection, cue && referenceBoundaryAcceptancesRef.current.get(cue), cue && referenceOriginalDifferencesRef.current.get(cue));
+        return applyCompleteSentenceReferencePreference(projection, cue, cue && referenceBoundaryAcceptancesRef.current.get(cue), cue && referenceOriginalDifferencesRef.current.get(cue));
     }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceBoundaryRevision, currentIndex, currentSubtitlePresentation]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
@@ -23600,6 +23631,7 @@ ${userQ}`;
                                             <input type="checkbox" checked={useReferenceSentences} onChange={event => setUseReferenceSentences(event.target.checked)} />原文完整句
                                         </label>
                                         {subtitles[currentIndex]?.referenceSentenceGroup && <span>已合併 {subtitles[currentIndex].sourceCues.length} 段字幕</span>}
+                                        {currentSubtitlePresentation?.autoCompletedPrefix && <span>依完整句補回：{currentSubtitlePresentation.autoCompletedPrefix}</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>依原文與標點</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
                                             <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
