@@ -27,6 +27,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const fallback = vm.runInNewContext(code + '\ntokenizeSubtitlePractice', { Intl: {} });
         assert.equal(join(fallback("Don't stop!\n再見。")), "Don't stop!\n再見。");
     });
+    test('English accepts unaccented Latin input while other learning languages stay strict: ' + file, () => {
+        for(const [word,typed] of [['café','cafe'],['naïve','naive'],['résumé','resume'],['cafe\u0301','cafe']]) {
+            for(const language of ['en','en-US','en-GB','fr-FR','es','de','']) {
+                const token=api.tokenizeSubtitlePractice(word,language)[0];
+                const answer=api.updateSubtitlePracticeAnswer(token,null,0,typed);
+                assert.equal(api.isSubtitlePracticeAnswerCorrect(token,answer),language.startsWith('en'),word+' '+language);
+                if(language.startsWith('en')) {
+                    assert.equal(answer.values[0],token.parts[0].text,'completion restores original spelling');
+                    assert.equal(api.getSubtitlePracticeDualAlignment(token.parts[0],typed).matchedCount,typed.length);
+                }
+            }
+        }
+        const source='a café',projection={raw:'a coffee',text:source,changed:true,edits:[{start:2,end:8,text:'café',from:'coffee'}]};
+        const word=api.buildSubtitlePracticeDualTokens(source,'en-US',[],projection).find(token=>token.corrected);
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,'cafe')),true,'dual answers share the same English input rule');
+        const french=api.tokenizeSubtitlePractice('café','fr-FR')[0];
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(french,api.updateSubtitlePracticeAnswer(french,null,0,'café')),true);
+    });
     test('letter hints align noncontiguous ordered letters without changing what was typed: ' + file, () => {
         const runs = (answer, typed) => Array.from(api.getSubtitlePracticeLetterHints(answer, typed), run => ({ text: run.text, matched: run.matched }));
         assert.deepEqual(runs('afternoon', 'aftex'), [{ text: 'afte', matched: true }, { text: 'x', matched: false }]);

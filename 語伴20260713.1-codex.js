@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.299 · spoken-handle-context-alignment";
+const APP_VERSION = "v5.300 · english-diacritic-input";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9429,7 +9429,7 @@ const tokenizeSubtitlePractice = (text, language = 'en', nameHints = []) => {
         let partIndex = 0;
         const parts = (piece.text.match(/[\p{L}\p{M}\p{N}]+|[^\p{L}\p{M}\p{N}]+/gu) || [])
             .map(text => /[\p{L}\p{N}]/u.test(text)
-                ? { kind: 'letters', text, index: partIndex++ } : { kind: 'literal', text });
+                ? { kind: 'letters', text, language, index: partIndex++ } : { kind: 'literal', text });
         return { kind: 'word', index: wordIndex++, parts };
     });
 };
@@ -9461,7 +9461,7 @@ const buildSubtitlePracticeDualTokens = (source, language, nameHints, projection
         // No answer is exposed until the learner completes or requests a hint.
         const accepted=[corrected,original].filter(Boolean);
         result.push({kind:'word',index:index++,corrected:true,correctedText:corrected,originalText:original,
-            parts:[{kind:'letters',index:0,text:corrected,accepted:[...new Set(accepted)]}]});
+            parts:[{kind:'letters',index:0,text:corrected,language,accepted:[...new Set(accepted)]}]});
         i=last;
     }
     return result;
@@ -9496,18 +9496,25 @@ const buildSubtitlePracticeDeletionDisplay = (tokens,source,markers) => {
     return result;
 };
 const getSubtitlePracticePartOptions = part => part.accepted || [part.text];
-const normalizeSubtitlePracticeOption = value => String(value || '').normalize('NFC').toLowerCase().replace(/['’ʼ‐‑–—-]/gu,'');
+// English loanwords may be typed without Latin diacritics. Keep source
+// spelling and answer text intact; other learning languages remain strict.
+const foldSubtitlePracticeLetters = (value,language) => {
+    const text=String(value || '').normalize('NFC').toLowerCase();
+    if(!/^en(?:-|$)/iu.test(String(language || '')))return text;
+    return text.normalize('NFD').replace(/(\p{Script=Latin})\p{M}+/gu,'$1').normalize('NFC');
+};
+const normalizeSubtitlePracticeOption = (value,language) => foldSubtitlePracticeLetters(value,language).replace(/['’ʼ‐‑–—-]/gu,'');
 const getSubtitlePracticeMatchedOption = (part,value) => getSubtitlePracticePartOptions(part).find(expected=>
-    part.accepted ? normalizeSubtitlePracticeOption(expected)===normalizeSubtitlePracticeOption(value) : isSubtitlePracticePartCorrect(expected,value));
+    part.accepted ? normalizeSubtitlePracticeOption(expected,part.language)===normalizeSubtitlePracticeOption(value,part.language) : isSubtitlePracticePartCorrect(expected,value,part.language));
 const getSubtitlePracticePendingLongerOptions = (part,value) => {
     if(!part.accepted)return [];
     const matched=getSubtitlePracticeMatchedOption(part,value);
     if(matched===undefined)return [];
-    const short=normalizeSubtitlePracticeOption(matched);
+    const short=normalizeSubtitlePracticeOption(matched,part.language);
     // Containment can be a prefix, suffix, or an internal span (fit / befit).
     // Equal punctuation/case variants are still one complete answer.
     return getSubtitlePracticePartOptions(part).filter(expected=>{
-        const longer=normalizeSubtitlePracticeOption(expected);
+        const longer=normalizeSubtitlePracticeOption(expected,part.language);
         return longer.length>short.length && longer.includes(short);
     });
 };
@@ -9515,7 +9522,7 @@ const getSubtitlePracticeAcceptedOption = (part,value) => getSubtitlePracticePen
     ? undefined : getSubtitlePracticeMatchedOption(part,value);
 const isSubtitlePracticePartAccepted = (part,value) => getSubtitlePracticeAcceptedOption(part,value) !== undefined;
 const getSubtitlePracticeDualAlignment = (part,value) => {
-    const options=getSubtitlePracticePartOptions(part).map(expected=>({expected,alignment:getSubtitlePracticeLetterAlignment(expected,value)}));
+    const options=getSubtitlePracticePartOptions(part).map(expected=>({expected,alignment:getSubtitlePracticeLetterAlignment(expected,value,part.language)}));
     const best=options.reduce((best,item)=>item.alignment.matchedCount>best.alignment.matchedCount?item:best,options[0]);
     // A typed letter is green if either answer supports it in order.
     const masks=options.map(item=>item.alignment.runs.flatMap(run=>splitSubtitlePracticeGraphemes(run.text).map(()=>run.matched)));
@@ -9622,7 +9629,7 @@ const buildSubtitlePracticeNameContext = (subtitles = [], referenceEntries = [])
 };
 const buildSubtitlePracticeNameHints = (subtitles = [], referenceEntries = []) => buildSubtitlePracticeNameContext(subtitles,referenceEntries).names;
 
-const isSubtitlePracticePartCorrect = (expected, value) => String(value || '').normalize('NFC').toLowerCase() === expected.normalize('NFC').toLowerCase();
+const isSubtitlePracticePartCorrect = (expected, value, language) => foldSubtitlePracticeLetters(value,language) === foldSubtitlePracticeLetters(expected,language);
 const splitSubtitlePracticeGraphemes = value => {
     const text = String(value || '');
     try { return Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text), item => item.segment); }
@@ -9630,10 +9637,10 @@ const splitSubtitlePracticeGraphemes = value => {
 };
 // Align an ordered subsequence, without reusing repeated letters or changing
 // the draft. On ties keep the earliest available answer position.
-const getSubtitlePracticeLetterAlignment = (expected, typed) => {
+const getSubtitlePracticeLetterAlignment = (expected, typed, language) => {
     const target = splitSubtitlePracticeGraphemes(expected);
     const entered = splitSubtitlePracticeGraphemes(typed);
-    const fold = char => char.normalize('NFC').toLowerCase();
+    const fold = char => foldSubtitlePracticeLetters(char,language);
     const answer = target.map(fold), draft = entered.map(fold);
     const lengths = Array.from({ length: answer.length + 1 }, () => new Uint32Array(draft.length + 1));
     for (let i = answer.length - 1; i >= 0; i--) {
@@ -10080,7 +10087,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     <span data-subtitle-other-answer role="note" className="absolute bottom-0 left-1/2 -translate-x-1/2 text-center whitespace-nowrap"
                         style={{fontSize:'0.55em',lineHeight:'1.15',color:answer?.revealed?'#dc2626':'#64748b'}}>
                         {answer?.revealed ? `文本：${token.correctedText}／原字幕：${token.originalText || '缺字'}` :
-                            isSubtitlePracticePartCorrect(token.correctedText,value) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
+                            isSubtitlePracticePartCorrect(token.correctedText,value,language) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
                     </span>
                 )}
                 {showGuide && (
