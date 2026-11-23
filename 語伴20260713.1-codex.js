@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.297 · punctuation-with-word-boundaries";
+const APP_VERSION = "v5.298 · meridiem-time-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6934,14 +6934,15 @@ const normalizeSubtitleReferenceNumbers = (words, text) => {
         const minute = hour && readSubtitleReferenceNumber(words, hour.end, text);
         const spokenClock = hour && minute && Number(hour.value) >= 1 && Number(hour.value) <= 12 &&
             Number(minute.value) >= 0 && Number(minute.value) < 60 && /^\s+$/u.test(text.slice(words[hour.end-1].end, words[hour.end].start));
-        const clockEnd = digits ? i+1 : spokenClock ? minute.end : i;
-        const meridiem = clockEnd > i && /^\s*(?:a\.?m\.?|p\.?m\.?)(?![a-z])/iu.test(text.slice(words[clockEnd-1].end));
+        const singleHour = /^\d{1,2}$/u.test(word.key) ? {value:word.key,end:i+1} : hour;
+        const clockEnd = digits ? i+1 : spokenClock ? minute.end : singleHour ? singleHour.end : i;
+        const meridiem = clockEnd > i && text.slice(words[clockEnd-1].end).match(/^\s*([ap])\.?m\.?(?![a-z])/iu);
         if ((clockContext || meridiem || (digits && word.key.includes(':'))) &&
-            ((digits && +digits[1] <= 23 && +digits[2] < 60) || spokenClock)) {
-            const h = digits ? +digits[1] : +hour.value, m = digits ? +digits[2] : +minute.value;
-            const end = words[clockEnd-1].end;
-            result.push({...word, text:text.slice(word.start,end), end, key:`#time:${h}:${String(m).padStart(2,'0')}`, numeric:true});
-            i=clockEnd; continue;
+            ((digits && +digits[1] <= 23 && +digits[2] < 60) || spokenClock || (meridiem && singleHour && +singleHour.value>=1 && +singleHour.value<=12))) {
+            const h = digits ? +digits[1] : spokenClock ? +hour.value : +singleHour.value, m = digits ? +digits[2] : spokenClock ? +minute.value : 0;
+            const end = words[clockEnd-1].end+(meridiem?meridiem[0].length:0);
+            result.push({...word, text:text.slice(word.start,end), end, key:`#time:${h}:${String(m).padStart(2,'0')}${meridiem?':'+meridiem[1].toLowerCase()+'m':''}`, numeric:true});
+            i=clockEnd; while(i<words.length && words[i].end<=end)i++; continue;
         }
         let numeric = /^\d+(?:,\d{3})*(?:\.\d+)?$/u.test(word.key) ? { end: i + 1, value: String(Number(word.key.replace(/,/g, ''))) } : readSubtitleReferenceNumber(words, i, text);
         if (numeric && (!Number.isFinite(Number(numeric.value)) || Math.abs(Number(numeric.value)) > Number.MAX_SAFE_INTEGER)) numeric = null;

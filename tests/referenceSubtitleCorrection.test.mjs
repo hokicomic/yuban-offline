@@ -125,6 +125,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const caption='The careful researcher reviewed all of the evidence. And signed the report, before returning home.';
         assert.equal(api.applySubtitleReferencePreference(resolver(damaged).resolve({text:caption})).text,damaged.replace('allofthe','all of the'),'ebook joins do not become malformed answer words');
     });
+    test('explicit clock meridiems align across dots, colons, spacing and name transcription: ' + file, () => {
+        const first='It is 4:31 AM, very late.';
+        const second='When I was your age, I wake up at 4AM every morning to cook breakfast for Ah Gong and Ah Ma.';
+        const engine=resolver('Are you awake? '+first+' '+second+' Qi lai! Carpe diem! Kind regards, Mama.');
+        const a=engine.resolveWithNeighbours({text:'It is 4.31 a.m., very late.'},null,{text:second});
+        assert.equal(a.aligned,true,JSON.stringify(a));assert.equal(api.applySubtitleReferencePreference(a).text,first);
+        const b=engine.resolveWithNeighbours({text:'When I was your age, I wake up at 4 a.m. every morning to cook breakfast for A Gong and A Ma.'},{text:first},null);
+        assert.equal(b.aligned,true,JSON.stringify(b));
+        assert.match(api.applySubtitleReferencePreference(b).text,/Ah Gong and Ah Ma/);
+        for(const notation of ['4AM','4 AM','4 a.m.','four a.m.']) {
+            const raw=second.replace('4AM',notation);
+            assert.equal(resolver(second).resolve({text:raw}).aligned,true,notation);
+        }
+        for(const raw of [first.replace('4:31 AM','4:32 AM'),first.replace('AM','PM')]) {
+            const result=resolver(first).resolve({text:raw});
+            assert.ok(!result.trusted || result.reviewDifferences?.length,'different minute or meridiem is not silently equivalent');
+        }
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';
