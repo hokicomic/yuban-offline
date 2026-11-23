@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({getSubtitleReferenceSentenceText,buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
@@ -70,6 +70,27 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(api.applySubtitleReferencePreference(short).text,shortRef);
         const quoted='“The delegates reviewed the report,” she said, “and signed the treaty.”';
         assert.equal(api.applySubtitleReferencePreference(resolver(quoted).resolve({text:'The delegates reviewed the report she said and signed the treaty!'})).text,quoted);
+    });
+    test('matched sentence tails retain parenthetical punctuation without borrowing the introduction: ' + file, () => {
+        const introduction='After a quick wash, Vera dons her morning gear—a polo shirt with a Ralph Lauren logo so big that it covers her entire left breast ';
+        const tail='(well, okay, thanks to the ravages of time and gravity, it covers the top half of her breast) and sweatpants.';
+        const raw='Well, okay, thanks to the ravages of time and gravity, it covers the top half of her breast and sweatpants.';
+        const cue={text:raw,start:100,end:110};
+        const result=api.applySubtitleReferencePreference(resolver(introduction+tail+' Arm sleeves are yanked on and adjusted.').resolve(cue));
+        assert.equal(result.text,tail);assert.equal(result.referenceTextApplied,true);
+        assert.equal(result.raw,raw);assert.equal(cue.text,raw);assert.equal(cue.start,100);assert.equal(cue.end,110);
+        const tokens=api.buildSubtitlePracticeDualTokens(result.text,'en-US',null,result);
+        assert.equal(tokens.map(token=>token.text || token.parts?.map(part=>part.text).join('') || '').join(''),tail);
+        for(const [ref,raw,expected] of [
+            ['An introduction (she carefully reviewed (and signed) the final report) and returned home.','She carefully reviewed and signed the final report and returned home.','(she carefully reviewed (and signed) the final report) and returned home.'],
+            ['An introduction (she carefully reviewed the final report).','She carefully reviewed the final report.','(she carefully reviewed the final report).'],
+            ['An introduction, she carefully reviewed the final report; then returned home.','She carefully reviewed the final report then returned home.','she carefully reviewed the final report; then returned home.']
+        ]) {
+            const first=ref.indexOf('she'),last=ref.lastIndexOf(raw.endsWith('home.')?'home':'report')+(raw.endsWith('home.')?4:6);
+            assert.equal(api.getSubtitleReferenceSentenceText([{sourceLine:1,start:first,end:last}],new Map([[1,ref]])),expected);
+        }
+        const incomplete=api.applySubtitleReferencePreference(resolver('An introduction (she carefully reviewed the final report and returned home).').resolve({text:'She carefully reviewed the final report.'}));
+        assert.notEqual(incomplete.referenceTextApplied,true,'do not borrow the remaining words to close a parenthesis');
     });
     test('uncertainty, unconfirmed differences and partial clauses do not become full-reference answers: ' + file, () => {
         const ref='The delegates carefully reviewed all the available evidence before signing the treaty yesterday.';

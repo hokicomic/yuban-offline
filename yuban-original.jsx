@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.291 · original-text-answers";
+const APP_VERSION = "v5.292 · reference-fragment-punctuation";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7199,21 +7199,27 @@ const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled
 
 const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
     if(!ranges?.length)return "";
-    // Keep only the complete mapped sentence, including its own punctuation.
-    // A partial clause must never borrow neighbouring words or punctuation.
+    // Use only mapped words, including punctuation inside the matched span.
+    // A cue may start inside a sentence (for example at a parenthetical aside).
     const firstRange=ranges[0],lastRange=ranges.at(-1);
     const beforeText=lineTexts.get(firstRange.sourceLine).slice(0,firstRange.start);
     const afterText=lineTexts.get(lastRange.sourceLine).slice(lastRange.end);
     const opening=beforeText.match(/[“"‘(\[]*$/u)?.[0] || '';
-    const beforeOpening=beforeText.slice(0,beforeText.length-opening.length);
-    const startsSentence=!beforeOpening.trim() || /[.!?…][”"’')\]]*\s+$/u.test(beforeOpening);
-    const closing=afterText.match(/^[.!?…]+[”"’')\]]*/u)?.[0] || '';
+    const closing=afterText.match(/^[)”’"\]]*[.!?…]+[”"’')\]]*/u)?.[0] || '';
     const sourceParts=[];
     for(let line=firstRange.sourceLine;line<=lastRange.sourceLine;line++) {
         const source=lineTexts.get(line) || '';
         sourceParts.push(source.slice(line===firstRange.sourceLine?firstRange.start:0,line===lastRange.sourceLine?lastRange.end:source.length));
     }
-    return startsSentence && closing ? opening+sourceParts.join('\n')+closing : '';
+    const reference=opening+sourceParts.join('\n')+closing;
+    // Never invent an opener outside this cue or import a neighbouring word to
+    // complete a bracket pair. Incomplete spans retain the original subtitle.
+    let depth=0;
+    for(const character of reference) {
+        if(character==='(')depth++;
+        if(character===')' && --depth<0)return '';
+    }
+    return closing && depth===0 ? reference : '';
 
 };
 const createSubtitleReferenceResolver = searchIndex => {
