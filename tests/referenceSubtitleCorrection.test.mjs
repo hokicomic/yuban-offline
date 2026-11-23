@@ -143,6 +143,26 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.ok(!result.trusted || result.reviewDifferences?.length,'different minute or meridiem is not silently equivalent');
         }
     });
+    test('spoken handles align as a whole identifier across a timestamp and paragraph break: ' + file, () => {
+        for(const [handle,spoken] of [['NotChloeBennet','at not Chloe Bennett'],['TravelWithMina','at Travel With Mina'],['RiverStone','at River Stone']]) {
+            const heading='Sent yesterday at 7:45 p.m.:';
+            const sentence='Tilly, I notice that this girl @'+handle+' has liked TWO of your videos on the TikTok!';
+            const ref=heading+'\n\n'+sentence+' I think this means she likes you.';
+            const raw='Sent yesterday at 7.45 p.m. Tilly, I notice that this girl, '+spoken+', has liked two of your videos on the TikTok.';
+            const result=resolver(ref).resolve({text:raw});
+            assert.equal(result.aligned,true,JSON.stringify(result));
+            const display=api.applySubtitleReferencePreference(result);
+            assert.match(display.text,new RegExp('@'+handle));
+            assert.equal(display.text,heading+'\n\n'+sentence,'mapped words retain original punctuation and line breaks');
+            for(const time of ['7.45 p.m.','7:45 PM','7.45 p . m .'])
+                assert.equal(resolver(ref).resolve({text:raw.replace('7.45 p.m.',time)}).trusted,true,time);
+            const wrong=raw.replace(spoken,'at completely different account');
+            assert.equal(resolver(ref).resolve({text:wrong}).trusted,false,'unrelated handles are not guessed');
+            const changedTime=raw.replace('7.45','7.46');
+            const mismatch=resolver(ref).resolve({text:changedTime});
+            assert.ok(!mismatch.trusted || mismatch.reviewDifferences?.length,'clock mismatch remains protected');
+        }
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';

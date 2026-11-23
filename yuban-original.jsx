@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.298 · meridiem-time-alignment";
+const APP_VERSION = "v5.299 · spoken-handle-context-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -6713,7 +6713,7 @@ const normalizeSubtitleReferenceNumbers = (words, text) => {
             Number(minute.value) >= 0 && Number(minute.value) < 60 && /^\s+$/u.test(text.slice(words[hour.end-1].end, words[hour.end].start));
         const singleHour = /^\d{1,2}$/u.test(word.key) ? {value:word.key,end:i+1} : hour;
         const clockEnd = digits ? i+1 : spokenClock ? minute.end : singleHour ? singleHour.end : i;
-        const meridiem = clockEnd > i && text.slice(words[clockEnd-1].end).match(/^\s*([ap])\.?m\.?(?![a-z])/iu);
+        const meridiem = clockEnd > i && text.slice(words[clockEnd-1].end).match(/^\s*([ap])\s*\.?\s*m\s*\.?(?![a-z])/iu);
         if ((clockContext || meridiem || (digits && word.key.includes(':'))) &&
             ((digits && +digits[1] <= 23 && +digits[2] < 60) || spokenClock || (meridiem && singleHour && +singleHour.value>=1 && +singleHour.value<=12))) {
             const h = digits ? +digits[1] : spokenClock ? +hour.value : +singleHour.value, m = digits ? +digits[2] : spokenClock ? +minute.value : 0;
@@ -6821,6 +6821,26 @@ const isSubtitleReferenceNameWord = word => Boolean(word && !word.numeric &&
     !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && !SUBTITLE_REFERENCE_PROTECTED_WORDS.has(word.key) &&
     !SUBTITLE_REFERENCE_NAME_EXCLUSIONS.has(word.key) && /^\p{Lu}[\p{L}\p{M}'’]+$/u.test(word.text));
 const findSubtitleReferenceNameMatch = (words, i, tokens, j, lineTexts) => {
+    // Spoken @ handles are one identifier, even when ASR emits “at” plus
+    // several words. Require exact context on both sides; never interpret
+    // ordinary “at” phrases or change a different account by sound alone.
+    const ref=tokens[j],line=ref && lineTexts.get(ref.sourceLine);
+    if(ref && line?.[ref.start-1]==='@' && words[i]?.key==='at') {
+        const handle=line.slice(ref.start).match(/^[A-Za-z][A-Za-z0-9_]{2,}/u)?.[0];
+        if(handle && i>=2 && words[i-1].key===tokens[j-1]?.key && words[i-2].key===tokens[j-2]?.key) {
+            const refs=[];let k=j;
+            while(tokens[k]?.sourceLine===ref.sourceLine && tokens[k].end<=ref.start+handle.length)refs.push(tokens[k++]);
+            for(let count=2;count<=7 && i+count+1<words.length;count++) {
+                const spoken=words.slice(i+1,i+count).map(word=>word.key.replace(/^#number:/u,'')).join('');
+                const target=handle.toLowerCase().replace(/_/g,'');
+                const close=spoken===target || (!/\d/u.test(spoken+target) && isSubtitleReferenceSpellingVariant(spoken,target,true));
+                if(close && words[i+count].key===tokens[k]?.key && words[i+count+1].key===tokens[k+1]?.key)
+                    return {rawCount:count,refCount:refs.length,refs,text:'@'+handle};
+            }
+        }
+    }
+
+    if(ref && line?.[ref.start-1]==='@')return null;
     if (!isSubtitleReferenceNameWord(tokens[j]) || words.length < 8) return null;
     // At cue start, a fuzzy name match must begin at the source name's
     // beginning. Otherwise each suffix of a long name looks equally plausible.
