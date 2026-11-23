@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.295 · sentence-boundary-omission-recovery";
+const APP_VERSION = "v5.296 · word-aware-punctuation-diff";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7931,15 +7931,24 @@ const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
 // Word/punctuation diff keeps correction offsets valid without turning a whole
 // sentence into one giant blank. Offsets always refer to the untouched subtitle.
 const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
-    const split=text=>Array.from(text.matchAll(/[\p{L}\p{M}\p{N}]+|\s+|[^\s]/gu),match=>({text:match[0],start:match.index,end:match.index+match[0].length}));
+    const split=text=>Array.from(text.matchAll(/[\p{L}\p{M}\p{N}]+|\s+|[^\s]/gu),match=>({text:match[0],key:match[0].normalize('NFKC').toLowerCase(),weight:/[\p{L}\p{N}]/u.test(match[0])?4:1,start:match.index,end:match.index+match[0].length}));
     const a=split(raw),b=split(reference),width=b.length+1;
     const scores=new Uint16Array((a.length+1)*width);
     for(let i=a.length-1;i>=0;i--)for(let j=b.length-1;j>=0;j--)
-        scores[i*width+j]=a[i].text===b[j].text?1+scores[(i+1)*width+j+1]:Math.max(scores[(i+1)*width+j],scores[i*width+j+1]);
+        scores[i*width+j]=a[i].key===b[j].key?a[i].weight+scores[(i+1)*width+j+1]:Math.max(scores[(i+1)*width+j],scores[i*width+j+1]);
     const edits=[];let i=0,j=0,start=null,end=0,replacement='';
     const flush=()=>{if(start!==null){edits.push({start,end,text:replacement,from:raw.slice(start,end),to:replacement,kind:'reference'});start=null;replacement='';}};
     while(i<a.length || j<b.length){
-        if(i<a.length && j<b.length && a[i].text===b[j].text){flush();i++;j++;continue;}
+        // Anchor the same word across capitalization and adjacent punctuation
+        // changes. Exact-case LCS used to insert “—cold” and delete “Cold”.
+        if(i<a.length && j<b.length && a[i].key===b[j].key){
+            if(a[i].text===b[j].text)flush();
+            else {
+                if(start===null){start=a[i].start;end=start;}
+                end=a[i].end;replacement+=b[j].text;
+            }
+            i++;j++;continue;
+        }
         if(start===null){start=i<a.length?a[i].start:raw.length;end=start;}
         if(j<b.length && (i===a.length || scores[i*width+j+1]>=scores[(i+1)*width+j]))replacement+=b[j++].text;
         else end=a[i++].end;
@@ -9295,7 +9304,7 @@ const getSubtitleCorrectionDeletionMarkers = projection => {
     for(const edit of [...projection.edits].sort((a,b)=>a.start-b.start || a.end-b.end)) {
         if(!edit.text && edit.end>edit.start) {
             const deleted=String(edit.from || projection.raw.slice(edit.start,edit.end)).trim();
-            if(deleted) {
+            if(/[\p{L}\p{N}]/u.test(deleted)) {
                 const point=Math.max(0,Math.min(projection.text.length,edit.start+offset));
                 // Put the mark under the surviving space, never under a word.
                 // At sentence boundaries use a zero-width anchor instead.

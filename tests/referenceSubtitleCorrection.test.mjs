@@ -13,7 +13,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const marker = source.split('\n').find(line => line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
     const sentenceHelpers = source.slice(source.indexOf('const isAbbreviation ='), source.indexOf('const extractJsonObjectFromText ='));
     const helpers = source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='), source.indexOf('const MarkdownView ='));
-    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + '\n({applyCompleteSentenceReferencePreference,groupSubtitlesByReferenceSentences,getSubtitleReferenceSentenceText,buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
+    const api = vm.runInNewContext(marker + '\n' + sentenceHelpers + helpers + source.slice(source.indexOf('const tokenizeSubtitlePractice ='),source.indexOf('const splitSubtitlePracticeGraphemes =')) + source.slice(source.indexOf('const getSubtitleCorrectionDisplayRanges ='),source.indexOf('const SUBTITLE_DELETION_GAP_STYLE =')) + '\n({buildSubtitleReferenceDisplayEdits,getSubtitleCorrectionDeletionMarkers,applyCompleteSentenceReferencePreference,groupSubtitlesByReferenceSentences,getSubtitleReferenceSentenceText,buildSubtitlePracticeDualTokens,createSubtitleReferenceResolver, buildKnowledgeOriginalSearchIndex, findKnowledgePreciseSubtitleRanges, applySubtitleReferenceBoundaryAcceptance, applySubtitleReferencePreference, getSubtitleReferenceStatus})');
     const resolver = text => api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n' + text));
     test('full-reference sentence practice joins adjacent timed cues and retains raw captions: ' + file, () => {
         const first='After a quick wash, Vera dons her morning gear—a polo shirt with a Ralph Lauren logo so big that it covers her entire left breast';
@@ -73,6 +73,33 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(api.groupSubtitlesByReferenceSentences([cues[0]],index)[0],cues[0],'no sentence ending audio means no completed exercise');
         const negated=api.buildKnowledgeOriginalSearchIndex('[原文]\nNot '+full.toLowerCase());
         assert.equal(api.groupSubtitlesByReferenceSentences([{text:full.toLowerCase(),start:1,end:10}],negated)[0].referenceSentencePrefix,undefined,'negation is not silently added');
+    });
+    test('joining cues preserves Cold as cold instead of reporting a deletion: ' + file, () => {
+        const first='Sleeves on, Vera nods at her reflection and marches to the kitchen, where she gulps down a pint of room-temperature water';
+        const tail='cold water, Vera believes, would freeze the fats in your arteries and give you heart disease.';
+        const full=first+'—'+tail;
+        const index=api.buildKnowledgeOriginalSearchIndex('[原文]\n'+full);
+        const raw=[{text:first.replace('Sleeves on,','On,')+'.',start:10,end:20},{text:'Cold'+tail.slice(4),start:20,end:27}];
+        const grouped=api.groupSubtitlesByReferenceSentences(raw,index);
+        const result=api.applyCompleteSentenceReferencePreference(api.createSubtitleReferenceResolver(index).resolve(grouped[0]),grouped[0]);
+        assert.equal(result.text,full);
+        assert.equal(api.getSubtitleCorrectionDeletionMarkers(result).length,0,JSON.stringify(result.edits));
+        for(const [before,after] of [
+            ['water. Cold water.','water—cold water.'],
+            ['First clause. Next clause.','First clause; next clause.'],
+            ['“HELLO,” she said.','“Hello,” she said.'],
+            ['We stopped. Then we returned.','We stopped, then we returned.']
+        ]) {
+            const edits=api.buildSubtitleReferenceDisplayEdits(before,after);
+            let restored=before;
+            for(const edit of [...edits].sort((a,b)=>b.start-a.start))restored=restored.slice(0,edit.start)+edit.text+restored.slice(edit.end);
+            assert.equal(restored,after);
+            assert.equal(api.getSubtitleCorrectionDeletionMarkers({raw:before,text:after,changed:true,edits}).length,0,before);
+        }
+        const before='We chose cold cold water.',after='We chose cold water.';
+        const markers=api.getSubtitleCorrectionDeletionMarkers({raw:before,text:after,changed:true,edits:api.buildSubtitleReferenceDisplayEdits(before,after)});
+        assert.equal(markers.length,1);assert.equal(markers[0].deleted,'cold','real duplicate deletion remains visible');
+        assert.equal(api.getSubtitleCorrectionDeletionMarkers({raw:'Water.',text:'Water',changed:true,edits:[{start:5,end:6,text:'',from:'.'}]}).length,0,'punctuation deletion is not a word deletion');
     });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
