@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.301 · confirm-short-answer";
+const APP_VERSION = "v5.302 · compact-answer-annotations";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9827,7 +9827,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const guide = alignment?.slots.map(slot => (slot.matched || /^\s+$/u.test(slot.text)) ? slot.text : '_').join(' ') || '';
         const hasHints = runs.some(run => run.matched);
         return (
-            <span key={key} className="relative inline-block align-baseline max-w-full" data-subtitle-corrected-blank={token.corrected || undefined} style={{ minWidth:pendingLonger?'7em':undefined, paddingBottom: pendingLonger?'3.8em':confirmedShort?'2.8em':(answer?.revealed || correct) && token.corrected ? '1.5em' : showGuide ? (part.accepted?.length > 1 ? '1.9em' : '0.95em') : undefined }}>
+            <span key={key} className="relative inline-block align-baseline max-w-full" data-subtitle-corrected-blank={token.corrected || undefined} style={{ minWidth:pendingLonger?'7em':undefined, paddingBottom: pendingLonger?'3.8em':(answer?.revealed || correct) && token.corrected ? '1.5em' : showGuide ? (part.accepted?.length > 1 ? '1.9em' : '0.95em') : undefined }}>
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
@@ -9872,7 +9872,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 )}
                 {token.corrected && (correct || answer?.revealed) && (
                     <span data-subtitle-other-answer role="note" className="absolute bottom-0 left-1/2 -translate-x-1/2 text-center"
-                        style={{whiteSpace:confirmedShort?'normal':'nowrap',width:confirmedShort?'max-content':undefined,maxWidth:confirmedShort?'min(24em,80vw)':undefined,fontSize:'0.55em',lineHeight:'1.15',color:answer?.revealed?'#dc2626':'#64748b'}}>
+                        style={{whiteSpace:'nowrap',overflowX:confirmedShort?'auto':undefined,width:confirmedShort?'max-content':undefined,maxWidth:confirmedShort?'80vw':undefined,fontSize:'0.55em',lineHeight:'1.15',color:answer?.revealed?'#dc2626':'#64748b'}}>
                         {confirmedShort ? `已採用：${value}（${isSubtitlePracticePartCorrect(token.correctedText,value,language)?'文本':'原字幕'}）／另一答案：${isSubtitlePracticePartCorrect(token.correctedText,value,language)?token.originalText:token.correctedText}（${isSubtitlePracticePartCorrect(token.correctedText,value,language)?'原字幕':'文本'}）` : answer?.revealed ? `文本：${token.correctedText}／原字幕：${token.originalText || '缺字'}` :
                             isSubtitlePracticePartCorrect(token.correctedText,value,language) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
                     </span>

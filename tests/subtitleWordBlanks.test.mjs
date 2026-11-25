@@ -499,6 +499,8 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.equal(fields(nodes)[0].props.readOnly,false,'confirmed answers remain editable');
             assert.ok(!nodes.some(node=>node.props?.['data-subtitle-confirm-short']!==undefined));
             const disclosure=nodes.find(node=>node.props?.['data-subtitle-other-answer']!==undefined);
+            assert.equal(disclosure.props.style.whiteSpace,'nowrap','keep both answers on one annotation line');
+            assert.equal(nodes.find(node=>node.props?.['data-subtitle-corrected-blank']).props.style.paddingBottom,'1.5em','use the same annotation row height as normal corrections');
             assert.equal(disclosure.props.children,`已採用：${short}（${shortFromText?'文本':'原字幕'}）／另一答案：${long}（${shortFromText?'原字幕':'文本'}）`);
             assert.ok(records.some(record=>record.completedWithoutHints && !record.words.length),'confirmation is not an error or reveal');
             assert.equal(fields(render({...props,blankMode:false,correction:null})).length,0);
