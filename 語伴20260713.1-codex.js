@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.302 · compact-answer-annotations";
+const APP_VERSION = "v5.303 · preserve-subtitle-panel-space";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -23663,7 +23663,13 @@ ${userQ}`;
                     <div
                         className={`w-full relative rounded-lg overflow-hidden shadow-sm ring-1 ring-gray-100 ${isBlankReferencePanel ? '' : 'transition-all duration-300 ease-in-out'} shrink-0 ${isVideoMasked ? 'h-12 bg-gray-100' : ''} ${!isVideoMasked && isTopPanelDocumentMode ? 'bg-white' : 'bg-black'}`}
                         aria-hidden={!isVideoMasked && effectiveTopPanelHeight === 0 ? true : undefined}
-                        style={!isVideoMasked ? { height: `${effectiveTopPanelHeight}vh` } : undefined}
+                        style={!isVideoMasked ? {
+                            height: `${effectiveTopPanelHeight}vh`,
+                            // Cap the document against the available reading area,
+                            // not the entire viewport (which includes toolbars).
+                            // Reserve a usable caption area even with a keyboard.
+                            maxHeight: isTopPanelDocumentMode ? 'max(0px, calc(100% - min(180px, 40%) - 20px))' : undefined
+                        } : undefined}
                     >
                         {/* [FIX] Removed manual onTimeUpdate, relying on Worker tick */}
                         <video ref={playerRef} src={mediaSrc} preload="auto"
