@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.303 · preserve-subtitle-panel-space";
+const APP_VERSION = "v5.304 · tighter-correction-spacing";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10050,7 +10050,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         const guide = alignment?.slots.map(slot => (slot.matched || /^\s+$/u.test(slot.text)) ? slot.text : '_').join(' ') || '';
         const hasHints = runs.some(run => run.matched);
         return (
-            <span key={key} className="relative inline-block align-baseline max-w-full" data-subtitle-corrected-blank={token.corrected || undefined} style={{ minWidth:pendingLonger?'7em':undefined, paddingBottom: pendingLonger?'3.8em':(answer?.revealed || correct) && token.corrected ? '1.5em' : showGuide ? (part.accepted?.length > 1 ? '1.9em' : '0.95em') : undefined }}>
+            <span key={key} className="relative inline-block align-baseline max-w-full" data-subtitle-corrected-blank={token.corrected || undefined} style={{ minWidth:pendingLonger?'7em':undefined, paddingBottom: pendingLonger?'3.8em':(answer?.revealed || correct) && token.corrected ? '0.8em' : showGuide ? (part.accepted?.length > 1 ? '1.9em' : '0.95em') : undefined }}>
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
