@@ -481,6 +481,37 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const names=api.buildSubtitlePracticeDualTokens('We visited Kherson yesterday.','en',['Kherson'],{raw:'We visited Haerson yesterday.',text:'We visited Kherson yesterday.',changed:true,edits:[{start:11,end:18,text:'Kherson',from:'Haerson',kind:'name'}]});
         assert.equal(names.some(t=>t.kind==='word'&&t.parts.some(p=>p.text==='Kherson')),false);
     });
+    test('clicking short-answer confirmation completes without hints and discloses both sources: ' + file, () => {
+        for(const [short,long,shortFromText] of [['any','many',true],['fit','befit',false],['act','acted',true]]) {
+            const text=shortFromText?short:long,original=shortFromText?long:short;
+            const render=setup(),records=[],props={...base(),text,subtitle:{text:original,start:1,end:4},autoFocusEnabled:false,
+                reviewContext:{},onReviewRecord:(session,record)=>records.push(record),
+                correction:{raw:original,text,changed:true,edits:[{start:0,end:original.length,text,from:original,kind:'spelling'}]}};
+            let nodes=render(props);type(fields(nodes)[0],short);nodes=render(props);
+            assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],false);
+            assert.equal(fields(nodes)[0].props.style.borderBottomColor,'#d97706');
+            assert.ok(!nodes.some(node=>node.props?.['data-subtitle-other-answer']!==undefined),'other answer stays masked before confirmation');
+            const button=nodes.find(node=>node.props?.['data-subtitle-confirm-short']!==undefined);
+            assert.ok(button);button.props.onClick({preventDefault(){},stopPropagation(){}});
+            nodes=render(props);
+            assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true);
+            assert.equal(fields(nodes)[0].props.style.color,'#2f7d57');
+            assert.equal(fields(nodes)[0].props.readOnly,false,'confirmed answers remain editable');
+            assert.ok(!nodes.some(node=>node.props?.['data-subtitle-confirm-short']!==undefined));
+            const disclosure=nodes.find(node=>node.props?.['data-subtitle-other-answer']!==undefined);
+            assert.equal(disclosure.props.children,`已採用：${short}（${shortFromText?'文本':'原字幕'}）／另一答案：${long}（${shortFromText?'原字幕':'文本'}）`);
+            assert.ok(records.some(record=>record.completedWithoutHints && !record.words.length),'confirmation is not an error or reveal');
+            assert.equal(fields(render({...props,blankMode:false,correction:null})).length,0);
+            nodes=render(props);assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true,'confirmation survives switching display modes');
+            type(fields(nodes)[0],'wrong');nodes=render(props);
+            assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],false);
+            assert.ok(!nodes.some(node=>node.props?.['data-subtitle-other-answer']!==undefined),'editing removes the prior disclosure');
+            type(fields(nodes)[0],short);nodes=render(props);
+            assert.ok(nodes.some(node=>node.props?.['data-subtitle-confirm-short']!==undefined),'editing clears the old explicit confirmation');
+            type(fields(nodes)[0],long);nodes=render(props);
+            assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true,'the longer answer still completes automatically');
+        }
+    });
     test('typing updates real input props, correct/revealed colors, and retains drafts across modes and cues: ' + file, () => {
         const render = setup(), props = base();
         let inputs = fields(render(props));
