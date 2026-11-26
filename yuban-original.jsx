@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.306 · complete-opening-phrase-alignment";
+const APP_VERSION = "v5.307 · anchored-whole-phrase-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7015,6 +7015,34 @@ const getSubtitleReferenceSpanMatch = (words,i,tokens,j,lineTexts,rawText) => {
         while(right<3&&words[i+rawCount+right]?.key===tokens[j+refCount+right]?.key&&words[i+rawCount+right])right++;
         if((left>=2&&right>=2)||(left>=4&&right>=1)||(i===0&&words.length>=14&&right>=1))return {rawCount,refCount,equivalent:false};
     }
+    // Short fused speech needs phrase-level comparison even without a
+    // contraction, in either direction and at any anchored position.
+    const speechKey=value=>value.replace(/'/g,'').replace(/ph/g,'f').replace(/sh|ch/g,'s').replace(/c(?=[eiy])/g,'s').replace(/c|q/g,'k')
+        .replace(/th/g,'t').replace(/h/g,'').replace(/b/g,'p').replace(/d/g,'t').replace(/g/g,'k')
+        .replace(/v/g,'f').replace(/z/g,'s').replace(/[aeiouy]/g,'').replace(/(.)\1+/g,'$1');
+    for(const [rawCount,refCount] of [[1,2],[2,1],[1,3],[3,1],[2,3],[3,2]]) {
+        const raw=words.slice(i,i+rawCount),refs=tokens.slice(j,j+refCount);
+        if(raw.length!==rawCount || refs.length!==refCount || refs.some(item=>item.sourceLine!==ref.sourceLine))continue;
+        if(raw[0].key===refs[0].key || raw.at(-1).key===refs.at(-1).key)continue;
+        if([...raw,...refs].some(item=>item.numeric || SUBTITLE_REFERENCE_PROTECTED_WORDS.has(item.key)))continue;
+        const a=raw.map(item=>item.key).join(''),b=refs.map(item=>item.key).join('');
+        const key=speechKey(a);
+        if(key.length<3 || key!==speechKey(b) || a===b || Math.abs(a.length-b.length)>Math.max(6,Math.min(a.length,b.length)))continue;
+        const gaps=(items,text)=>typeof text==='string' && items.slice(1).every((item,k)=>/^[\s'’\-]*$/u.test(text.slice(items[k].end,item.start)));
+        const line=lineTexts?.get(ref.sourceLine);
+        if(!gaps(raw,rawText) || !gaps(refs,line))continue;
+        let left=0,right=0;
+        while(left<6 && words[i-left-1] && words[i-left-1].key===tokens[j-left-1]?.key)left++;
+        while(right<6 && words[i+rawCount+right] && words[i+rawCount+right].key===tokens[j+refCount+right]?.key)right++;
+        const before=line?.slice(0,ref.start) || '';
+        const sentenceStart=!before.trim() || /[.!?…][”’"')\]]*\s*[“‘"(\[]*$/u.test(before);
+        const after=line?.slice(refs.at(-1).end) || '';
+        const sentenceEnd=/^[.!?…]/u.test(after);
+        if((left>=3 && right>=3) || (i===0 && sentenceStart && right>=6) ||
+            (i+rawCount===words.length && sentenceEnd && left>=6))
+            return {rawCount,refCount,equivalent:false,wholePhrase:true};
+    }
+
     return null;
 };
 
@@ -7331,36 +7359,6 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
     return changed?result:cues;
 };
 
-// A cue-start spelling match can hide a contracted phrase immediately to
-// its left (one ASR word versus several source words). Compare the whole
-// boundary phrase before publishing the shorter, incomplete correction.
-const recoverSubtitleReferenceOpeningPhrase = (selected,words,tokens,lineTexts,raw,after=[]) => {
-    if(words.length<10 || !selected?.ranges?.length)return selected;
-    const first=selected.ranges[0];
-    const at=tokens.findIndex(word=>word.sourceLine===first.sourceLine && word.start===first.start);
-    const prefix=tokens[at-1],word=tokens[at];
-    if(!prefix || prefix.sourceLine!==word?.sourceLine ||
-        !/^(?:he|she|it|we|they|you|i)'(?:s|d|ve|ll|re|m)$/u.test(prefix.key))return selected;
-    const line=lineTexts.get(first.sourceLine),before=line.slice(0,prefix.start);
-    if(before.trim() && !/[.!?…][”’"')\]]*\s*[“‘"(\[]*$/u.test(before))return selected;
-    if(after.some(range=>range.sourceLine===prefix.sourceLine && range.end>prefix.start))return selected;
-    if(!words.slice(1).every((word,i)=>word.key===tokens[at+i+1]?.key))return selected;
-    const sound=value=>value.replace(/'/g,'').replace(/ph/g,'f').replace(/sh|ch/g,'s')
-        .replace(/th/g,'t').replace(/h/g,'').replace(/b/g,'p').replace(/d/g,'t').replace(/g/g,'k')
-        .replace(/v/g,'f').replace(/z/g,'s').replace(/[aeiouy]/g,'').replace(/(.)\1+/g,'$1');
-    const a=sound(words[0].key),b=sound(prefix.key+word.key);
-    if(a.length<3 || a!==b || words[0].key===word.key)return selected;
-    const text=line.slice(prefix.start,word.end),edit={start:words[0].start,end:words[0].end,
-        text,from:words[0].text,to:text,kind:'spelling'};
-    const ranges=selected.ranges.map((range,i)=>i?range:{...range,start:prefix.start,text:line.slice(prefix.start,range.end)});
-    const edits=selected.edits.filter(item=>item.end<=edit.start || item.start>=edit.end);
-    let corrected=raw;
-    for(const change of [...edits].sort((a,b)=>b.start-a.start))corrected=corrected.slice(0,change.start)+change.text+corrected.slice(change.end);
-    return {...selected,start:at-1,text:corrected,edits,ranges,changed:edits.length>0,trusted:false,
-        alignmentMethod:'opening_phrase',reviewDifferences:[{side:'difference',text:`${edit.from} → ${text}`,
-            signature:JSON.stringify(['opening_phrase',ranges,edit]),edit}]};
-};
-
 const createSubtitleReferenceResolver = searchIndex => {
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
@@ -7524,13 +7522,24 @@ const createSubtitleReferenceResolver = searchIndex => {
             const candidates = [];
             for (const start of starts) {
                 let i = 0, j = start, exact = 0, substitutions = 0, duplicates = 0, omissions = 0, nameCorrections = 0, nameWords = 0, anchoredCorrections = 0;
-                const edits = [], consumed = [];
+                const edits = [], consumed = [], phraseReviews=[];
                 while (i < words.length && j < tokens.length) {
                     const word = words[i], ref = tokens[j];
                     if (consumed.length && ref.sourceLine - consumed[consumed.length - 1].sourceLine > 4) break;
                     if (word.key === ref.key) { exact++; consumed.push(ref); i++; j++; continue; }
                     const span=getSubtitleReferenceSpanMatch(words,i,tokens,j,lineTexts,raw);
                     if(span?.equivalent){exact+=Math.max(span.rawCount,span.refCount);consumed.push(...tokens.slice(j,j+span.refCount));i+=span.rawCount;j+=span.refCount;continue;}
+                    if(span && !span.equivalent && span.rawCount!==span.refCount && phraseReviews.length<2) {
+                        const last=words[i+span.rawCount-1],refs=tokens.slice(j,j+span.refCount);
+                        const refLine=lineTexts.get(ref.sourceLine);
+                        const spanEnd=(items,text)=>items.at(-1).end+(items.length>1 && items.every(item=>/^[A-Z]$/u.test(item.text)) && text[items.at(-1).end]==='.'?1:0);
+                        const rawEnd=spanEnd(words.slice(i,i+span.rawCount),raw);
+                        const replacement=refLine.slice(ref.start,spanEnd(refs,refLine));
+                        const edit={start:word.start,end:rawEnd,text:replacement,from:raw.slice(word.start,rawEnd),to:replacement,kind:'spelling'};
+                        phraseReviews.push({side:'difference',text:`${edit.from} → ${edit.to}`,edit});
+                        exact+=Math.max(span.rawCount,span.refCount)-1;
+                        consumed.push(...refs);i+=span.rawCount;j+=span.refCount;continue;
+                    }
                     if (ref.possibleFootnote && consumed.length && !word.numeric) {
                         consumed.push(ref); j++; continue;
                     }
@@ -7605,7 +7614,8 @@ const createSubtitleReferenceResolver = searchIndex => {
                 }
                 if (sequential && sourceLine >= 0 && (ranges[0].sourceLine < sourceLine - 1 || ranges[0].sourceLine > sourceLine + 48)) continue;
                 ranges.forEach(range => { range.text = lineTexts.get(range.sourceLine).slice(range.start, range.end); });
-                candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2 + nameCorrections * 3, changed, trusted: true });
+                candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2 + nameCorrections * 3 + phraseReviews.length, changed, trusted:!phraseReviews.length,
+                    reviewDifferences:phraseReviews.map(item=>({...item,signature:JSON.stringify(['whole_phrase',ranges,item.edit])})),...(phraseReviews.length?{alignmentMethod:'phrase_alignment'}:{}) });
             }
             if (!candidates.length) {
                 const contextual=locateSubtitleReferenceContext(words,tokens,lineTexts,starts,raw,{sourceLine,sequential});
@@ -7667,7 +7677,7 @@ const createSubtitleReferenceResolver = searchIndex => {
                 correctedText:candidate.text, cost:candidate.cost,
                 ranges:candidate.ranges.map(range=>({...range}))}))
         });
-        const selected = recoverSubtitleReferenceOpeningPhrase(best[0],words,tokens,lineTexts,raw,after);
+        const selected = best[0];
         // A boundary omission is indistinguishable from a deliberately partial
         // cue. Offer a review action; never silently extend the spoken range.
         const boundaryOmissions = [];

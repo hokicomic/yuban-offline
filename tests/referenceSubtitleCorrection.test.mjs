@@ -188,6 +188,35 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const unrelated=resolver('He is truly favored by the gods. He’s been '+tail).resolve({text:'green '+tail});
         assert.equal(unrelated.alignmentMethod==='opening_phrase',false,'unrelated sounds cannot justify borrowing a pronoun');
     });
+    test('whole-phrase review works mid-cue, at the end, and in both word-count directions: ' + file, () => {
+        const left='The neighbors told us yesterday that ',right=' in such good spirits these days and everyone was pleased about the news.';
+        for(const [corrected,heard] of [["he’s been",'spin'],['he has been','spin'],['ice cream','scream'],['spin',"he's been"],['spin','he has been']]) {
+            for(const ending of [false,true]) {
+                const ref=left+corrected+(ending?'.':right),raw=left+heard+(ending?'.':right);
+                const base=resolver(ref).resolve({text:raw});
+                assert.equal(base.aligned,true,JSON.stringify(base));
+                assert.equal(base.trusted,false,corrected+' / '+heard);
+                assert.equal(base.reviewDifferences.length,1,JSON.stringify({corrected,heard,ending,base}));
+                assert.equal(base.reviewDifferences[0].edit.from,heard);
+                assert.equal(base.reviewDifferences[0].edit.to,corrected);
+                const display=api.applySubtitleReferencePreference(base);
+                assert.equal(display.text,ref);
+                assert.equal(api.getSubtitleCorrectionDeletionMarkers(display).length,0,'no half-phrase deletion markers');
+                const words=api.buildSubtitlePracticeDualTokens(display.text,'en-US',[],display);
+                const phrase=words.filter(word=>word.corrected);
+                assert.equal(phrase.length,1);
+                assert.deepEqual(Array.from(phrase[0].parts[0].accepted),[corrected,heard]);
+            }
+        }
+        const ref=left+"he's been"+right;
+        const twice=left+"he's been"+right+' Later the neighbors explained that he has been in such good spirits these days and everyone was pleased about the news.';
+        assert.equal(resolver(twice).resolve({text:'spin'+right}).trusted,false,'different competing phrase locations stay uncertain');
+        for(const word of ['not spin','300','never']) {
+            const result=resolver(ref).resolve({text:left+word+right});
+            assert.ok(!result.trusted || result.reviewDifferences?.length,'protected meanings cannot be silently rewritten');
+        }
+        assert.notEqual(resolver("He's been in such good spirits.").resolve({text:'spin'}).aligned,true,'no phrase inference from an isolated word');
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';
