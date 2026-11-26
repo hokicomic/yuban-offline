@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.308 · spaceless-phrase-answers";
+const APP_VERSION = "v5.309 · short-sentence-reference-review";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7594,7 +7594,15 @@ const createSubtitleReferenceResolver = searchIndex => {
                     if(j!==beforeBoundary)continue;
                 }
                 if (i !== words.length || consumed.length < 2) continue;
-                const changed = edits.length > 0;
+                const firstRef=consumed[0],lastRef=consumed.at(-1);
+                const sourceLineText=lineTexts.get(firstRef.sourceLine) || '';
+                const sourcePrefix=sourceLineText.slice(0,firstRef.start),sourceSuffix=sourceLineText.slice(lastRef.end);
+                const completeStart=/^[\s“‘"(\[]*$/u.test(sourcePrefix) || /[.!?…][”’"')\]]*\s+[“‘"(\[]*$/u.test(sourcePrefix);
+                const completeEnd=/^[.!?…]/u.test(sourceSuffix) || /^[\s”’"')\]]*$/u.test(sourceSuffix);
+                const shortReview=words.length>=4 && words.length<=6 && substitutions===1 && edits.length===1 &&
+                    !duplicates && !omissions && !nameCorrections && !anchoredCorrections && !phraseReviews.length &&
+                    exact===words.length-1 && firstRef.sourceLine===lastRef.sourceLine && completeStart && completeEnd;
+                const changed = edits.length > 0 && !shortReview;
                 const contentExact = new Set(words.filter(word => !word.numeric && !KNOWLEDGE_ALIGNMENT_STOP_WORDS.has(word.key) && word.key.length >= 3 && consumed.some(ref => ref.key === word.key)).map(word => word.key)).size;
                 const agreementLength = words.length - nameWords + nameCorrections;
                 if (anchoredCorrections && (exact / agreementLength < 0.90 || contentExact < 4)) continue;
@@ -7604,8 +7612,11 @@ const createSubtitleReferenceResolver = searchIndex => {
                 // exact adjacent pair as well as the whole-window evidence above.
                 if (changed && (words[0].key !== consumed[0].key || words[words.length - 1].key !== consumed[consumed.length - 1].key) &&
                     (words.length < 7 || exact < words.length - Math.max(2, nameWords))) continue;
+                if(shortReview && contentExact<2)continue;
+                const autoEdits=shortReview?[]:edits;
+                const pendingReviews=shortReview?edits.map(edit=>({side:'difference',text:`${edit.from} → ${edit.to}`,edit})):phraseReviews;
                 let text = raw;
-                for (const edit of [...edits].sort((a, b) => b.start - a.start)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
+                for (const edit of [...autoEdits].sort((a, b) => b.start - a.start)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
                 const ranges = [];
                 for (const ref of consumed) {
                     const last = ranges[ranges.length - 1];
@@ -7614,8 +7625,8 @@ const createSubtitleReferenceResolver = searchIndex => {
                 }
                 if (sequential && sourceLine >= 0 && (ranges[0].sourceLine < sourceLine - 1 || ranges[0].sourceLine > sourceLine + 48)) continue;
                 ranges.forEach(range => { range.text = lineTexts.get(range.sourceLine).slice(range.start, range.end); });
-                candidates.push({ start, text, edits, ranges, cost: substitutions * 2 + duplicates + omissions * 2 + nameCorrections * 3 + phraseReviews.length, changed, trusted:!phraseReviews.length,
-                    reviewDifferences:phraseReviews.map(item=>({...item,signature:JSON.stringify(['whole_phrase',ranges,item.edit])})),...(phraseReviews.length?{alignmentMethod:'phrase_alignment'}:{}) });
+                candidates.push({ start, text, edits:autoEdits, ranges, cost: substitutions * 2 + duplicates + omissions * 2 + nameCorrections * 3 + phraseReviews.length, changed, trusted:!pendingReviews.length,
+                    reviewDifferences:pendingReviews.map(item=>({...item,signature:JSON.stringify(['whole_phrase',ranges,item.edit])})),...(pendingReviews.length?{alignmentMethod:shortReview?'short_sentence_review':'phrase_alignment'}:{}) });
             }
             if (!candidates.length) {
                 const contextual=locateSubtitleReferenceContext(words,tokens,lineTexts,starts,raw,{sourceLine,sequential});

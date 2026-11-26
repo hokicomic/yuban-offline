@@ -217,6 +217,34 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         }
         assert.notEqual(resolver("He's been in such good spirits.").resolve({text:'spin'}).aligned,true,'no phrase inference from an isolated word');
     });
+    test('a complete four-word sentence with one spelling difference becomes a reviewable match: ' + file, () => {
+        const ref='“Mung beans and pandan. Boil for fifteen minutes, maybe twenty if you want it richer in flavor.”';
+        const raw='Mung beans and pantan.';
+        const result=resolver(ref).resolve({text:raw});
+        assert.equal(result.aligned,true,JSON.stringify(result));assert.equal(result.trusted,false);
+        assert.equal(result.text,raw,'the unconfirmed base never mutates the raw caption');
+        assert.equal(result.reviewDifferences.length,1);assert.equal(result.reviewDifferences[0].edit.to,'pandan');
+        const preferred=api.applySubtitleReferencePreference(result);
+        assert.equal(preferred.text,'Mung beans and pandan.');
+        assert.equal(preferred.reviewDifferences.length,1);
+        const tokens=api.buildSubtitlePracticeDualTokens(preferred.text,'en-US',[],preferred);
+        const blank=tokens.find(token=>token.corrected);
+        assert.deepEqual(Array.from(blank.parts[0].accepted),['pandan','pantan']);
+        for(const [reference,caption] of [['Green leaves and stalks.','Green leaves and stalkes.'],['Fresh fruit tastes wonderful.','Fresh fruit tastes wonderfull.']]) {
+            const located=resolver(reference).resolve({text:caption});
+            assert.equal(located.aligned,true,caption);assert.equal(located.trusted,false);
+            assert.equal(api.applySubtitleReferencePreference(located).text,reference);
+        }
+        assert.equal(resolver(ref+'\n'+ref.replace('pandan','pantan')).resolve({text:raw}).changed,false);
+        const duplicate=resolver(ref+'\n'+ref).resolve({text:raw});
+        assert.notEqual(duplicate.aligned,true,'multiple equally good positions remain ambiguous');
+        for(const [source,cue] of [
+            ['Mung beans and pandan.','Mung beans and nonsense.'],
+            ['We bought mung beans and pandan for our guests.','Mung beans and pantan.'],
+            ['Mung beans cost 200.','Mung beans cost 300.'],
+            ['We should never leave.','We should always leave.']
+        ]) assert.notEqual(resolver(source).resolve({text:cue}).alignmentMethod,'short_sentence_review',cue);
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';
