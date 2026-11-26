@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.307 · anchored-whole-phrase-alignment";
+const APP_VERSION = "v5.308 · spaceless-phrase-answers";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9320,7 +9320,7 @@ const foldSubtitlePracticeLetters = (value,language) => {
     if(!/^en(?:-|$)/iu.test(String(language || '')))return text;
     return text.normalize('NFD').replace(/(\p{Script=Latin})\p{M}+/gu,'$1').normalize('NFC');
 };
-const normalizeSubtitlePracticeOption = (value,language) => foldSubtitlePracticeLetters(value,language).replace(/['’ʼ‐‑–—-]/gu,'');
+const normalizeSubtitlePracticeOption = (value,language) => foldSubtitlePracticeLetters(value,language).replace(/[\s'’ʼ‐‑–—-]/gu,'');
 const getSubtitlePracticeMatchedOption = (part,value) => getSubtitlePracticePartOptions(part).find(expected=>
     part.accepted ? normalizeSubtitlePracticeOption(expected,part.language)===normalizeSubtitlePracticeOption(value,part.language) : isSubtitlePracticePartCorrect(expected,value,part.language));
 const getSubtitlePracticePendingLongerOptions = (part,value) => {
@@ -9635,10 +9635,6 @@ const createPlaybackShortcutHandler = getState => {
         if (!space && !['-', '/', '.'].includes(key)) return;
         if (event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
             event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
-        const phrase = event.target?.dataset?.subtitlePhraseAnswer;
-        if (space && phrase) {
-            try { if (JSON.parse(phrase).some(expected => expected.toLowerCase().startsWith(String(event.target.value || '').toLowerCase() + ' '))) return; } catch (_) {}
-        }
         const state = getState();
         if (!state?.enabled || (key === '.' && !state.blankMode)) return;
         const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');

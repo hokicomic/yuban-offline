@@ -87,6 +87,15 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const ordinaryEditor = event(editor, {key:'.',code:'Period'}); handler(ordinaryEditor);
         assert.equal(ordinaryEditor.prevented, undefined); assert.equal(toggles, 2);
     });
+    test('Space remains a playback shortcut inside a partially typed phrase answer: ' + file, () => {
+        let calls=0;
+        const handler=create(()=>({enabled:true,echoMode:true,replayEcho:()=>calls++}));
+        const target={dataset:{subtitlePhraseAnswer:JSON.stringify(["He's been",'spin'])},value:"He's",closest:()=>blank};
+        const keydown=event(blank,{type:'keydown',target});handler(keydown);
+        assert.equal(calls,1);assert.equal(keydown.prevented,true);
+        const before=event(blank,{type:'beforeinput',inputType:'insertText',data:' ',target});handler(before);
+        assert.equal(before.prevented,true);assert.equal(calls,1,'beforeinput does not replay twice');
+    });
     test('typing spaces, composition, modified shortcuts and open overlays are left alone: ' + file, () => {
         let calls = 0; const state = { enabled: true, toggle: () => calls++ };
         const handler = create(() => state);

@@ -514,6 +514,28 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.equal(fields(nodes)[0].props['data-subtitle-part-complete'],true,'the longer answer still completes automatically');
         }
     });
+    test('multiword answers accept omitted spaces and restore original formatting without hints: ' + file, () => {
+        for(const typed of ["he'sbeen",'hesbeen',"he's been",'hes been']) {
+            const text="He's been",raw='spin',render=setup(),records=[];
+            const props={...base(),text,subtitle:{text:raw,start:1,end:3},autoFocusEnabled:false,reviewContext:{},onReviewRecord:(session,record)=>records.push(record),
+                correction:{raw,text,changed:true,edits:[{start:0,end:4,text,from:raw,kind:'spelling'}]}};
+            type(fields(render(props))[0],typed);
+            const nodes=render(props),field=fields(nodes)[0];
+            assert.equal(field.props['data-subtitle-part-complete'],true,typed);
+            assert.equal(field.props.value,text,'show canonical spaces and apostrophe after acceptance');
+            assert.equal(field.props.style.color,'#2f7d57');
+            assert.ok(records.some(record=>record.completedWithoutHints && !record.words.length));
+            assert.equal(nodes.find(node=>node.props?.['data-subtitle-other-answer']!==undefined).props.children,'原字幕：spin');
+        }
+        const part={kind:'letters',index:0,text:'I am ill',accepted:['I am ill',"I'm ill"],language:'en-US'};
+        const word={kind:'word',index:0,parts:[part]};
+        for(const typed of ['iamill','imill'])assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,typed)),true);
+        const nested={kind:'word',index:0,parts:[{...part,text:'a bit',accepted:['a bit','quite a bit']}]};
+        let answer=api.updateSubtitlePracticeAnswer(nested,null,0,'abit');
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(nested,answer),false,'spaceless short answer still requires confirmation');
+        answer=api.updateSubtitlePracticeAnswer(nested,answer,0,'abit',false,true);
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(nested,answer),true);
+    });
     test('typing updates real input props, correct/revealed colors, and retains drafts across modes and cues: ' + file, () => {
         const render = setup(), props = base();
         let inputs = fields(render(props));
