@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.304 · tighter-correction-spacing";
+const APP_VERSION = "v5.305 · echo-replay-seek-lifecycle";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -4183,9 +4183,9 @@ const monitorMediaPlayback = (player, { isSuppressed, onState, onRecover, onFail
 };
 
 // A seek request is not proof that audio decoding has reached the target.
-const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, onDiagnostic = () => {}, timeoutMs = 15000, reload = false }) => {
+const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFailure, onDiagnostic = () => {}, timeoutMs = 15000, reload = false, tolerance = 0.15 }) => {
     let timer = null, finished = false, attempts = 0, reloaded = reload, recovering = reload;
-    let observedCompletion = !reload && !player.seeking && Math.abs(Number(player.currentTime) - target) <= 0.15;
+    let observedCompletion = !reload && !player.seeking && Math.abs(Number(player.currentTime) - target) <= tolerance;
     const started = Date.now();
     let lastAssignment = started, lastProgress = started, lastState = '';
     const source = player.src;
@@ -4209,7 +4209,7 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
     const emptied = () => { if (!recovering) fail(); };
     const assignTarget = (force = false) => {
         if (player.readyState < 1 || (!force && player.seeking) || attempts >= 3) return;
-        if (!force && Math.abs(Number(player.currentTime) - target) <= 0.15) return;
+        if (!force && Math.abs(Number(player.currentTime) - target) <= tolerance) return;
         attempts++; lastAssignment = Date.now(); observedCompletion = false;
         try { player.currentTime = target; } catch (_) { /* Metadata/data events can retry. */ }
     };
@@ -4220,11 +4220,11 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
         const actual = Number(player.currentTime);
         const state = `${actual}:${player.readyState}:${Boolean(player.seeking)}`;
         if (state !== lastState) { lastState = state; lastProgress = Date.now(); }
-        if (observedCompletion && !player.seeking && player.readyState >= 2 && Math.abs(actual - target) <= 0.15) {
+        if (observedCompletion && !player.seeking && player.readyState >= 2 && Math.abs(actual - target) <= tolerance) {
             cleanup(); report('located'); onLocated(actual); return;
         }
         if (Date.now() - started >= timeoutMs) { fail(); return; }
-        if (!player.seeking && Math.abs(actual - target) > 0.15) assignTarget();
+        if (!player.seeking && Math.abs(actual - target) > tolerance) assignTarget();
         if (finished) return;
         // A superseded/stalled iOS seek must not hold the new target hostage.
         // Retry only after a real stall, never on ordinary buffered repeats.
@@ -4255,7 +4255,7 @@ const performVerifiedMediaSeek = (player, target, { isCurrent, onLocated, onFail
         catch (_) { fail(); }
     }
     // Always supersede an old seek, including when it never emitted seeked.
-    if (!finished && (player.seeking || Math.abs(Number(player.currentTime) - target) > 0.15)) assignTarget(true);
+    if (!finished && (player.seeking || Math.abs(Number(player.currentTime) - target) > tolerance)) assignTarget(true);
     poll();
     return cancel;
 };
@@ -11582,8 +11582,7 @@ export default function App() {
         echoPhaseRef.current = 'listening';
         setEchoPhase('listening');
         setEchoNotice('播放完畢後會停止；請先聽腦中的回音，再自行覆誦。');
-        seekThenMaybePlay(range.start, true);
-        setIsPlaying(true);
+        seekThenMaybePlay(range.start, true, null, { seekTolerance: Math.min(0.025,(range.end-range.start)/4) });
     };
 
 
@@ -11755,13 +11754,16 @@ export default function App() {
                 return;
             }
             setCurrentTime(player.currentTime);
+            // Paused timeupdate/seeked events are not a new playback pass.
+            if (player.paused) return;
             if (player.currentTime < end - 0.025) return;
             if (echoPhaseRef.current === 'selecting') {
                 seekThenMaybePlay(start, true);
                 return;
             }
+            // Do not seek to B after pausing: that starts another asynchronous
+            // native seek, which can collide with the next replay on mobile.
             player.pause();
-            player.currentTime = end;
             setIsPlaying(false);
             echoPhaseRef.current = 'ready';
             setEchoPhase('ready');
@@ -11806,7 +11808,7 @@ export default function App() {
         });
     };
 
-    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { bufferedEnd = null, reload = false } = {}) => {
+    const seekThenMaybePlay = (targetTime, shouldPlay, onLocated = null, { bufferedEnd = null, reload = false, seekTolerance = 0.15 } = {}) => {
         const player = playerRef.current;
         if (!player) return;
         const t = Math.max(0, Math.min(Number(targetTime) || 0, Number(player.duration) || duration || Infinity));
@@ -11861,6 +11863,7 @@ export default function App() {
         };
         session.cancel = performVerifiedMediaSeek(player, t, {
             reload: needsReload,
+            tolerance: seekTolerance,
             isCurrent: () => token === timerTokenRef.current && playerRef.current === player,
             onLocated: (actual) => {
                 session.active = false;
