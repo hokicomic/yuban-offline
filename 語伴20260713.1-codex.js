@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.305 · echo-replay-seek-lifecycle";
+const APP_VERSION = "v5.306 · complete-opening-phrase-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7554,6 +7554,36 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
     return changed?result:cues;
 };
 
+// A cue-start spelling match can hide a contracted phrase immediately to
+// its left (one ASR word versus several source words). Compare the whole
+// boundary phrase before publishing the shorter, incomplete correction.
+const recoverSubtitleReferenceOpeningPhrase = (selected,words,tokens,lineTexts,raw,after=[]) => {
+    if(words.length<10 || !selected?.ranges?.length)return selected;
+    const first=selected.ranges[0];
+    const at=tokens.findIndex(word=>word.sourceLine===first.sourceLine && word.start===first.start);
+    const prefix=tokens[at-1],word=tokens[at];
+    if(!prefix || prefix.sourceLine!==word?.sourceLine ||
+        !/^(?:he|she|it|we|they|you|i)'(?:s|d|ve|ll|re|m)$/u.test(prefix.key))return selected;
+    const line=lineTexts.get(first.sourceLine),before=line.slice(0,prefix.start);
+    if(before.trim() && !/[.!?…][”’"')\]]*\s*[“‘"(\[]*$/u.test(before))return selected;
+    if(after.some(range=>range.sourceLine===prefix.sourceLine && range.end>prefix.start))return selected;
+    if(!words.slice(1).every((word,i)=>word.key===tokens[at+i+1]?.key))return selected;
+    const sound=value=>value.replace(/'/g,'').replace(/ph/g,'f').replace(/sh|ch/g,'s')
+        .replace(/th/g,'t').replace(/h/g,'').replace(/b/g,'p').replace(/d/g,'t').replace(/g/g,'k')
+        .replace(/v/g,'f').replace(/z/g,'s').replace(/[aeiouy]/g,'').replace(/(.)\1+/g,'$1');
+    const a=sound(words[0].key),b=sound(prefix.key+word.key);
+    if(a.length<3 || a!==b || words[0].key===word.key)return selected;
+    const text=line.slice(prefix.start,word.end),edit={start:words[0].start,end:words[0].end,
+        text,from:words[0].text,to:text,kind:'spelling'};
+    const ranges=selected.ranges.map((range,i)=>i?range:{...range,start:prefix.start,text:line.slice(prefix.start,range.end)});
+    const edits=selected.edits.filter(item=>item.end<=edit.start || item.start>=edit.end);
+    let corrected=raw;
+    for(const change of [...edits].sort((a,b)=>b.start-a.start))corrected=corrected.slice(0,change.start)+change.text+corrected.slice(change.end);
+    return {...selected,start:at-1,text:corrected,edits,ranges,changed:edits.length>0,trusted:false,
+        alignmentMethod:'opening_phrase',reviewDifferences:[{side:'difference',text:`${edit.from} → ${text}`,
+            signature:JSON.stringify(['opening_phrase',ranges,edit]),edit}]};
+};
+
 const createSubtitleReferenceResolver = searchIndex => {
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
@@ -7860,7 +7890,7 @@ const createSubtitleReferenceResolver = searchIndex => {
                 correctedText:candidate.text, cost:candidate.cost,
                 ranges:candidate.ranges.map(range=>({...range}))}))
         });
-        const selected = best[0];
+        const selected = recoverSubtitleReferenceOpeningPhrase(best[0],words,tokens,lineTexts,raw,after);
         // A boundary omission is indistinguishable from a deliberately partial
         // cue. Offer a review action; never silently extend the spoken range.
         const boundaryOmissions = [];

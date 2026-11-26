@@ -163,6 +163,31 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             assert.ok(!mismatch.trusted || mismatch.reviewDifferences?.length,'clock mismatch remains protected');
         }
     });
+    test('a fused ASR opening retains the whole contracted reference phrase as one review: ' + file, () => {
+        const tail='in such good spirits these days; he says that things are going swimmingly with his business.';
+        for(const [opening,heard] of [["He’s been",'spin'],["She's been",'spin'],["He's been",'sbin']]) {
+            const ref='He is truly favored by the gods. '+opening+' '+tail;
+            const raw=heard+' '+tail.replace(';',',');
+            const result=resolver(ref).resolve({text:raw});
+            assert.equal(result.aligned,true,JSON.stringify(result));assert.equal(result.trusted,false);
+            assert.equal(result.ranges[0].text,opening+' '+tail.slice(0,-1));
+            assert.equal(result.reviewDifferences.length,1);
+            assert.equal(result.reviewDifferences[0].edit.from,heard);
+            assert.equal(result.reviewDifferences[0].edit.to,opening);
+            const display=api.applySubtitleReferencePreference(result);
+            assert.equal(display.text,opening+' '+tail.replace(';',','));
+            assert.equal(api.getSubtitleCorrectionDeletionMarkers(display).length,0);
+            const blanks=api.buildSubtitlePracticeDualTokens(display.text,'en-US',[],display);
+            const phrase=blanks.find(token=>token.corrected);
+            assert.deepEqual(Array.from(phrase.parts[0].accepted),[opening,heard]);
+            const original=api.applySubtitleReferencePreference(result,null,new Set([result.reviewDifferences[0].signature]));
+            assert.equal(original.text,raw,'choosing original retains the entire ASR phrase');
+        }
+        const exact='been '+tail;
+        assert.equal(resolver("He's been "+tail).resolve({text:exact}).text,exact,'exact partial cues are not silently extended');
+        const unrelated=resolver('He is truly favored by the gods. He’s been '+tail).resolve({text:'green '+tail});
+        assert.equal(unrelated.alignmentMethod==='opening_phrase',false,'unrelated sounds cannot justify borrowing a pronoun');
+    });
     test('Vera opening and clock phrase resolve without false ambiguity or missing-word reviews: ' + file, () => {
         const opening='Vera Wong Zhuzhu, age sixty, is a pig, but she really should have been born a rooster.';
         const raw='Vera Wang Zhu Zhu, age 60, is a pig, but she really should have been born a rooster.';
