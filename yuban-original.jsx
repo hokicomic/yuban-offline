@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.309 · short-sentence-reference-review";
+const APP_VERSION = "v5.310 · unicode-subtitle-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7253,8 +7253,8 @@ const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
     const firstRange=ranges[0],lastRange=ranges.at(-1);
     const beforeText=lineTexts.get(firstRange.sourceLine).slice(0,firstRange.start);
     const afterText=lineTexts.get(lastRange.sourceLine).slice(lastRange.end);
-    const opening=beforeText.match(/[“"‘(\[]*$/u)?.[0] || '';
-    const closing=afterText.match(/^[,.;:!?…。，；：！？—–)”’"'\]}]*/u)?.[0] || '';
+    const opening=beforeText.match(/[\p{Ps}\p{Pi}"']*$/u)?.[0] || '';
+    const closing=afterText.match(/^\p{P}*/u)?.[0] || '';
     const sourceParts=[];
     for(let line=firstRange.sourceLine;line<=lastRange.sourceLine;line++) {
         const source=lineTexts.get(line) || '';
@@ -7271,6 +7271,7 @@ const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
 // can replace the existing segmentation; unmatched material stays as it was.
 const groupSubtitlesByReferenceSentences = (cues, index) => {
     if (!cues?.length || !index?.entries?.length) return cues;
+    if(cues.some(cue=>requiresUnicodeSubtitleComparison(cue.text)))return groupUnicodeSubtitlesByReferenceSentences(cues,index);
     const sentences=[];
     let paragraph='',lastLine=-2;
     const flush=()=>{
@@ -7359,7 +7360,137 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
     return changed?result:cues;
 };
 
+// Comparison keys are separate from source offsets and display text. Keep
+// diacritics, joining controls and numeric signs/units; discard typography only.
+const normalizeSubtitleUnicode = text => {
+    const units=[];
+    const unspaced=/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+    let pendingSpace=false;
+    for(const match of String(text || '').matchAll(/\P{M}\p{M}*|\p{M}+/gu)) {
+        const value=match[0].normalize('NFKC').toLowerCase();
+        if(/^\s+$/u.test(value)){pendingSpace=true;continue;}
+        const start=match.index,end=start+match[0].length;
+        const numericPunctuation=/^[.,:*/]$/u.test(value) && /\p{N}$/u.test(text.slice(0,start)) && /^\p{N}/u.test(text.slice(end));
+        const signed=/^[+−-]$/u.test(value) && /^\p{N}/u.test(text.slice(end));
+        if(!/[\p{L}\p{M}\p{N}\u200c\u200d]/u.test(value) && !numericPunctuation && !signed && !/^[%٪‰]$/u.test(value))continue;
+        const previous=units.at(-1);
+        if(pendingSpace && previous && /[\p{L}\p{M}\p{N}]$/u.test(previous.key) && /^[\p{L}\p{M}\p{N}]/u.test(value) && !unspaced.test(previous.key+value))
+            units.push({key:' ',start:previous.end,end:start});
+        units.push({key:value,start,end});pendingSpace=false;
+    }
+    return {key:units.map(unit=>unit.key).join(''),units};
+};
+const requiresUnicodeSubtitleComparison = text => [...String(text || '')].some(char=>/[\p{L}\p{M}]/u.test(char) && !/[A-Za-z]/u.test(char));
+const cleanSubtitleMarkdown = text => String(text || '').replace(/\*+/gu,(mark,offset,source)=>
+    mark==='*' && /\p{N}$/u.test(source.slice(0,offset)) && /^\p{N}/u.test(source.slice(offset+1)) ? mark : '').replace(/\\(?=[*_`])/gu,'');
+// Exact sentence grouping for all scripts; language-specific spelling repair
+// remains a separate operation. A failed merge leaves the original cues intact.
+const groupUnicodeSubtitlesByReferenceSentences = (cues,index) => {
+    const heads=new Map();
+    const segmenter=typeof Intl?.Segmenter==='function'?new Intl.Segmenter(undefined,{granularity:'sentence'}):null;
+    let paragraph='',lastLine=-2;
+    const flush=()=>{
+        const segments=segmenter ? [...segmenter.segment(paragraph)].map(item=>item.segment) : paragraph.match(/[^.!?。！？؟]+[.!?。！？؟]+/gu) || [];
+        for(const text of segments) {
+            const reference=text.trim(),key=normalizeSubtitleUnicode(reference).key;
+            if(key.length<8 || key.length>2000 || !/[.!?。！？؟][\p{Pe}\p{Pf}"']*$/u.test(reference))continue;
+            const head=key.slice(0,8),entries=heads.get(head) || [];
+            entries.push({reference,key});heads.set(head,entries);
+        }
+        paragraph='';
+    };
+    for(const entry of index.entries){if(entry.sourceLine!==lastLine+1)flush();paragraph+=(paragraph?'\n':'')+entry.raw;lastLine=entry.sourceLine;}
+    flush();
+    const result=[];let changed=false;
+    for(let i=0;i<cues.length;i++) {
+        let leading='';
+        for(let j=i;j<Math.min(cues.length,i+4) && normalizeSubtitleUnicode(leading).key.length<8;j++) {
+            if(j>i && cues[j].start-cues[j-1].end>1)break;
+            leading+=(leading?' ':'')+cues[j].text;
+        }
+        const candidates=heads.get(normalizeSubtitleUnicode(leading).key.slice(0,8)) || [],matches=[];
+        for(const candidate of candidates) {
+            let raw='';
+            for(let j=i;j<Math.min(cues.length,i+16);j++) {
+                if(j>i && (cues[j].start-cues[j-1].end>1 || cues[j].start<cues[j-1].start))break;
+                if(cues[j].end-cues[i].start>120)break;
+                raw+=(raw?' ':'')+cues[j].text;
+                const key=normalizeSubtitleUnicode(raw).key;
+                if(key===candidate.key){if(j>i)matches.push({end:j,text:raw,reference:candidate.reference});break;}
+                if(!candidate.key.startsWith(key))break;
+            }
+        }
+        if(matches.length && new Set(matches.map(match=>match.end)).size===1 && new Set(matches.map(match=>match.reference)).size===1) {
+            const match=matches[0];result.push({...cues[i],end:cues[match.end].end,text:match.text,referenceSentenceGroup:true,
+                referenceSentenceText:match.reference,referenceSentencePrefix:'',sourceCues:cues.slice(i,match.end+1)});
+            i=match.end;changed=true;
+        } else result.push(cues[i]);
+    }
+    return changed?result:cues;
+};
+
+const createUnicodeSubtitleReferenceResolver = searchIndex => {
+    const lineTexts=new Map(),offsets=[],pieces=[];
+    let length=0,previousLine=-10,previousKey='';
+    const unspaced=/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+    for(const entry of searchIndex?.entries || []) {
+        lineTexts.set(entry.sourceLine,entry.raw);
+        const normalized=normalizeSubtitleUnicode(entry.raw);
+        if(!normalized.key)continue;
+        if(length) {
+            const separator=entry.sourceLine-previousLine>4?'\0':unspaced.test(previousKey.at(-1)+normalized.key[0])?'':' ';
+            pieces.push(separator);for(let i=0;i<separator.length;i++)offsets.push(null);length+=separator.length;
+        }
+        pieces.push(normalized.key);
+        for(const unit of normalized.units){const position={...unit,sourceLine:entry.sourceLine};for(let i=0;i<unit.key.length;i++)offsets.push(position);}
+        length+=normalized.key.length;previousLine=entry.sourceLine;previousKey=normalized.key;
+    }
+    const sequence=pieces.join('');
+    const boundary=(range,last)=>{
+        if(!range)return -1;
+        return offsets.findIndex(item=>item && item.sourceLine===range.sourceLine && (last?item.end===range.end:item.start===range.start));
+    };
+    return (raw,{sourceLine=-1,sequential=false,after=[],before=[]}={})=>{
+        const query=normalizeSubtitleUnicode(raw).key;
+        if(!query || (Array.from(query).length<4 && !after.length && !before.length))return {reason:'short_without_adjacent_context'};
+        let afterIndex=after.length?boundary(after.at(-1),true):-1,beforeIndex=before.length?boundary(before[0],false):-1;
+        if((after.length && afterIndex<0)||(before.length && beforeIndex<0))return {reason:'invalid_adjacent_boundary'};
+        if(afterIndex>=0){while(offsets[afterIndex+1]?.end===offsets[afterIndex]?.end && offsets[afterIndex+1]?.sourceLine===offsets[afterIndex]?.sourceLine)afterIndex++;afterIndex++;while(sequence[afterIndex]===' ')afterIndex++;}
+        if(beforeIndex>=0)while(sequence[beforeIndex-1]===' ')beforeIndex--;
+        const candidates=[];
+        for(let start=sequence.indexOf(query);start>=0;start=sequence.indexOf(query,start+1)) {
+            const end=start+query.length,first=offsets[start],last=offsets[end-1];
+            if(!first || !last || (after.length && start!==afterIndex) || (before.length && end!==beforeIndex))continue;
+            // Do not match only half a compatibility ligature or surrogate pair.
+            if(offsets[start-1]?.sourceLine===first.sourceLine && offsets[start-1]?.start===first.start)continue;
+            if(offsets[end]?.sourceLine===last.sourceLine && offsets[end]?.end===last.end)continue;
+            if(sequential && sourceLine>=0 && (first.sourceLine<sourceLine-1 || first.sourceLine>sourceLine+48))continue;
+            const ranges=[];
+            for(let i=start;i<end;i++) {
+                const unit=offsets[i];if(!unit)continue;
+                const range=ranges.at(-1);
+                if(range?.sourceLine===unit.sourceLine)range.end=unit.end;
+                else ranges.push({sourceLine:unit.sourceLine,start:unit.start,end:unit.end});
+            }
+            ranges.forEach(range=>range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end));
+            candidates.push({ranges,cost:0,text:ranges.map(range=>range.text).join('\n')});
+            if(candidates.length>128)return {reason:'ambiguous',candidateCount:candidates.length,candidates,candidatesTruncated:true};
+        }
+        let best=candidates;
+        if(best.length>1 && sourceLine>=0){const local=best.filter(item=>item.ranges.some(range=>Math.abs(range.sourceLine-sourceLine)<=4));if(local.length===1)best=local;}
+        if(best.length!==1)return best.length?{reason:'ambiguous',candidateCount:best.length,candidates:best}:{reason:'no_unicode_alignment'};
+        const selected=best[0];
+        const reference=cleanSubtitleMarkdown(getSubtitleReferenceSentenceText(selected.ranges,lineTexts));
+        // Only exact normalized content can authorize display cleanup; never
+        // borrow a word outside the matched span or convert a translation.
+        const text=normalizeSubtitleUnicode(reference).key===query?reference:cleanSubtitleMarkdown(selected.text);
+        return {text,changed:text!==raw,edits:buildSubtitleReferenceDisplayEdits(raw,text),ranges:selected.ranges,
+            aligned:true,trusted:true,reviewDifferences:[],boundaryOmissions:[],alignmentMethod:'unicode_exact',referenceText:text};
+    };
+};
+
 const createSubtitleReferenceResolver = searchIndex => {
+    let unicodeResolver=null;
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
         lineTexts.set(entry.sourceLine, entry.raw);
@@ -7445,7 +7576,7 @@ const createSubtitleReferenceResolver = searchIndex => {
         if (cached?.raw === raw && cached.results.has(contextKey)) return cached.results.get(contextKey);
         const remember = result => {
             const record = { raw, text: raw, changed: false, trusted: false, edits: [], ranges: [], ...result };
-            if(record.aligned)record.referenceText=getSubtitleReferenceSentenceText(record.ranges,lineTexts);
+            if(record.aligned && record.referenceText===undefined)record.referenceText=getSubtitleReferenceSentenceText(record.ranges,lineTexts);
             const cache = cached?.raw === raw ? cached : { raw, results: new Map() };
             if (cache.results.size >= 4) cache.results.delete(cache.results.keys().next().value);
             cache.results.set(contextKey, record);
@@ -7453,6 +7584,11 @@ const createSubtitleReferenceResolver = searchIndex => {
             else { if (textCache.size >= 64) textCache.delete(textCache.keys().next().value); textCache.set(raw, cache); }
             return record;
         };
+        if(requiresUnicodeSubtitleComparison(raw) || /\*/u.test(raw)) {
+            unicodeResolver ||= createUnicodeSubtitleReferenceResolver(searchIndex);
+            const universal=unicodeResolver(raw,{sourceLine,sequential,after,before});
+            if(universal.aligned || requiresUnicodeSubtitleComparison(raw))return remember(universal);
+        }
         const words = tokenizeSubtitleReferenceWords(raw);
         if (!tokens.length || !words.length || words.length > 120 || /[぀-ヿ㐀-鿿가-힯]/u.test(raw)) return remember({ reason: 'unsupported_or_short' });
         const beforeBoundary=before.length?getBeforeWordBoundary(before):-1;
@@ -7807,6 +7943,7 @@ const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
 const applySubtitleReferenceOriginalText = projection => {
     if (!projection?.aligned || !projection.trusted || !projection.referenceText ||
         projection.reviewDifferences?.length || projection.boundaryOmissions?.length) return projection;
+    if(projection.alignmentMethod==='unicode_exact')return {...projection,referenceTextApplied:true,referenceNames:[]};
     let reference=projection.referenceText;
     // Preserve reliable caption word boundaries when the book has joined the
     // exact same letters. That spelling safeguard must not veto punctuation
