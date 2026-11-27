@@ -5,7 +5,7 @@ its downloader/integrity checks. No cookies, hidden APIs or guessed audio URLs.
 """
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlsplit, urljoin
+from urllib.parse import urlsplit, urljoin, parse_qs, unquote
 from datetime import datetime, timezone
 import json
 import re
@@ -95,6 +95,78 @@ def article_id(url):
     return match[1] if match else None
 
 
+def audio_asset_identity(url, identifier):
+    """Master/variant playlists and direct audio share a voice asset, not a URL."""
+    parsed = urlsplit(url)
+    if parsed.scheme != 'https' or parsed.hostname != 'media.vd.st.nhk':
+        return None
+    prefix = '/news/easy_audio/'
+    if not parsed.path.startswith(prefix) or not re.search(r'\.(?:m3u8|m4a|mp3)$', parsed.path):
+        return None
+    asset = parsed.path[len(prefix):].split('/')[0]
+    asset = re.sub(r'\.(?:m4a|mp3)$', '', asset)
+    return asset if re.match(re.escape(identifier) + r'(?:_|$)', asset) else None
+
+
+def declared_voice_asset(source, identifier):
+    # The article's audio iframe declares the voice ID actually requested by
+    # this page. Never infer it from a historical network request or video.
+    voices = set()
+    for node in walk(Tree(source).root):
+        if node.tag != 'iframe':
+            continue
+        parsed = urlsplit(urljoin('https://news.web.nhk/', node.attrs.get('src', '')))
+        if parsed.hostname not in {'news.web.nhk', 'www3.nhk.or.jp'} or not parsed.path.startswith('/news/easy/player/'):
+            continue
+        for voice in parse_qs(parsed.query).get('voiceId', []):
+            asset = re.sub(r'\.(?:m4a|mp3)$', '', voice)
+            if re.fullmatch(re.escape(identifier) + r'_[A-Za-z0-9_-]+', asset):
+                voices.add(asset)
+    if len(voices) > 1:
+        raise ValueError('文章宣告多個不同朗讀 ID，請重新載入朗讀播放器後重試。')
+    return next(iter(voices), None)
+
+
+def audio_url_expiry(url):
+    match = re.search(r'(?:[?&~=])exp=(\d+)', unquote(url))
+    return int(match[1]) if match else None
+
+
+def select_audio_source(pages, identifier, expected_asset=None):
+    candidates = []
+    for page in pages:
+        times = {item.get('url'): item.get('start', 0) for item in page.get('resource_records', []) if isinstance(item, dict)}
+        # DOM media is current playback evidence; resource timing is history.
+        for active, values in ((False, page.get('resources', [])), (True, page.get('media', []))):
+            for raw in values:
+                if not isinstance(raw, str):
+                    continue
+                url = urljoin(page.get('url') or 'https://news.web.nhk/', raw)
+                asset = audio_asset_identity(url, identifier)
+                if not asset or expected_asset and asset != expected_asset:
+                    continue
+                candidates.append(dict(url=url, asset=asset, active=active, order=len(candidates), time=times.get(raw, 0)))
+    if not candidates:
+        raise ValueError('正文已找到，但尚無對應朗讀音檔來源；請在 Chrome 按「ニュースを聞く」，等播放器載入後重試。')
+    active_assets = {item['asset'] for item in candidates if item['active']}
+    assets = active_assets or {item['asset'] for item in candidates}
+    if len(assets) != 1:
+        raise ValueError('找到多個不同朗讀 ID，未自行選取；請重新載入此文章的朗讀播放器。')
+    asset = next(iter(assets))
+    now = datetime.now(timezone.utc).timestamp()
+    valid = [item for item in candidates if item['asset'] == asset and
+             (audio_url_expiry(item['url']) is None or audio_url_expiry(item['url']) > now)]
+    if not valid:
+        raise ValueError('NHK 朗讀網址已過期；請關閉再開啟「ニュースを聞く」播放器，載入後重試。')
+    def rank(item):
+        parsed = urlsplit(item['url'])
+        # Prefer a currently declared source, then a top-level HLS manifest.
+        # Signed URLs for the same path may refresh without changing identity.
+        return (item['active'], parsed.path.endswith('.m3u8'), -parsed.path.count('/'),
+                audio_url_expiry(item['url']) or 0, item['time'], item['order'])
+    return max(valid, key=rank)['url']
+
+
 def extract_snapshot(snapshot, page_url):
     identifier = article_id(page_url)
     if not identifier:
@@ -104,29 +176,8 @@ def extract_snapshot(snapshot, page_url):
     if not main:
         raise ValueError('請在 Chrome 開啟相同的 NHK 文章，並按「ニュースを聞く」載入朗讀後再下載。')
     article = extract_article(main.get('html', ''))
-    candidates = []
-    for page in pages:
-        # The same article also contains the regular-news video. Only accept
-        # the Easy narrated-audio path whose ID matches this article exactly.
-        for raw in page.get('media', []) + page.get('resources', []):
-            url = urljoin(page.get('url', page_url), raw)
-            parsed = urlsplit(url)
-            if (parsed.scheme == 'https' and parsed.hostname == 'media.vd.st.nhk'
-                    and re.match(r'/news/easy_audio/' + re.escape(identifier) + r'[_/.]', parsed.path)
-                    and re.search(r'\.(?:m3u8|m4a|mp3)$', parsed.path)):
-                if url not in candidates:
-                    candidates.append(url)
-    if not candidates:
-        raise ValueError('正文已找到，但尚無朗讀音檔來源；請在 Chrome 按「ニュースを聞く」，等播放器載入後重試。')
-    # A refreshed signed URL for the same path is the same audio; prefer newest.
-    by_path = {urlsplit(url).path: url for url in candidates}
-    if len(by_path) != 1:
-        raise ValueError('找到多個不同朗讀來源，未自行選取；請重新載入此文章的朗讀播放器。')
-    chosen = list(by_path.values())[0]
-    expiry = re.search(r'(?:[?&~=])exp=(\d+)', chosen)
-    if expiry and int(expiry[1]) <= datetime.now(timezone.utc).timestamp():
-        raise ValueError('NHK 朗讀網址已過期；請關閉再開啟「ニュースを聞く」播放器，載入後重試。')
-    return article, chosen
+    expected = declared_voice_asset(main.get('html', ''), identifier)
+    return article, select_audio_source(pages, identifier, expected)
 
 
 def save_text_exclusive(path, text):
@@ -171,7 +222,7 @@ def download_nhk_easy(app, ydl_opts, page_url):
                     postprocessors=[{'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'}],
                     http_headers=app.get_browser_headers(page_url),
                     hls_prefer_native=True, skip_unavailable_fragments=False,
-                    overwrites=False, continuedl=True)
+                    overwrites=False, continuedl=True, writeinfojson=False)
         app.ui_log(f'📖 NHK 原文振假名 {article["rubyCount"]} 處；下載對應朗讀音訊。\n')
         if audio.exists():
             complete, reason = app.is_complete_media_file(str(audio), require_video=False, require_audio=True)

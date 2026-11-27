@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import tempfile
+import subprocess
+import ast
 import unittest
 from pathlib import Path
 
@@ -48,6 +50,80 @@ class BridgeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], refreshed]}, URL)
 
+    def test_master_and_variant_paths_are_one_voice_asset(self):
+        variant = AUDIO.replace('/index.m3u8', '/audio/128000/index.m3u8')
+        page = dict(SNAPSHOT['pages'][1], resources=[AUDIO, variant])
+        self.assertEqual(bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)[1], AUDIO)
+        # Even if both are DOM sources, the top-level manifest is preferred.
+        page['media'] = [AUDIO, variant]
+        self.assertEqual(bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)[1], AUDIO)
+
+    def test_nhk_tokenized_variant_directory_is_same_audio(self):
+        variant = AUDIO.replace('/index.m3u8?token=temporary', '/hdntl=exp=4102444800~acl=%2f*~hmac=redacted/index_64k.m3u8')
+        page = dict(SNAPSHOT['pages'][1], resources=[AUDIO, variant])
+        self.assertEqual(bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)[1], AUDIO)
+
+    def test_current_dom_audio_beats_historical_resource_from_other_voice(self):
+        other = AUDIO.replace('_sample', '_historic')
+        page = dict(SNAPSHOT['pages'][1], resources=[other], resource_records=[{'url': other, 'start': 9999}])
+        self.assertEqual(bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)[1], AUDIO)
+
+    def test_article_iframe_voice_id_disambiguates_history_only(self):
+        main = dict(SNAPSHOT['pages'][0], html=HTML + '<iframe src="/news/easy/player/audio-v6.html?voiceId=20261126de81736_sample.m4a&amp;title=x"></iframe>')
+        page = dict(SNAPSHOT['pages'][1], media=[], resources=[AUDIO, AUDIO.replace('_sample', '_other')])
+        self.assertEqual(bridge.extract_snapshot({'pages': [main, page]}, URL)[1], AUDIO)
+
+    def test_valid_current_url_not_replaced_by_expired_history(self):
+        expired = AUDIO + '&hdnts=exp=1~acl=/*'
+        page = dict(SNAPSHOT['pages'][1], resources=[expired])
+        self.assertEqual(bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)[1], AUDIO)
+        # Resources for another voice cannot rescue an expired current voice.
+        page = dict(SNAPSHOT['pages'][1], media=[expired], resources=[AUDIO.replace('_sample', '_other')])
+        with self.assertRaisesRegex(ValueError, '過期'):
+            bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)
+
+    def test_encoded_expiry_and_wrong_host_are_not_accepted(self):
+        expired = AUDIO + '&hdnts=exp%3D1~acl%3D/*'
+        page = dict(SNAPSHOT['pages'][1], media=[expired])
+        with self.assertRaisesRegex(ValueError, '過期'):
+            bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)
+        self.assertIsNone(bridge.audio_asset_identity(AUDIO.replace('media.vd.st.nhk', 'media.vd.st.nhk.example'), '20261126de81736'))
+
+    def test_direct_audio_and_hls_share_voice_identity(self):
+        direct = AUDIO.replace('/index.m3u8', '.m4a')
+        page = dict(SNAPSHOT['pages'][1], media=[AUDIO, direct])
+        self.assertEqual(bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)[1], AUDIO)
+
+    def test_resources_only_different_voices_remain_ambiguous(self):
+        page = dict(SNAPSHOT['pages'][1], media=[], resources=[AUDIO, AUDIO.replace('_sample', '_other')])
+        with self.assertRaisesRegex(ValueError, '不同朗讀 ID'):
+            bridge.extract_snapshot({'pages': [SNAPSHOT['pages'][0], page]}, URL)
+
+    def test_installer_updates_visible_version_even_when_already_installed(self):
+        root = Path(__file__).parents[1]
+        injection = """        # NHK Easy: keep the official ruby text with its narrated audio.
+        from nhk_easy_bridge import article_id, download_nhk_easy
+        if article_id(page_url):
+            return download_nhk_easy(self, ydl_opts, page_url)
+"""
+        for already_installed in [False, True]:
+            with self.subTest(already_installed=already_installed), tempfile.TemporaryDirectory() as folder:
+                target = Path(folder) / 'media_dl_17.py'
+                old = '# VERSION: v15.8 (NHK)\n# DATE: 2026-11-18\nimport tkinter as tk\nclass App:\n    def __init__(self, root):\n        root.title("影音下載轉檔器 v15.7")\n    def run_web_media_download(self, ydl_opts, page_url):\n' + (injection if already_installed else '') + '        return True\n'
+                target.write_text(old, encoding='utf-8')
+                subprocess.run(['python3', str(root / 'tools/install-nhk-bridge.py'), str(target)], check=True, capture_output=True)
+                updated = target.read_text(encoding='utf-8')
+                ast.parse(updated)
+                self.assertIn('APP_VERSION = "v15.9"', updated)
+                self.assertIn('root.title(f"影音下載轉檔器 {APP_VERSION}")', updated)
+                self.assertNotIn('v15.7', updated)
+                self.assertEqual(updated.count(injection), 1)
+                self.assertEqual(next(Path(folder).glob('*.bak')).read_text(encoding='utf-8'), old)
+                self.assertEqual((Path(folder) / 'nhk_easy_bridge.py').read_bytes(), (root / 'tools/nhk_easy_bridge.py').read_bytes())
+                subprocess.run(['python3', str(root / 'tools/install-nhk-bridge.py'), str(target)], check=True, capture_output=True)
+                self.assertEqual(target.read_text(encoding='utf-8'), updated)
+                self.assertEqual(len(list(Path(folder).glob('*.bak'))), 1)
+
     def test_expired_signed_audio_requires_refresh(self):
         expired = dict(SNAPSHOT['pages'][1], media=[AUDIO + '&hdnts=exp=1~acl=/*'])
         with self.assertRaisesRegex(ValueError, '過期'):
@@ -74,6 +150,7 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(len(files), 3)
             self.assertEqual(app.opts['postprocessors'][0]['key'], 'FFmpegExtractAudio')
             self.assertNotIn('_media_selection', app.opts)
+            self.assertFalse(app.opts['writeinfojson'])
             metadata = json.loads(next(Path(root).glob('*.media.json')).read_text())
             self.assertNotIn('token', json.dumps(metadata))
             self.assertEqual(metadata['rubyFile'].removesuffix('.ruby.txt'), metadata['audioFile'].removesuffix('.m4a'))

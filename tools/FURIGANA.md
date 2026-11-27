@@ -23,7 +23,7 @@
 
 ## 已整合現有影音下載程式
 
-`/Users/richard/MacFileExplorer/chrome ext/media_dl_17.py` 已升為 v15.8，
+`/Users/richard/MacFileExplorer/chrome ext/media_dl_17.py` 已升為 v15.9，
 相鄰的 `nhk_easy_bridge.py` 負責此流程；修改前的 `.before-nhk-*.bak` 保留原檔。
 
 1. 重新啟動下載程式。Chrome 正常開啟 NHK Easy 文章，按「ニュースを聞く」讓朗讀播放器載入。
@@ -33,6 +33,10 @@
 4. 對該音檔生成同名 `.lrc`，再將 `.ruby.txt` 作為參考文本；讀音不混進 LRC 答案。
 5. 如果來源過期，關閉再開啟「ニュースを聞く」後重試。Chrome 未開放既有下載器使用的
    Apple 事件 JavaScript 讀取時，程式會沿用原有提示，不能自動替使用者更改此權限。
+
+同一朗讀 ID 的 HLS 主／子清單、直接音訊與更新簽章會合併辨認；
+優先使用目前播放器的來源，歷史請求不會冒充另一段朗讀。
+真正不同的朗讀 ID 仍保留歧義提示。下載器標題與版本常數一致；更新後須完全退出再開啟。
 
 不覆寫不同內容的參考文本，不刪除既有音檔；音訊驗證通過後才回報成對保存成功。
 JSON 保存純正文、來源網址和檔名，讓 LRC 生成流程取用；不保存 Cookie 或限時音訊簽章。
