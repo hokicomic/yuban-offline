@@ -13,6 +13,158 @@ import {
     Hand, Languages, Search, Globe, MessageCircle, Phone, PhoneOff, MicOff, Maximize2, Minimize2, FilePlus, MoveRight,
     Gauge, Clock, Trophy, Activity, Zap, Wand2, Ear, Ban, Brain, StopCircle, Trash2, Copy
 } from 'lucide-react';
+// Original text stays immutable. Offsets below use JavaScript UTF-16 indexes,
+// just like subtitles and the reference highlighter.
+const toHiragana = text => String(text || '').normalize('NFC').replace(/[ァ-ヶ]/gu,c=>String.fromCharCode(c.charCodeAt(0)-0x60));
+const entities = text => String(text).replace(/&#(x[\da-f]+|\d+);/giu,(_,v)=>{const n=v[0].toLowerCase()==='x'?parseInt(v.slice(1),16):Number(v);return n<=0x10ffff?String.fromCodePoint(n):'';}).replace(/&(amp|lt|gt|quot|apos|nbsp);/g,(_,v)=>({amp:'&',lt:'<',gt:'>',quot:'"',apos:"'",nbsp:' '})[v]);
+const rubyReadingValid = value => /^[\p{Script=Hiragana}\p{Script=Katakana}\p{M}ー・\s]+$/u.test(value) && value.trim().length>0 && value.length<=120;
+function parseRubyDocument(value) {
+ const source=String(value || '').replace(/\r\n?/g,'\n'),annotations=[];let text='';
+ const pattern=/<ruby\b[^>]*>[\s\S]*?<\/ruby\s*>|｜([^\n《]+)《([^\n》]+)》/giu;
+ let cursor=0;
+ for(const match of source.matchAll(pattern)) {
+  text+=source.slice(cursor,match.index);let base,reading;
+  if(match[1]!==undefined){base=match[1];reading=match[2];}
+  else {
+   reading=[...match[0].matchAll(/<rt\b[^>]*>([\s\S]*?)<\/rt\s*>/giu)].map(m=>entities(m[1].replace(/<[^>]*>/g,''))).join('');
+   base=entities(match[0].replace(/<(?:rt|rp)\b[^>]*>[\s\S]*?<\/(?:rt|rp)\s*>/giu,'').replace(/<[^>]*>/g,''));
+  }
+  const start=text.length;text+=base;
+  if(base && rubyReadingValid(reading))annotations.push({start,end:text.length,base,reading:toHiragana(reading.trim()),source:'original'});
+  cursor=match.index+match[0].length;
+ }
+ text+=source.slice(cursor);return {text,annotations};
+}
+function originalReadingsForText(text,document) {
+ if(!document?.annotations?.length)return [];
+ const first=document.text.indexOf(text),unique=first>=0 && document.text.indexOf(text,first+1)<0;
+ const result=[];
+ for(const annotation of document.annotations) {
+  for(let at=text.indexOf(annotation.base);at>=0;at=text.indexOf(annotation.base,at+1)) {
+   const candidates=document.annotations.filter(item=>item.base===annotation.base);
+   let selected;
+   if(unique)selected=candidates.find(item=>item.start===first+at);
+   else if(new Set(candidates.map(item=>item.reading)).size===1)selected=annotation;
+   else {
+    const score=item=>{
+     let n=0;
+     for(let k=1;k<=12;k++){if(at-k<0 || item.start-k<0 || text[at-k]!==document.text[item.start-k])break;n++;}
+     for(let k=0;k<12;k++){if(at+annotation.base.length+k>=text.length || item.end+k>=document.text.length || text[at+annotation.base.length+k]!==document.text[item.end+k])break;n++;}
+     return n;
+    };
+    const ranked=candidates.map(item=>({item,score:score(item)})).sort((a,b)=>b.score-a.score);
+    if(ranked[0]?.score>=3 && (!ranked[1] || ranked[0].score>ranked[1].score))selected=ranked[0].item;
+   }
+   if(selected && !result.some(item=>item.start===at && item.end===at+annotation.base.length))result.push({...selected,start:at,end:at+annotation.base.length});
+  }
+ }
+ return result;
+}
+function buildFuriganaReadings(text,document,tokenizer,overrides={}) {
+ const result=originalReadingsForText(text,document);
+ const covered=(start,end)=>result.some(item=>start<item.end && end>item.start);
+ if(tokenizer)for(const token of tokenizer.tokenize(text)) {
+  const base=token.surface_form,start=Number(token.word_position)-1,end=start+base.length;
+  if(text.slice(start,end)!==base || !/\p{Script=Han}/u.test(base) || !rubyReadingValid(token.reading || '') || covered(start,end))continue;
+  result.push({start,end,base,reading:toHiragana(token.reading),source:'dictionary'});
+ }
+ // Explicit user edits have highest priority, scoped to the displayed sentence
+ // and occurrence, so correcting a name cannot alter another reading elsewhere.
+ for(const [key,value] of Object.entries(overrides)) {
+  const at=key.indexOf(':');if(at<0)continue;
+  const start=Number(key.slice(0,at)),base=key.slice(at+1),end=start+base.length;
+  if(text.slice(start,end)!==base || !rubyReadingValid(value))continue;
+  for(let i=result.length-1;i>=0;i--)if(start<result[i].end && end>result[i].start)result.splice(i,1);
+  result.push({start,end,base,reading:toHiragana(value),source:'manual'});
+ }
+ const sorted=result.sort((a,b)=>a.start-b.start || b.end-a.end),kept=[];
+ for(const item of sorted)if(!kept.length || item.start>=kept[kept.length-1].end)kept.push(item);
+ return kept;
+}
+let tokenizerPromise;
+function loadJapaneseTokenizer() {
+ if(tokenizerPromise)return tokenizerPromise;
+ tokenizerPromise=(async()=>{
+  // All assets are served with the app. Never send learning text to a service.
+  if(location.protocol!=='file:' && navigator.serviceWorker) {
+   try {const registration=await navigator.serviceWorker.register('./furigana-sw.js');await new Promise(resolve=>{if(registration.active)return resolve();const timer=setTimeout(resolve,10000);const worker=registration.installing || registration.waiting;if(!worker){clearTimeout(timer);return resolve();}worker.addEventListener('statechange',()=>{if(worker.state==='activated' || worker.state==='redundant'){clearTimeout(timer);resolve();}});});}catch(_){}
+  }
+  const worker=new Worker(new URL('./furigana-worker.js',document.baseURI).href);
+  let nextId=0;const pending=new Map();
+  const fail=error=>{for(const task of pending.values()){clearTimeout(task.timer);task.reject(error);}pending.clear();worker.terminate();tokenizerPromise=null;};
+  worker.onerror=()=>fail(Error('離線字典工作程序載入失敗；原文讀音仍可使用'));
+  worker.onmessage=event=>{const task=pending.get(event.data.id);if(!task)return;pending.delete(event.data.id);clearTimeout(task.timer);event.data.error?task.reject(Error(event.data.error)):task.resolve(event.data.tokens);};
+  const request=text=>new Promise((resolve,reject)=>{
+   const id=++nextId,timer=setTimeout(()=>fail(Error('離線字典載入逾時，可稍後再試')),90000);
+   pending.set(id,{resolve,reject,timer});worker.postMessage({id,text});
+  });
+  await request(null);return {tokenize:request};
+ })().catch(error=>{tokenizerPromise=null;throw error;});return tokenizerPromise;
+}
+
+const rubyKey=text=>{let hash=2166136261;for(const ch of text)hash=Math.imul(hash^ch.codePointAt(0),16777619);return (hash>>>0).toString(16)+':'+text.length;};
+const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0,renderText=(value)=>value}) => {
+ const source=String(text || ''),originalDocument=settings?.document || {text:'',annotations:[]};
+ const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,annotations:originalReadingsForText(contextText,originalDocument)
+    .filter(item=>item.start>=contextOffset && item.end<=contextOffset+source.length)
+    .map(item=>({...item,start:item.start-contextOffset,end:item.end-contextOffset}))},[originalDocument,source,contextText,contextOffset]);
+ const enabled=Boolean(settings?.enabled),host=useRef(null);
+ const [revealed,setRevealed]=useState(false),[visible,setVisible]=useState(false),[tokenizer,setTokenizer]=useState(null),[error,setError]=useState(''),[revision,setRevision]=useState(0),[editing,setEditing]=useState(null),[editValue,setEditValue]=useState('');
+ const context=contextText ?? source,documentAt=originalDocument.text.indexOf(context);
+ const documentOffset=context && documentAt>=0 && originalDocument.text.indexOf(context,documentAt+1)<0?documentAt+contextOffset:null;
+ const storageKey='yuban-furigana:'+rubyKey(originalDocument.text)+':'+(documentOffset!==null?'document':rubyKey(context)+':'+contextOffset+':'+rubyKey(source));
+ const revealKey=storageKey+':'+documentOffset+':'+contextOffset+':'+source;
+ const active=hidden?revealed===revealKey:enabled;
+ useEffect(()=>{setRevealed(false);setTokenizer(null);setError('');setEditing(null);},[source,storageKey,hidden,documentOffset,contextOffset]);
+ useEffect(()=>{
+  if(!active)return;
+  if(typeof IntersectionObserver==='undefined'){setVisible(true);return;}
+  const observer=new IntersectionObserver(entries=>{if(entries.some(entry=>entry.isIntersecting)){setVisible(true);observer.disconnect();}},{rootMargin:'120px'});
+  if(host.current)observer.observe(host.current);return ()=>observer.disconnect();
+ },[active,source]);
+ const originals=useMemo(()=>originalReadingsForText(source,documentData),[source,documentData]);
+ const needsDictionary=Array.from(source.matchAll(/\p{Script=Han}/gu)).some(match=>!originals.some(item=>match.index>=item.start && match.index<item.end));
+ useEffect(()=>{
+  if(!active || !visible || !needsDictionary)return;
+  let cancelled=false;loadJapaneseTokenizer().then(value=>value.tokenize(source)).then(tokens=>{if(!cancelled)setTokenizer({tokenize:()=>tokens});}).catch(reason=>{if(!cancelled)setError(reason.message);});return ()=>{cancelled=true;};
+ },[active,visible,needsDictionary,source]);
+ useEffect(()=>{
+  const changed=event=>{if(event.detail===storageKey)setRevision(n=>n+1);};window.addEventListener('yuban-furigana-changed',changed);return ()=>window.removeEventListener('yuban-furigana-changed',changed);
+ },[storageKey]);
+ const [overrides,storageError]=useMemo(()=>{try{return [JSON.parse(localStorage.getItem(storageKey)||'{}'),''];}catch(_){return [{},'讀音更正暫存不可用'];}},[storageKey,revision]);
+ const localOverrides=useMemo(()=>documentOffset===null?overrides:Object.fromEntries(Object.entries(overrides).map(([key,value])=>{const colon=key.indexOf(':');return [(Number(key.slice(0,colon))-documentOffset)+key.slice(colon),value];})),[overrides,documentOffset]);
+ const readings=useMemo(()=>buildFuriganaReadings(source,documentData,tokenizer,localOverrides),[source,documentData,tokenizer,localOverrides]);
+ const edit=item=>{setEditing(item);setEditValue(item.reading || '');};
+ const saveEdit=()=>{
+  if(!editing)return;
+  const item=editing,value=editValue;
+  const next={...overrides},key=(item.start+(documentOffset ?? 0))+':'+item.base;
+  if(!value.trim())delete next[key];
+  else if(!rubyReadingValid(value)){setError('請輸入平假名或片假名讀音');return;}
+  else next[key]=toHiragana(value.trim());
+  try{localStorage.setItem(storageKey,JSON.stringify(next));window.dispatchEvent(new CustomEvent('yuban-furigana-changed',{detail:storageKey}));setError('');setEditing(null);}
+  catch(_){setError('更正未保存，請確認瀏覽器可使用本機儲存');}
+ };
+ if(!/\p{Script=Han}/u.test(source))return hidden?null:source;
+ if(!active)return hidden?<button type="button" data-furigana-reveal onPointerDown={event=>event.preventDefault()} onClick={event=>{event.stopPropagation();setRevealed(revealKey);}} aria-label="點擊顯示本格讀音" className="text-slate-500" style={{fontSize:'0.45em',lineHeight:1}}>讀音</button>:source;
+ const nodes=[];let cursor=0;
+ for(const item of readings){
+  if(item.start>cursor)nodes.push(renderText(source.slice(cursor,item.start),cursor));
+  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over'}}>{renderText(item.base,item.start)}<rt style={{fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{item.reading}<button type="button" aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?'原文':item.source==='manual'?'手動更正':'離線字典推測'}；點擊更正`} onClick={event=>{event.stopPropagation();edit(item);}} style={{fontSize:'0.8em',paddingInline:'0.15em'}}>✎</button></rt></ruby>);cursor=item.end;
+ }
+ if(cursor<source.length)nodes.push(renderText(source.slice(cursor),cursor));
+ const unknown=[...source.matchAll(/[\p{Script=Han}々]+/gu)].filter(match=>!readings.some(item=>match.index<item.end && match.index+match[0].length>item.start));
+ return <span ref={host} data-furigana-view onClick={event=>event.stopPropagation()} style={{lineHeight:1.9}}>
+  {hidden?<span style={{fontSize:'0.55em',fontWeight:400}}>{readings.length?readings.map(item=>item.reading).join(' '):tokenizer?'讀音未收錄':'讀音載入中…'}</span>:nodes}
+  {hidden && readings.map(item=><button type="button" key={item.start} aria-label={`更正${item.base}讀音`} onClick={()=>edit(item)} style={{fontSize:'0.4em'}}>✎</button>)}
+  {unknown.length>0 && (!needsDictionary || tokenizer || error) && <button type="button" onClick={()=>edit({base:unknown[0][0],start:unknown[0].index,reading:''})} style={{fontSize:'0.5em'}} title="字典沒有可靠讀音，可手動指定">補讀音</button>}
+  {error && <span role="status" style={{fontSize:'0.5em'}}>{error}</span>}
+  {editing && <span role="dialog" aria-label="更正讀音" onKeyDown={event=>{event.stopPropagation();if(event.key==='Escape')setEditing(null);if(event.key==='Enter' && !event.nativeEvent.isComposing){event.preventDefault();saveEdit();}}} style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:14,padding:6,background:'#eff6ff',border:'1px solid #94a3b8',borderRadius:6}}><label>「{editing.base}」<input aria-label="讀音更正值" autoFocus value={editValue} onChange={event=>setEditValue(event.target.value)} style={{width:'10em',color:'#0f172a',background:'white'}}/></label><button type="button" onClick={saveEdit}>保存</button><button type="button" onClick={()=>{setEditValue('');}}>恢復來源</button><button type="button" onClick={()=>setEditing(null)}>取消</button></span>}
+  {storageError && <span role="status" style={{fontSize:'0.5em'}}>{storageError}</span>}
+  {hidden && <button type="button" aria-label="隱藏本格讀音" onClick={()=>setRevealed(false)} style={{fontSize:'0.4em'}}>隱藏</button>}
+ </span>;
+};
+
 // Portable local-file review records. Playback and source captions stay immutable.
 const REVIEW_SCHEMA = 1;
 function reviewHash(value) {
@@ -253,7 +405,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.313 · reading-mode-echo-shortcut";
+const APP_VERSION = "v5.314 · japanese-furigana";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8616,7 +8768,8 @@ const MarkdownView = ({
     treatWholeDocumentAsOriginal = false,
     manualKnowledgeAnchorMode = false,
     onKnowledgeSourceLineConfirm = null,
-    onActiveKnowledgeTermsChange = null
+    onActiveKnowledgeTermsChange = null,
+    furiganaSettings = null
 }) => {
     const subtitleForSourceLine = line => activeKnowledgeLineTexts.find(range => range.sourceLine === line)?.text || activeKnowledgeSubtitleText;
     const sourceContent = typeof content === 'string' ? content : '';
@@ -8971,12 +9124,13 @@ const MarkdownView = ({
     const buildKnowledgeLinkedNodes = (text, keyPrefix = "mdk") => {
         const source = String(text || "");
         if (!source) return source;
-        if (!enableKnowledgeTermLinks) return source;
-        if (!Array.isArray(knowledgeTermEntries) || knowledgeTermEntries.length === 0) return source;
-        if (typeof onKnowledgeTermClick !== "function") return source;
+        const withRuby=(value)=>(furiganaSettings?.enabled?<FuriganaView text={value} settings={furiganaSettings} />:value);
+        if (!enableKnowledgeTermLinks) return withRuby(source);
+        if (!Array.isArray(knowledgeTermEntries) || knowledgeTermEntries.length === 0) return withRuby(source);
+        if (typeof onKnowledgeTermClick !== "function") return withRuby(source);
 
         const cacheKey = `${keyPrefix}::${source}`;
-        if (knowledgeLinkedNodesCache.has(cacheKey)) return knowledgeLinkedNodesCache.get(cacheKey);
+        if (!furiganaSettings?.enabled && knowledgeLinkedNodesCache.has(cacheKey)) return knowledgeLinkedNodesCache.get(cacheKey);
         const nodes = [];
         let cursor = 0;
         let tokenIdx = 0;
@@ -9015,13 +9169,13 @@ const MarkdownView = ({
 
             if (hitPos < 0 || hitMatches.length === 0) {
                 if (cursor < source.length) {
-                    nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{source.slice(cursor)}</React.Fragment>);
+                    nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{withRuby(source.slice(cursor))}</React.Fragment>);
                 }
                 break;
             }
 
             if (hitPos > cursor) {
-                nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{source.slice(cursor, hitPos)}</React.Fragment>);
+                nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{withRuby(source.slice(cursor, hitPos))}</React.Fragment>);
             }
 
             const longest = hitMatches[0];
@@ -10040,7 +10194,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null, furiganaSettings = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -10070,6 +10224,12 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         ordinaryWords:Array.isArray(contextNameHints)?undefined:contextNameHints?.ordinaryWords
     }), [contextNameHints, correction]);
     const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
+    const furiganaPartOffsets=useMemo(()=>{
+        const offsets={};let at=0;
+        for(const token of tokens){if(token.kind==='literal'){at+=token.text.length;continue;}
+            for(const part of token.parts){if(part.kind==='letters')offsets[`${token.index}:${part.index}`]=at;at+=part.text.length;}}
+        return offsets;
+    },[tokens]);
     const displayTokens = useMemo(() => buildSubtitlePracticeDeletionDisplay(tokens,source,correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[]), [tokens,source,correction]);
     const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
@@ -10230,6 +10390,15 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             </button>
         </span>
     );
+    const renderRubyCaptionText = (value,from) => {
+        const to=from+value.length,ranges=correction?.text===source?getSubtitleCorrectionDisplayRanges(correction):[];
+        const markers=correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[];
+        const nodes=[];
+        const append=(a,b)=>{let cursor=a;for(const range of ranges){const start=Math.max(a,range.start),end=Math.min(b,range.end);if(end<=start)continue;if(start>cursor)nodes.push(source.slice(cursor,start));nodes.push(<span key={`color-${start}`} data-subtitle-reference-corrected="true" style={{color:'#2563eb'}}>{source.slice(start,end)}</span>);cursor=end;}if(cursor<b)nodes.push(source.slice(cursor,b));};
+        let cursor=from;
+        for(const marker of markers.filter(item=>item.start>=from && (item.start<to || to===source.length && item.start===to))){append(cursor,marker.start);nodes.push(renderDeletion({...marker,text:source.slice(marker.start,marker.end)},`ruby-delete-${marker.start}`));cursor=marker.end;}
+        append(cursor,to);return nodes;
+    };
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
         const reviewSubtitleMatches=reviewTarget && ((reviewTarget.originalText===subtitle?.text && Math.abs(reviewTarget.start-Number(subtitle?.start))<.05) ||
@@ -10303,6 +10472,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             isSubtitlePracticePartCorrect(token.correctedText,value,language) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
                     </span>
                 )}
+                {/^ja/i.test(language || '') && /\p{Script=Han}/u.test(part.text) && <span className="absolute left-1/2 -translate-x-1/2" style={{top:'-1.05em',lineHeight:1}}><FuriganaView key={`${source}:${token.index}:${part.index}`} text={part.text} settings={furiganaSettings} contextText={source} contextOffset={furiganaPartOffsets[`${token.index}:${part.index}`]} hidden /></span>}
                 {pendingLonger && <button type="button" data-subtitle-confirm-short
                     className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded border border-amber-400 bg-amber-50 px-2 py-1 text-amber-800 whitespace-nowrap"
                     style={{fontSize:'0.5em',lineHeight:'1.2'}}
@@ -10341,7 +10511,8 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 <p className="w-fit max-w-full mx-auto select-text cursor-text">
                     <span ref={editorRef} contentEditable={false}
                         role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" data-subtitle-reading="true" data-subtitle-composing="false" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
-                        className="select-text outline-none" />
+                        className="select-text outline-none" style={/^ja/i.test(language || '') && furiganaSettings?.enabled?{display:'none'}:undefined} />
+                    {!blankMode && /^ja/i.test(language || '') && furiganaSettings?.enabled && <FuriganaView text={source} settings={furiganaSettings} renderText={renderRubyCaptionText} />}
                     {subtitle && source.trim() && <button type="button" aria-label="複製全句" title="複製目前顯示的完整字幕"
                         onPointerDown={event=>event.preventDefault()} onClick={copySentence}
                         className="inline-flex align-middle ml-1 rounded p-1 select-none text-slate-500 hover:text-blue-600 hover:bg-blue-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
@@ -10465,7 +10636,10 @@ export default function App() {
     // UI States
     const [isVideoMasked, setIsVideoMasked] = useState(true);
     const [topPanelMode, setTopPanelMode] = useState('media'); // 'media' | 'document'
-    const [embeddedKnowledgeText, setEmbeddedKnowledgeText] = useState("");
+    const [embeddedKnowledgeRubySource, setEmbeddedKnowledgeText] = useState("");
+    const embeddedRubyDocument=useMemo(()=>parseRubyDocument(embeddedKnowledgeRubySource),[embeddedKnowledgeRubySource]);
+    const embeddedKnowledgeText=embeddedRubyDocument.text;
+    const [showFurigana,setShowFurigana]=useState(false);
     const [referenceSubtitleCorrectionEnabled, setReferenceSubtitleCorrectionEnabled] = useState(true);
     const referenceBoundaryAcceptancesRef = useRef(new WeakMap());
     const referenceOriginalDifferencesRef = useRef(new WeakMap());
@@ -10565,6 +10739,7 @@ export default function App() {
     const [showRecorder, setShowRecorder] = useState(false);
     const [globalFontSize, setGlobalFontSize] = useState(16);
     const [trackLanguage, setTrackLanguage] = useState("en-US");
+    const furiganaSettings=useMemo(()=>({enabled:showFurigana && /^ja/i.test(trackLanguage),document:embeddedRubyDocument}),[showFurigana,embeddedRubyDocument,trackLanguage]);
     const [chatInput, setChatInput] = useState("");
     const [tutorLang, setTutorLang] = useState('target');
     const [deepDiveInput, setDeepDiveInput] = useState("");
@@ -21872,6 +22047,7 @@ ${userQ}`;
         onActiveKnowledgeTermsChange: syncOpenKnowledgePreviewToActiveTerm,
         activeKnowledgeSourceLines: embeddedKnowledgeSourceLines,
         activeKnowledgeLineTexts: embeddedKnowledgeLineTexts,
+        furiganaSettings,
         activeKnowledgeSubtitleText: (referenceDocumentProjection?.aligned || referenceDocumentProjection?.trusted) ? referenceDocumentProjection.text : subtitles[embeddedKnowledgeRenderIndex]?.text || "",
         treatWholeDocumentAsOriginal: embeddedKnowledgeAlignmentIndex.useWholeDocument,
         manualKnowledgeAnchorMode: embeddedKnowledgeManualAnchorMode,
@@ -21883,7 +22059,7 @@ ${userQ}`;
     }, [knowledgeReverseSelecting, embeddedKnowledgeText, embeddedKnowledgeFontSize, trackLanguage, embeddedKnowledgeFileInfo?.targetLanguage,
         embeddedKnowledgeIsDirectBookText, embeddedKnowledgeTermEntries, handleKnowledgePreviewTermClick,
         syncOpenKnowledgePreviewToActiveTerm, embeddedKnowledgeSourceLines, subtitles, embeddedKnowledgeRenderIndex,
-        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm, referenceDocumentProjection, embeddedKnowledgeLineTexts]);
+        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm, referenceDocumentProjection, embeddedKnowledgeLineTexts, furiganaSettings]);
 
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
@@ -24121,6 +24297,9 @@ ${userQ}`;
                                 }
                             }}>
                             <div ref={subtitleCardRef} className="w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-auto border bg-white border-gray-200 shadow-sm">
+                                {/^ja/i.test(trackLanguage) && <label className="inline-flex items-center justify-end gap-1 text-xs text-slate-500 mb-1" onClick={event=>event.stopPropagation()}>
+                                    <input type="checkbox" checked={showFurigana} onChange={event=>setShowFurigana(event.target.checked)} />顯示日文讀音（填空仍須點擊）
+                                </label>}
                                 {isTopPanelDocumentMode && (
                                     <div className="flex flex-wrap items-center justify-end gap-2 mb-1 text-[10px] text-slate-500">
                                         <span role="status" aria-label="本句文本對照狀態" aria-live="polite"
@@ -24178,6 +24357,7 @@ ${userQ}`;
                                     </div>
                                 )}
                                 <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.id===selectedReviewId && findReviewCue([subtitles[currentIndex]].filter(Boolean),entry)===0) || reviewSession?.document.entries.find(entry=>!entry.mastered && (entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05 || subtitles[currentIndex]?.sourceCues?.some(cue=>cue.text===entry.originalText && Math.abs(cue.start-entry.start)<.05)))} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                    furiganaSettings={furiganaSettings}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}

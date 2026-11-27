@@ -19,6 +19,8 @@ import {
     Hand, Languages, Search, Globe, MessageCircle, Phone, PhoneOff, MicOff, Maximize2, Minimize2, FilePlus, MoveRight,
     Gauge, Clock, Trophy, Activity, Zap, Wand2, Ear, Ban, Brain, StopCircle, Trash2, Copy
 } from 'lucide-react';
+import {parseRubyDocument} from './furigana.js';
+import {FuriganaView} from './FuriganaView.jsx';
 import { createReviewDocument, openReviewSession, findReviewCue, getReviewPlaybackIndices, stepReviewIndex, tickReviewPlayback } from './subtitleReview.js';
 import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, getFsrsPreview, getFsrsStateLabel, getRetrievability, isDue, isFsrsScheduled, normalizeFsrsConfig } from './fsrsScheduler.js';
 
@@ -26,7 +28,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.313 · reading-mode-echo-shortcut";
+const APP_VERSION = "v5.314 · japanese-furigana";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8393,7 +8395,8 @@ const MarkdownView = ({
     treatWholeDocumentAsOriginal = false,
     manualKnowledgeAnchorMode = false,
     onKnowledgeSourceLineConfirm = null,
-    onActiveKnowledgeTermsChange = null
+    onActiveKnowledgeTermsChange = null,
+    furiganaSettings = null
 }) => {
     const subtitleForSourceLine = line => activeKnowledgeLineTexts.find(range => range.sourceLine === line)?.text || activeKnowledgeSubtitleText;
     const sourceContent = typeof content === 'string' ? content : '';
@@ -8748,12 +8751,13 @@ const MarkdownView = ({
     const buildKnowledgeLinkedNodes = (text, keyPrefix = "mdk") => {
         const source = String(text || "");
         if (!source) return source;
-        if (!enableKnowledgeTermLinks) return source;
-        if (!Array.isArray(knowledgeTermEntries) || knowledgeTermEntries.length === 0) return source;
-        if (typeof onKnowledgeTermClick !== "function") return source;
+        const withRuby=(value)=>(furiganaSettings?.enabled?<FuriganaView text={value} settings={furiganaSettings} />:value);
+        if (!enableKnowledgeTermLinks) return withRuby(source);
+        if (!Array.isArray(knowledgeTermEntries) || knowledgeTermEntries.length === 0) return withRuby(source);
+        if (typeof onKnowledgeTermClick !== "function") return withRuby(source);
 
         const cacheKey = `${keyPrefix}::${source}`;
-        if (knowledgeLinkedNodesCache.has(cacheKey)) return knowledgeLinkedNodesCache.get(cacheKey);
+        if (!furiganaSettings?.enabled && knowledgeLinkedNodesCache.has(cacheKey)) return knowledgeLinkedNodesCache.get(cacheKey);
         const nodes = [];
         let cursor = 0;
         let tokenIdx = 0;
@@ -8792,13 +8796,13 @@ const MarkdownView = ({
 
             if (hitPos < 0 || hitMatches.length === 0) {
                 if (cursor < source.length) {
-                    nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{source.slice(cursor)}</React.Fragment>);
+                    nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{withRuby(source.slice(cursor))}</React.Fragment>);
                 }
                 break;
             }
 
             if (hitPos > cursor) {
-                nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{source.slice(cursor, hitPos)}</React.Fragment>);
+                nodes.push(<React.Fragment key={`${keyPrefix}-text-${tokenIdx++}`}>{withRuby(source.slice(cursor, hitPos))}</React.Fragment>);
             }
 
             const longest = hitMatches[0];
@@ -9817,7 +9821,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null, furiganaSettings = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -9847,6 +9851,12 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         ordinaryWords:Array.isArray(contextNameHints)?undefined:contextNameHints?.ordinaryWords
     }), [contextNameHints, correction]);
     const tokens = useMemo(() => buildSubtitlePracticeDualTokens(source, language, nameHints, correction), [source, language, nameHints, correction]);
+    const furiganaPartOffsets=useMemo(()=>{
+        const offsets={};let at=0;
+        for(const token of tokens){if(token.kind==='literal'){at+=token.text.length;continue;}
+            for(const part of token.parts){if(part.kind==='letters')offsets[`${token.index}:${part.index}`]=at;at+=part.text.length;}}
+        return offsets;
+    },[tokens]);
     const displayTokens = useMemo(() => buildSubtitlePracticeDeletionDisplay(tokens,source,correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[]), [tokens,source,correction]);
     const answerSignature = useMemo(() => JSON.stringify(tokens.map(token => token.kind === 'word' ? token.parts.map(part => [part.text,part.accepted]) : null)), [tokens]);
     const cached = subtitle ? answerCache.current.get(subtitle) : null;
@@ -10007,6 +10017,15 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             </button>
         </span>
     );
+    const renderRubyCaptionText = (value,from) => {
+        const to=from+value.length,ranges=correction?.text===source?getSubtitleCorrectionDisplayRanges(correction):[];
+        const markers=correction?.text===source?getSubtitleCorrectionDeletionMarkers(correction):[];
+        const nodes=[];
+        const append=(a,b)=>{let cursor=a;for(const range of ranges){const start=Math.max(a,range.start),end=Math.min(b,range.end);if(end<=start)continue;if(start>cursor)nodes.push(source.slice(cursor,start));nodes.push(<span key={`color-${start}`} data-subtitle-reference-corrected="true" style={{color:'#2563eb'}}>{source.slice(start,end)}</span>);cursor=end;}if(cursor<b)nodes.push(source.slice(cursor,b));};
+        let cursor=from;
+        for(const marker of markers.filter(item=>item.start>=from && (item.start<to || to===source.length && item.start===to))){append(cursor,marker.start);nodes.push(renderDeletion({...marker,text:source.slice(marker.start,marker.end)},`ruby-delete-${marker.start}`));cursor=marker.end;}
+        append(cursor,to);return nodes;
+    };
     const renderBlank = (token, part, key) => {
         const answer = answers[token.index];
         const reviewSubtitleMatches=reviewTarget && ((reviewTarget.originalText===subtitle?.text && Math.abs(reviewTarget.start-Number(subtitle?.start))<.05) ||
@@ -10080,6 +10099,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             isSubtitlePracticePartCorrect(token.correctedText,value,language) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
                     </span>
                 )}
+                {/^ja/i.test(language || '') && /\p{Script=Han}/u.test(part.text) && <span className="absolute left-1/2 -translate-x-1/2" style={{top:'-1.05em',lineHeight:1}}><FuriganaView key={`${source}:${token.index}:${part.index}`} text={part.text} settings={furiganaSettings} contextText={source} contextOffset={furiganaPartOffsets[`${token.index}:${part.index}`]} hidden /></span>}
                 {pendingLonger && <button type="button" data-subtitle-confirm-short
                     className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded border border-amber-400 bg-amber-50 px-2 py-1 text-amber-800 whitespace-nowrap"
                     style={{fontSize:'0.5em',lineHeight:'1.2'}}
@@ -10118,7 +10138,8 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 <p className="w-fit max-w-full mx-auto select-text cursor-text">
                     <span ref={editorRef} contentEditable={false}
                         role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" data-subtitle-reading="true" data-subtitle-composing="false" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
-                        className="select-text outline-none" />
+                        className="select-text outline-none" style={/^ja/i.test(language || '') && furiganaSettings?.enabled?{display:'none'}:undefined} />
+                    {!blankMode && /^ja/i.test(language || '') && furiganaSettings?.enabled && <FuriganaView text={source} settings={furiganaSettings} renderText={renderRubyCaptionText} />}
                     {subtitle && source.trim() && <button type="button" aria-label="複製全句" title="複製目前顯示的完整字幕"
                         onPointerDown={event=>event.preventDefault()} onClick={copySentence}
                         className="inline-flex align-middle ml-1 rounded p-1 select-none text-slate-500 hover:text-blue-600 hover:bg-blue-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
@@ -10242,7 +10263,10 @@ export default function GeminiPlayer() {
     // UI States
     const [isVideoMasked, setIsVideoMasked] = useState(true);
     const [topPanelMode, setTopPanelMode] = useState('media'); // 'media' | 'document'
-    const [embeddedKnowledgeText, setEmbeddedKnowledgeText] = useState("");
+    const [embeddedKnowledgeRubySource, setEmbeddedKnowledgeText] = useState("");
+    const embeddedRubyDocument=useMemo(()=>parseRubyDocument(embeddedKnowledgeRubySource),[embeddedKnowledgeRubySource]);
+    const embeddedKnowledgeText=embeddedRubyDocument.text;
+    const [showFurigana,setShowFurigana]=useState(false);
     const [referenceSubtitleCorrectionEnabled, setReferenceSubtitleCorrectionEnabled] = useState(true);
     const referenceBoundaryAcceptancesRef = useRef(new WeakMap());
     const referenceOriginalDifferencesRef = useRef(new WeakMap());
@@ -10342,6 +10366,7 @@ export default function GeminiPlayer() {
     const [showRecorder, setShowRecorder] = useState(false);
     const [globalFontSize, setGlobalFontSize] = useState(16);
     const [trackLanguage, setTrackLanguage] = useState("en-US");
+    const furiganaSettings=useMemo(()=>({enabled:showFurigana && /^ja/i.test(trackLanguage),document:embeddedRubyDocument}),[showFurigana,embeddedRubyDocument,trackLanguage]);
     const [chatInput, setChatInput] = useState("");
     const [tutorLang, setTutorLang] = useState('target');
     const [deepDiveInput, setDeepDiveInput] = useState("");
@@ -21654,6 +21679,7 @@ ${userQ}`;
         onActiveKnowledgeTermsChange: syncOpenKnowledgePreviewToActiveTerm,
         activeKnowledgeSourceLines: embeddedKnowledgeSourceLines,
         activeKnowledgeLineTexts: embeddedKnowledgeLineTexts,
+        furiganaSettings,
         activeKnowledgeSubtitleText: (referenceDocumentProjection?.aligned || referenceDocumentProjection?.trusted) ? referenceDocumentProjection.text : subtitles[embeddedKnowledgeRenderIndex]?.text || "",
         treatWholeDocumentAsOriginal: embeddedKnowledgeAlignmentIndex.useWholeDocument,
         manualKnowledgeAnchorMode: embeddedKnowledgeManualAnchorMode,
@@ -21665,7 +21691,7 @@ ${userQ}`;
     }, [knowledgeReverseSelecting, embeddedKnowledgeText, embeddedKnowledgeFontSize, trackLanguage, embeddedKnowledgeFileInfo?.targetLanguage,
         embeddedKnowledgeIsDirectBookText, embeddedKnowledgeTermEntries, handleKnowledgePreviewTermClick,
         syncOpenKnowledgePreviewToActiveTerm, embeddedKnowledgeSourceLines, subtitles, embeddedKnowledgeRenderIndex,
-        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm, referenceDocumentProjection, embeddedKnowledgeLineTexts]);
+        embeddedKnowledgeAlignmentIndex, embeddedKnowledgeManualAnchorMode, handleEmbeddedKnowledgeSourceLineConfirm, referenceDocumentProjection, embeddedKnowledgeLineTexts, furiganaSettings]);
 
     const renderKnowledgePreviewPopupPanel = useCallback((isSplitCaller = false) => {
         if (!knowledgePreviewTermPopup || !Array.isArray(knowledgePreviewTermPopup.items) || knowledgePreviewTermPopup.items.length <= 0) return null;
@@ -23903,6 +23929,9 @@ ${userQ}`;
                                 }
                             }}>
                             <div ref={subtitleCardRef} className="w-full h-full rounded-xl p-4 text-center flex flex-col items-stretch justify-start overflow-auto border bg-white border-gray-200 shadow-sm">
+                                {/^ja/i.test(trackLanguage) && <label className="inline-flex items-center justify-end gap-1 text-xs text-slate-500 mb-1" onClick={event=>event.stopPropagation()}>
+                                    <input type="checkbox" checked={showFurigana} onChange={event=>setShowFurigana(event.target.checked)} />顯示日文讀音（填空仍須點擊）
+                                </label>}
                                 {isTopPanelDocumentMode && (
                                     <div className="flex flex-wrap items-center justify-end gap-2 mb-1 text-[10px] text-slate-500">
                                         <span role="status" aria-label="本句文本對照狀態" aria-live="polite"
@@ -23960,6 +23989,7 @@ ${userQ}`;
                                     </div>
                                 )}
                                 <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.id===selectedReviewId && findReviewCue([subtitles[currentIndex]].filter(Boolean),entry)===0) || reviewSession?.document.entries.find(entry=>!entry.mastered && (entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05 || subtitles[currentIndex]?.sourceCues?.some(cue=>cue.text===entry.originalText && Math.abs(cue.start-entry.start)<.05)))} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
+                                    furiganaSettings={furiganaSettings}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}
