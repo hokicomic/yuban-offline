@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urljoin, parse_qs, unquote
 from datetime import datetime, timezone
 import json
 import re
+import time
 
 
 class Node:
@@ -128,8 +129,17 @@ def declared_voice_asset(source, identifier):
 
 
 def audio_url_expiry(url):
-    match = re.search(r'(?:[?&~=])exp=(\d+)', unquote(url))
-    return int(match[1]) if match else None
+    matches = re.findall(r'(?:[?&~=])exp=(\d+)', unquote(url))
+    return min(map(int, matches)) if matches else None
+
+
+class AudioRefreshNeeded(ValueError):
+    """The normal player must renew the source before a download can start."""
+
+
+def is_root_audio_url(url):
+    tail = urlsplit(url).path.removeprefix('/news/easy_audio/').split('/')
+    return len(tail) <= 2
 
 
 def select_audio_source(pages, identifier, expected_asset=None):
@@ -147,22 +157,30 @@ def select_audio_source(pages, identifier, expected_asset=None):
                     continue
                 candidates.append(dict(url=url, asset=asset, active=active, order=len(candidates), time=times.get(raw, 0)))
     if not candidates:
-        raise ValueError('正文已找到，但尚無對應朗讀音檔來源；請在 Chrome 按「ニュースを聞く」，等播放器載入後重試。')
+        raise AudioRefreshNeeded('正文已找到，但尚無對應朗讀音檔來源；請在 Chrome 按「ニュースを聞く」，等播放器載入後重試。')
     active_assets = {item['asset'] for item in candidates if item['active']}
     assets = active_assets or {item['asset'] for item in candidates}
     if len(assets) != 1:
         raise ValueError('找到多個不同朗讀 ID，未自行選取；請重新載入此文章的朗讀播放器。')
     asset = next(iter(assets))
     now = datetime.now(timezone.utc).timestamp()
-    valid = [item for item in candidates if item['asset'] == asset and
-             (audio_url_expiry(item['url']) is None or audio_url_expiry(item['url']) > now)]
+    def ready(item):
+        if item['asset'] != asset or not is_root_audio_url(item['url']):
+            return False
+        expiry = audio_url_expiry(item['url'])
+        # NHK's unsigned data-hlsurl is the player's starting point, not a
+        # downloadable source. Wait until its normal player supplies a token.
+        if urlsplit(item['url']).path.endswith('.m3u8') and expiry is None:
+            return False
+        return expiry is None or expiry > now + 30
+    valid = [item for item in candidates if ready(item)]
     if not valid:
-        raise ValueError('NHK 朗讀網址已過期；請關閉再開啟「ニュースを聞く」播放器，載入後重試。')
+        raise AudioRefreshNeeded('NHK 主清單已過期或只剩歷史子清單，需要更新朗讀播放器。')
     def rank(item):
         parsed = urlsplit(item['url'])
         # Prefer a currently declared source, then a top-level HLS manifest.
         # Signed URLs for the same path may refresh without changing identity.
-        return (item['active'], parsed.path.endswith('.m3u8'), -parsed.path.count('/'),
+        return (is_root_audio_url(item['url']), item['active'], parsed.path.endswith('.m3u8'), -parsed.path.count('/'),
                 audio_url_expiry(item['url']) or 0, item['time'], item['order'])
     return max(valid, key=rank)['url']
 
@@ -180,6 +198,28 @@ def extract_snapshot(snapshot, page_url):
     return article, select_audio_source(pages, identifier, expected)
 
 
+def refreshed_snapshot(app, page_url):
+    app.ui_log('🔄 更新此文章的朗讀播放器，保留播放位置與播放／暫停狀態；重新取得短效連結。\n')
+    try:
+        result = app.read_chrome_playback_page(page_url, _nhk_refresh=True)
+    except TypeError:
+        raise ValueError('下載器仍執行舊版程式，請完全退出後重新開啟新版再試。')
+    if not result or not result.get('reloading'):
+        raise ValueError('無法更新朗讀播放器；請在 Chrome 按「ニュースを聞く」載入音訊後再下載。')
+    deadline = time.monotonic() + 12
+    for _ in range(30):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.4)
+        snapshot = app.read_chrome_playback_page(page_url)
+        try:
+            article, url = extract_snapshot(snapshot, page_url)
+            return article, url
+        except AudioRefreshNeeded:
+            continue
+    raise ValueError('朗讀播放器更新逾時；請確認 Chrome 此文章能正常播放後重試。')
+
+
 def save_text_exclusive(path, text):
     path = Path(path)
     if path.exists():
@@ -192,7 +232,10 @@ def save_text_exclusive(path, text):
 
 def download_nhk_easy(app, ydl_opts, page_url):
     try:
-        article, audio_url = extract_snapshot(app.read_chrome_playback_page(page_url), page_url)
+        try:
+            article, audio_url = extract_snapshot(app.read_chrome_playback_page(page_url), page_url)
+        except AudioRefreshNeeded:
+            article, audio_url = refreshed_snapshot(app, page_url)
         identifier = article_id(page_url)
         home = Path((ydl_opts.get('paths') or {}).get('home') or '.')
         template = ydl_opts.get('outtmpl')
@@ -229,7 +272,15 @@ def download_nhk_easy(app, ydl_opts, page_url):
             if not complete:
                 raise ValueError(f'已有音檔未通過完整性檢查，請另行處理後重試（未刪除）：{reason}')
         elif not app.run_download_with_integrity_check(opts, [audio_url], expected_path=str(audio), require_audio=True):
-            return False
+            app.ui_log('⚠️ 音訊來源未能下載，更新播放器連結後再試一次。\n')
+            refreshed_article, audio_url = refreshed_snapshot(app, page_url)
+            if refreshed_article['text'] != article['text']:
+                raise ValueError('重新載入後文章內容已變更，未混用兩份文本。')
+            # No output existed on entering this branch. Only retry this job's
+            # incomplete audio; never replace a pre-existing user audio file.
+            retry_opts = dict(opts, overwrites=True, continuedl=False)
+            if not app.run_download_with_integrity_check(retry_opts, [audio_url], expected_path=str(audio), require_audio=True):
+                return False
         save_text_exclusive(txt, article['annotatedText'])
         if not meta.exists():
             metadata['exportedAt'] = datetime.now(timezone.utc).isoformat()
