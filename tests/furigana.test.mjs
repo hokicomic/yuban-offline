@@ -72,3 +72,21 @@ test('offline worker converts supplementary Unicode positions into reference off
  assert.ok(readings.some(x=>x.base==='学校'&&x.reading==='がっこう'));
  for(const item of readings)assert.equal(text.slice(item.start,item.end),item.base);
 });
+
+test('reading controls show the pronunciation itself, with source metadata and no pencil icon',()=>{
+ const doc=parseRubyDocument('｜日本人《にっぽんじん》');
+ const html=renderToStaticMarkup(React.createElement(View,{text:doc.text,settings:{enabled:true,document:doc}}));
+ assert.doesNotMatch(html,/✎/);assert.match(html,/data-furigana-reading/);assert.match(html,/讀音來源：原文/);
+});
+const originalSource=readFileSync(new URL('../yuban-original.jsx',import.meta.url),'utf8');
+const markdownBuild=await build({stdin:{contents:originalSource+'\nexport {MarkdownView};',resolveDir:fileURLToPath(new URL('..',import.meta.url)),loader:'jsx'},bundle:true,write:false,format:'cjs',platform:'node',packages:'external'});
+const markdownModule={exports:{}};new Function('require','module','exports',markdownBuild.outputFiles[0].text)(require,markdownModule,markdownModule.exports);
+test('unhighlighted reference paragraphs render original ruby, not just the active subtitle',()=>{
+ const doc=parseRubyDocument('｜日本人《にっぽんじん》は｜家《いえ》にいます。\n\n｜中国《ちゅうごく》の｜学校《がっこう》です。');
+ const props={content:doc.text,trackLanguage:'ja-JP',treatWholeDocumentAsOriginal:true,furiganaSettings:{enabled:true,document:doc}};
+ const html=renderToStaticMarkup(React.createElement(markdownModule.exports.MarkdownView,props));
+ assert.equal((html.match(/data-furigana-source="original"/g)||[]).length,4);
+ assert.match(html,/にっぽんじん/);assert.match(html,/ちゅうごく/);assert.doesNotMatch(html,/✎/);
+ const plain=renderToStaticMarkup(React.createElement(markdownModule.exports.MarkdownView,{...props,furiganaSettings:{...props.furiganaSettings,enabled:false}}));
+ assert.doesNotMatch(plain,/<ruby|にっぽんじん/);assert.match(plain,/日本人/);
+});

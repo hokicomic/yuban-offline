@@ -108,14 +108,14 @@ const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset
  const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,annotations:originalReadingsForText(contextText,originalDocument)
     .filter(item=>item.start>=contextOffset && item.end<=contextOffset+source.length)
     .map(item=>({...item,start:item.start-contextOffset,end:item.end-contextOffset}))},[originalDocument,source,contextText,contextOffset]);
- const enabled=Boolean(settings?.enabled),host=useRef(null);
- const [revealed,setRevealed]=useState(false),[visible,setVisible]=useState(false),[tokenizer,setTokenizer]=useState(null),[error,setError]=useState(''),[revision,setRevision]=useState(0),[editing,setEditing]=useState(null),[editValue,setEditValue]=useState('');
+ const enabled=Boolean(settings?.enabled),host=useRef(null),editingRef=useRef(null),composingEdit=useRef(false);
+ const [revealed,setRevealed]=useState(false),[visible,setVisible]=useState(false),[tokenizer,setTokenizer]=useState(null),[error,setError]=useState(''),[revision,setRevision]=useState(0),[editing,setEditing]=useState(null),[editValue,setEditValue]=useState(''),[editorSide,setEditorSide]=useState('left');
  const context=contextText ?? source,documentAt=originalDocument.text.indexOf(context);
  const documentOffset=context && documentAt>=0 && originalDocument.text.indexOf(context,documentAt+1)<0?documentAt+contextOffset:null;
  const storageKey='yuban-furigana:'+rubyKey(originalDocument.text)+':'+(documentOffset!==null?'document':rubyKey(context)+':'+contextOffset+':'+rubyKey(source));
  const revealKey=storageKey+':'+documentOffset+':'+contextOffset+':'+source;
  const active=hidden?revealed===revealKey:enabled;
- useEffect(()=>{setRevealed(false);setTokenizer(null);setError('');setEditing(null);},[source,storageKey,hidden,documentOffset,contextOffset]);
+ useEffect(()=>{setRevealed(false);setTokenizer(null);setError('');setEditing(null);editingRef.current=null;composingEdit.current=false;},[source,storageKey,hidden,documentOffset,contextOffset]);
  useEffect(()=>{
   if(!active)return;
   if(typeof IntersectionObserver==='undefined'){setVisible(true);return;}
@@ -134,34 +134,47 @@ const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset
  const [overrides,storageError]=useMemo(()=>{try{return [JSON.parse(localStorage.getItem(storageKey)||'{}'),''];}catch(_){return [{},'讀音更正暫存不可用'];}},[storageKey,revision]);
  const localOverrides=useMemo(()=>documentOffset===null?overrides:Object.fromEntries(Object.entries(overrides).map(([key,value])=>{const colon=key.indexOf(':');return [(Number(key.slice(0,colon))-documentOffset)+key.slice(colon),value];})),[overrides,documentOffset]);
  const readings=useMemo(()=>buildFuriganaReadings(source,documentData,tokenizer,localOverrides),[source,documentData,tokenizer,localOverrides]);
- const edit=item=>{setEditing(item);setEditValue(item.reading || '');};
- const saveEdit=()=>{
-  if(!editing)return;
-  const item=editing,value=editValue;
+ const edit=item=>{editingRef.current=item;composingEdit.current=false;setEditing(item);setEditValue(item.reading || '');};
+ const cancelEdit=()=>{editingRef.current=null;setEditing(null);setError('');};
+ const saveEdit=(value=editValue)=>{
+  const item=editingRef.current;if(!item)return;
   const next={...overrides},key=(item.start+(documentOffset ?? 0))+':'+item.base;
   if(!value.trim())delete next[key];
   else if(!rubyReadingValid(value)){setError('請輸入平假名或片假名讀音');return;}
   else next[key]=toHiragana(value.trim());
-  try{localStorage.setItem(storageKey,JSON.stringify(next));window.dispatchEvent(new CustomEvent('yuban-furigana-changed',{detail:storageKey}));setError('');setEditing(null);}
+  try{localStorage.setItem(storageKey,JSON.stringify(next));window.dispatchEvent(new CustomEvent('yuban-furigana-changed',{detail:storageKey}));setError('');editingRef.current=null;setEditing(null);}
   catch(_){setError('更正未保存，請確認瀏覽器可使用本機儲存');}
  };
- if(!/\p{Script=Han}/u.test(source))return hidden?null:source;
+ if(!/\p{Script=Han}/u.test(source))return hidden?null:renderText(source,0);
  if(!active)return hidden?<button type="button" data-furigana-reveal onPointerDown={event=>event.preventDefault()} onClick={event=>{event.stopPropagation();setRevealed(revealKey);}} aria-label="點擊顯示本格讀音" className="text-slate-500" style={{fontSize:'0.45em',lineHeight:1}}>讀音</button>:source;
+ const unknown=[...source.matchAll(/[\p{Script=Han}々]+/gu)].filter(match=>!readings.some(item=>match.index<item.end && match.index+match[0].length>item.start));
+ const unknownItems=(!needsDictionary || tokenizer || error)?unknown.map(match=>({start:match.index,end:match.index+match[0].length,base:match[0],reading:'',source:'manual'})):[];
+ const readingControl=item=>editing?.start===item.start?<span data-furigana-editor style={{position:'relative',display:'inline-block',fontSize:'inherit',lineHeight:1.15}} onClick={event=>event.stopPropagation()} onKeyDown={event=>{
+  event.stopPropagation();if(composingEdit.current || event.nativeEvent.isComposing || event.keyCode===229)return;
+  if(event.key==='Escape'){event.preventDefault();cancelEdit();}
+  if(event.key==='Enter' && event.target.tagName==='INPUT'){event.preventDefault();saveEdit(event.target.value);}
+ }}>
+  <input aria-label={`更正${item.base}讀音`} data-furigana-edit-input autoFocus value={editValue} onFocus={event=>{event.currentTarget.select();setEditorSide(window.innerWidth-event.currentTarget.getBoundingClientRect().left<180?'right':'left');}}
+   onChange={event=>setEditValue(event.target.value)} onCompositionStart={()=>{composingEdit.current=true;}} onCompositionEnd={()=>{composingEdit.current=false;}}
+   onBlur={event=>{if(!composingEdit.current && !event.currentTarget.parentElement?.contains(event.relatedTarget))saveEdit(event.currentTarget.value);}}
+   style={{font:'inherit',lineHeight:1.15,width:`${Math.max(3,Array.from(editValue).length+1)}em`,maxWidth:'70vw',padding:'0 0.15em',border:'1px solid #60a5fa',borderRadius:3,background:'#eff6ff',color:'#0f172a'}}/>
+  <span role="group" aria-label="讀音編輯操作" style={{position:'absolute',top:'100%',left:editorSide==='left'?0:undefined,right:editorSide==='right'?0:undefined,display:'flex',gap:6,maxWidth:'calc(100vw - 24px)',padding:4,whiteSpace:'nowrap',fontSize:12,lineHeight:1.3,background:'white',border:'1px solid #93c5fd',borderRadius:4,zIndex:90,boxShadow:'0 2px 5px #0002'}} onPointerDown={event=>event.preventDefault()}>
+   <button type="button" onClick={()=>saveEdit()}>保存</button><button type="button" onClick={()=>saveEdit('')}>恢復來源</button><button type="button" onClick={cancelEdit}>取消</button>
+   {error && <span role="status" style={{whiteSpace:'normal',minWidth:80,maxWidth:160}}>{error}</span>}
+  </span>
+ </span>:<button type="button" data-furigana-reading aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?'原文':item.source==='manual'?'手動更正':'離線字典推測'}；點擊原位編輯`}
+  onClick={event=>{event.stopPropagation();edit(item);}} style={{font:'inherit',color:'inherit',lineHeight:'inherit',padding:0,border:0,background:'transparent',cursor:'text'}}>{item.reading || '補讀音'}</button>;
  const nodes=[];let cursor=0;
- for(const item of readings){
+ for(const item of [...readings,...unknownItems].sort((a,b)=>a.start-b.start)){
   if(item.start>cursor)nodes.push(renderText(source.slice(cursor,item.start),cursor));
-  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over'}}>{renderText(item.base,item.start)}<rt style={{fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{item.reading}<button type="button" aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?'原文':item.source==='manual'?'手動更正':'離線字典推測'}；點擊更正`} onClick={event=>{event.stopPropagation();edit(item);}} style={{fontSize:'0.8em',paddingInline:'0.15em'}}>✎</button></rt></ruby>);cursor=item.end;
+  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over'}}>{renderText(item.base,item.start)}<rt style={{fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{readingControl(item)}</rt></ruby>);cursor=item.end;
  }
  if(cursor<source.length)nodes.push(renderText(source.slice(cursor),cursor));
- const unknown=[...source.matchAll(/[\p{Script=Han}々]+/gu)].filter(match=>!readings.some(item=>match.index<item.end && match.index+match[0].length>item.start));
- return <span ref={host} data-furigana-view onClick={event=>event.stopPropagation()} style={{lineHeight:1.9}}>
-  {hidden?<span style={{fontSize:'0.55em',fontWeight:400}}>{readings.length?readings.map(item=>item.reading).join(' '):tokenizer?'讀音未收錄':'讀音載入中…'}</span>:nodes}
-  {hidden && readings.map(item=><button type="button" key={item.start} aria-label={`更正${item.base}讀音`} onClick={()=>edit(item)} style={{fontSize:'0.4em'}}>✎</button>)}
-  {unknown.length>0 && (!needsDictionary || tokenizer || error) && <button type="button" onClick={()=>edit({base:unknown[0][0],start:unknown[0].index,reading:''})} style={{fontSize:'0.5em'}} title="字典沒有可靠讀音，可手動指定">補讀音</button>}
-  {error && <span role="status" style={{fontSize:'0.5em'}}>{error}</span>}
-  {editing && <span role="dialog" aria-label="更正讀音" onKeyDown={event=>{event.stopPropagation();if(event.key==='Escape')setEditing(null);if(event.key==='Enter' && !event.nativeEvent.isComposing){event.preventDefault();saveEdit();}}} style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:14,padding:6,background:'#eff6ff',border:'1px solid #94a3b8',borderRadius:6}}><label>「{editing.base}」<input aria-label="讀音更正值" autoFocus value={editValue} onChange={event=>setEditValue(event.target.value)} style={{width:'10em',color:'#0f172a',background:'white'}}/></label><button type="button" onClick={saveEdit}>保存</button><button type="button" onClick={()=>{setEditValue('');}}>恢復來源</button><button type="button" onClick={()=>setEditing(null)}>取消</button></span>}
+ return <span ref={host} data-furigana-view style={{lineHeight:1.9}}>
+  {hidden?<span style={{fontSize:'0.55em',fontWeight:400}}>{readings.length?readings.map(item=><React.Fragment key={item.start}>{readingControl(item)}{' '}</React.Fragment>):unknownItems.length?readingControl(unknownItems[0]):tokenizer?'讀音未收錄':'讀音載入中…'}</span>:nodes}
+  {error && !editing && <span role="status" style={{fontSize:'0.5em'}}>{error}</span>}
   {storageError && <span role="status" style={{fontSize:'0.5em'}}>{storageError}</span>}
-  {hidden && <button type="button" aria-label="隱藏本格讀音" onClick={()=>setRevealed(false)} style={{fontSize:'0.4em'}}>隱藏</button>}
+  {hidden && <button type="button" aria-label="隱藏本格讀音" onClick={event=>{event.stopPropagation();cancelEdit();setRevealed(false);}} style={{fontSize:'0.4em'}}>隱藏</button>}
  </span>;
 };
 
@@ -405,7 +418,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.316 · nhk-audio-link-renewal";
+const APP_VERSION = "v5.317 · furigana-inline-reference";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8740,11 +8753,24 @@ const createKnowledgeReverseLookup = subtitles => {
     }};
 };
 
-const getSingleFolderReferenceTxt = (files,{mediaFile=null,videoVisible=false}={}) => {
+const getFolderReferenceTxt = (files,{mediaFile=null,videoVisible=false,exactOnly=false}={}) => {
     const name=String(mediaFile?.name || '');
     if(videoVisible && (/^video\//i.test(mediaFile?.type || '') || /\.(mp4|webm|mov|m4v|mkv|avi)$/i.test(name)))return null;
     const candidates=(Array.isArray(files)?files:[]).filter(file=>/\.txt$/i.test(file?.name || '') && !String(file.name).startsWith('._'));
-    return candidates.length===1?candidates[0]:null;
+    const key=value=>String(value || '').normalize('NFC').toLowerCase();
+    const base=key(name.replace(/\.[^.]+$/u,''));
+    const parent=file=>String(file?.webkitRelativePath || '').replace(/[^/]*$/u,'').normalize('NFC');
+    const mediaParent=parent(mediaFile);
+    if(base){
+        const nearby=candidates.filter(file=>!mediaParent || !parent(file) || parent(file)===mediaParent);
+        // An annotated companion preserves the publisher's original readings.
+        for(const suffix of ['.ruby.txt','.txt']){
+            const matches=nearby.filter(file=>key(file.name)===base+suffix);
+            if(matches.length===1)return matches[0];
+            if(matches.length>1)return null;
+        }
+    }
+    return !exactOnly && candidates.length===1?candidates[0]:null;
 };
 
 const getKnowledgeVerifiedHighlightRanges = (source,subtitleText,verified) => {
@@ -9539,7 +9565,7 @@ const MarkdownView = ({
                                 }}
                                 title={manualKnowledgeAnchorMode ? '點選這一行，設為目前字幕的對應位置' : undefined}
                             >
-                                {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
+                                {shouldLinkKnowledgeTerms || useSentenceLevelHighlight || furiganaSettings?.enabled ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
                                         {useSentenceLevelHighlight
                                             ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, subtitleForSourceLine(seg.sourceLine), `mdk-active-${i}`, seg.sourceLine)
@@ -12938,6 +12964,8 @@ export default function App() {
         const candidates = getTrackKnowledgeBaseCandidates(track);
         if (!candidates.length) return { exists: false, source: "none", baseName: "", triedBaseNames: [] };
 
+        const exactReference=getFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}),{mediaFile:track?.mediaFile || {name:track?.name},exactOnly:true});
+        if(exactReference)return {exists:true,source:'matching-folder-txt',file:exactReference,filename:exactReference.name,baseName:candidates[0] || '',triedBaseNames:candidates};
         const selectedKnowledgeFile = getSelectedKnowledgeTxtFileFromFolderMap();
         const selectedMatchesTrack = doesKnowledgeFileLikelyBelongToTrack(selectedKnowledgeFile, track);
         if (selectedKnowledgeFile &&
@@ -12969,7 +12997,7 @@ export default function App() {
                 triedBaseNames: candidates
             };
         }
-        const singleTxt=getSingleFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}));
+        const singleTxt=getFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}),{mediaFile:track?.mediaFile || {name:track?.name}});
         if(singleTxt)return {exists:true,source:'single-folder-txt',file:singleTxt,filename:singleTxt.name,baseName:candidates[0] || '',triedBaseNames:candidates};
         return { exists: false, source: "none", baseName: candidates[0] || "", triedBaseNames: candidates };
     };
@@ -23606,20 +23634,20 @@ ${userQ}`;
         setEmbeddedKnowledgeLoading(false);
         const pendingDefault=selectedFolderSession && handledFolderReferenceRef.current!==selectedFolderSession &&
             selectedFolderSession.mediaFile===(playlist[currentTrackIndex]?.mediaFile || null) &&
-            getSingleFolderReferenceTxt(selectedFolderSession.files,selectedFolderSession);
+            getFolderReferenceTxt(selectedFolderSession.files,selectedFolderSession);
         if (topPanelMode === 'document' && !isVideoMasked && !pendingDefault) {
             void loadEmbeddedKnowledgePanel({force:true});
         }
     }, [currentTrackIndex,selectedFolderSession]);
 
-    // Reuse the normal matching loader first, with the sole TXT as its final
+    // Match the media companion (including .ruby.txt) first, with the sole TXT as its final
     // fallback. A ref keeps text/language updates from restarting this effect.
     folderReferenceLoaderRef.current=loadEmbeddedKnowledgePanel;
     useEffect(() => {
         const session=selectedFolderSession;
         if(!session || handledFolderReferenceRef.current===session || selectedFolderSessionRef.current!==session)return;
         if(session.mediaFile && playlist[currentTrackIndex]?.mediaFile!==session.mediaFile)return;
-        const file=getSingleFolderReferenceTxt(session.files,session);
+        const file=getFolderReferenceTxt(session.files,session);
         if(!file){handledFolderReferenceRef.current=session;return;}
         let cancelled=false;
         const isCurrent=()=>!cancelled && selectedFolderSessionRef.current===session;

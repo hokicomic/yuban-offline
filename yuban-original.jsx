@@ -28,7 +28,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.316 · nhk-audio-link-renewal";
+const APP_VERSION = "v5.317 · furigana-inline-reference";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8367,11 +8367,24 @@ const createKnowledgeReverseLookup = subtitles => {
     }};
 };
 
-const getSingleFolderReferenceTxt = (files,{mediaFile=null,videoVisible=false}={}) => {
+const getFolderReferenceTxt = (files,{mediaFile=null,videoVisible=false,exactOnly=false}={}) => {
     const name=String(mediaFile?.name || '');
     if(videoVisible && (/^video\//i.test(mediaFile?.type || '') || /\.(mp4|webm|mov|m4v|mkv|avi)$/i.test(name)))return null;
     const candidates=(Array.isArray(files)?files:[]).filter(file=>/\.txt$/i.test(file?.name || '') && !String(file.name).startsWith('._'));
-    return candidates.length===1?candidates[0]:null;
+    const key=value=>String(value || '').normalize('NFC').toLowerCase();
+    const base=key(name.replace(/\.[^.]+$/u,''));
+    const parent=file=>String(file?.webkitRelativePath || '').replace(/[^/]*$/u,'').normalize('NFC');
+    const mediaParent=parent(mediaFile);
+    if(base){
+        const nearby=candidates.filter(file=>!mediaParent || !parent(file) || parent(file)===mediaParent);
+        // An annotated companion preserves the publisher's original readings.
+        for(const suffix of ['.ruby.txt','.txt']){
+            const matches=nearby.filter(file=>key(file.name)===base+suffix);
+            if(matches.length===1)return matches[0];
+            if(matches.length>1)return null;
+        }
+    }
+    return !exactOnly && candidates.length===1?candidates[0]:null;
 };
 
 const getKnowledgeVerifiedHighlightRanges = (source,subtitleText,verified) => {
@@ -9166,7 +9179,7 @@ const MarkdownView = ({
                                 }}
                                 title={manualKnowledgeAnchorMode ? '點選這一行，設為目前字幕的對應位置' : undefined}
                             >
-                                {shouldLinkKnowledgeTerms || useSentenceLevelHighlight ? (
+                                {shouldLinkKnowledgeTerms || useSentenceLevelHighlight || furiganaSettings?.enabled ? (
                                     <div className="whitespace-pre-wrap leading-relaxed">
                                         {useSentenceLevelHighlight
                                             ? buildSentenceHighlightedKnowledgeNodes(plainTextForLink, subtitleForSourceLine(seg.sourceLine), `mdk-active-${i}`, seg.sourceLine)
@@ -12568,6 +12581,8 @@ export default function GeminiPlayer() {
         const candidates = getTrackKnowledgeBaseCandidates(track);
         if (!candidates.length) return { exists: false, source: "none", baseName: "", triedBaseNames: [] };
 
+        const exactReference=getFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}),{mediaFile:track?.mediaFile || {name:track?.name},exactOnly:true});
+        if(exactReference)return {exists:true,source:'matching-folder-txt',file:exactReference,filename:exactReference.name,baseName:candidates[0] || '',triedBaseNames:candidates};
         const selectedKnowledgeFile = getSelectedKnowledgeTxtFileFromFolderMap();
         const selectedMatchesTrack = doesKnowledgeFileLikelyBelongToTrack(selectedKnowledgeFile, track);
         if (selectedKnowledgeFile &&
@@ -12599,7 +12614,7 @@ export default function GeminiPlayer() {
                 triedBaseNames: candidates
             };
         }
-        const singleTxt=getSingleFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}));
+        const singleTxt=getFolderReferenceTxt(selectedFolderSessionRef.current?.files || Object.values(selectedFolderFilesRef.current || {}),{mediaFile:track?.mediaFile || {name:track?.name}});
         if(singleTxt)return {exists:true,source:'single-folder-txt',file:singleTxt,filename:singleTxt.name,baseName:candidates[0] || '',triedBaseNames:candidates};
         return { exists: false, source: "none", baseName: candidates[0] || "", triedBaseNames: candidates };
     };
@@ -23238,20 +23253,20 @@ ${userQ}`;
         setEmbeddedKnowledgeLoading(false);
         const pendingDefault=selectedFolderSession && handledFolderReferenceRef.current!==selectedFolderSession &&
             selectedFolderSession.mediaFile===(playlist[currentTrackIndex]?.mediaFile || null) &&
-            getSingleFolderReferenceTxt(selectedFolderSession.files,selectedFolderSession);
+            getFolderReferenceTxt(selectedFolderSession.files,selectedFolderSession);
         if (topPanelMode === 'document' && !isVideoMasked && !pendingDefault) {
             void loadEmbeddedKnowledgePanel({force:true});
         }
     }, [currentTrackIndex,selectedFolderSession]);
 
-    // Reuse the normal matching loader first, with the sole TXT as its final
+    // Match the media companion (including .ruby.txt) first, with the sole TXT as its final
     // fallback. A ref keeps text/language updates from restarting this effect.
     folderReferenceLoaderRef.current=loadEmbeddedKnowledgePanel;
     useEffect(() => {
         const session=selectedFolderSession;
         if(!session || handledFolderReferenceRef.current===session || selectedFolderSessionRef.current!==session)return;
         if(session.mediaFile && playlist[currentTrackIndex]?.mediaFile!==session.mediaFile)return;
-        const file=getSingleFolderReferenceTxt(session.files,session);
+        const file=getFolderReferenceTxt(session.files,session);
         if(!file){handledFolderReferenceRef.current=session;return;}
         let cancelled=false;
         const isCurrent=()=>!cancelled && selectedFolderSessionRef.current===session;
