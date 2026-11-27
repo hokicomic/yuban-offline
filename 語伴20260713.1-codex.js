@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.311 · visible-practice-units";
+const APP_VERSION = "v5.312 · ime-shortcuts-and-advance";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9930,7 +9930,7 @@ const focusSubtitlePracticeBlank = (container, afterField = null) => {
     // Playback buttons may yield focus, while settings, editors and dialogs keep it.
     if (active && !container.contains(active) && (active.isContentEditable ||
         active.closest?.('input, textarea, select, [role="dialog"], [aria-modal="true"]'))) return;
-    if (doc.getSelection?.()?.toString()) return;
+    if (doc.getSelection?.()?.toString() && (!afterField || active!==afterField)) return;
     const field = findSubtitlePracticeBlank(container.querySelectorAll('input'), afterField);
     if (field) {
         if (field !== active) field.focus({ preventScroll: true });
@@ -10001,14 +10001,19 @@ const createPlaybackShortcutHandler = getState => {
         if (event.type === 'keyup') { handledKey = null; return; }
         const beforeInput = event.type === 'beforeinput';
         if (beforeInput && event.inputType !== 'insertText') return;
-        const key = String((beforeInput ? event.data : event.key) || '').toLowerCase();
+        const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
+        const practice=editor?.hasAttribute('data-subtitle-blank');
+        const imeActive=event.isComposing || event.target?.dataset?.subtitleComposing==='true';
+        const idleTracked=practice && event.target?.dataset?.subtitleComposing==='false' &&
+            Date.now()-Number(event.target.dataset.subtitleCompositionEndedAt || 0)>50;
+        let key = String((beforeInput ? event.data : event.key) || '').toLowerCase();
+        if(!imeActive && practice && ((!beforeInput && event.code==='Period') || (idleTracked && ['。','．'].includes(key))))key='.';
         const space = [' ', 'spacebar'].includes(key) || (!beforeInput && event.code === 'Space');
         if (!space && !['-', '/', '.'].includes(key)) return;
-        if (event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
+        if (event.defaultPrevented || imeActive || (event.keyCode===229 && !(idleTracked && ['Period','Space'].includes(event.code))) ||
             event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
         const state = getState();
         if (!state?.enabled || (key === '.' && !state.blankMode)) return;
-        const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
         // Punctuation is already printed around dictation blanks. Reserve these
         // keys there, while ordinary editors keep their normal characters.
         if (editor && !editor.hasAttribute('data-subtitle-blank')) return;
@@ -10037,6 +10042,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
+    const committedCompositionRef = useRef(null);
     const lastBlankTapRef = useRef(null);
     const handledTouchDoubleRef = useRef(null);
     const [copyNotice, setCopyNotice] = useState(null);
@@ -10102,19 +10108,25 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         window.addEventListener('pagehide',persist);window.addEventListener('yuban-review-flush',persist);document.addEventListener('visibilitychange',hide);
         return ()=>{persist();window.removeEventListener('pagehide',persist);window.removeEventListener('yuban-review-flush',persist);document.removeEventListener('visibilitychange',hide);if(reviewDraftRef.current===draft)reviewDraftRef.current=null;};
     },[subtitle,source,answerSignature,blankMode,reviewContext]);
-    React.useLayoutEffect(() => { composingBlankRef.current = null; lastBlankTapRef.current = null; handledTouchDoubleRef.current = null; }, [subtitle, source, answerSignature]);
+    React.useLayoutEffect(() => { composingBlankRef.current = null; committedCompositionRef.current = null; lastBlankTapRef.current = null; handledTouchDoubleRef.current = null; }, [subtitle, source, answerSignature]);
     React.useLayoutEffect(() => {
         if (blankMode && subtitle && autoFocusEnabled) return installSubtitlePracticeFocus(containerRef.current);
     }, [subtitle, source, blankMode, autoFocusEnabled, answerSignature]);
     React.useLayoutEffect(() => {
-        if (!advanceFocusRef.current) return;
-        const answered = advanceFocusRef.current;
-        advanceFocusRef.current = null;
-        if (blankMode && autoFocusEnabled) {
-            const fields = Array.from(containerRef.current?.querySelectorAll('input') || []);
-            const field = fields.find(input => input.dataset.subtitleBlank === answered);
-            focusSubtitlePracticeBlank(containerRef.current, field);
-        }
+        const answered=advanceFocusRef.current;
+        if(!answered || !blankMode || !autoFocusEnabled)return;
+        const container=containerRef.current,win=container?.ownerDocument?.defaultView;
+        const advance=()=>{
+            if(advanceFocusRef.current!==answered)return;
+            advanceFocusRef.current=null;
+            const fields=Array.from(container?.querySelectorAll('input') || []);
+            const field=fields.find(input=>input.dataset.subtitleBlank===answered);
+            if(field?.dataset.subtitlePartComplete==='true')focusSubtitlePracticeBlank(container,field);
+        };
+        // Native IME commits can send one more input event after compositionend.
+        // Keep focus in the committing field until that event turn has finished.
+        if(win?.requestAnimationFrame){const frame=win.requestAnimationFrame(advance);return ()=>win.cancelAnimationFrame(frame);}
+        advance();
     });
     const inspectDeletion = useCallback((deleted,pin=false)=>setCopyNotice(current=>{
         if(!deleted)return current?.kind==='deletion' && !current.pinned?null:current;
@@ -10162,7 +10174,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
         });
     }, [tokens, fontSize, blankMode]);
     const nextBlank = event => {
-        if (event.nativeEvent?.isComposing || event.key !== 'Enter') return;
+        if (event.nativeEvent?.isComposing || event.nativeEvent?.keyCode===229 || composingBlankRef.current || event.key !== 'Enter') return;
         event.preventDefault();
         // Enter moves through blanks; Space is reserved for listening.
         if (!event.currentTarget.value) return;
@@ -10238,19 +10250,24 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
+                    data-subtitle-composing={answer?.composing?'true':'false'}
                     data-subtitle-review-word={reviewWord || undefined} title={reviewWord?'錯題複習格':'每格是一個分詞單位；底線間隔表示分界'}
                     data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || correct}
                     data-subtitle-longer-answer-pending={pendingLonger || undefined}
                     aria-label={`第 ${token.index + 1} 格${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : correct ? '正確' : '填空'}`}
                     aria-description={showGuide ? `${pendingLonger ? '已符合短答案，可點擊採用目前答案，或繼續輸入較長答案。' : ''}字母位置提示：${guide}。底線代表尚未答出的字母。` : '雙擊：空白顯示答案，未答對清空，答對選取並複製'}
                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
-                    onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
+                    onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing && committedCompositionRef.current!==`${token.index}:${part.index}`)}
                     onCompositionStart={event => {
+                        committedCompositionRef.current=null;
+                        if(event.currentTarget.dataset)event.currentTarget.dataset.subtitleComposing='true';
                         composingBlankRef.current = `${token.index}:${part.index}`;
                         update(token, part, event.currentTarget.value, true);
                     }}
                     onCompositionEnd={event => {
                         composingBlankRef.current = null;
+                        committedCompositionRef.current=`${token.index}:${part.index}`;
+                        if(event.currentTarget.dataset){event.currentTarget.dataset.subtitleComposing='false';event.currentTarget.dataset.subtitleCompositionEndedAt=String(Date.now());}
                         update(token, part, event.currentTarget.value, false);
                     }}
                     onScroll={event => syncSubtitlePracticeLetterOverlay(event.currentTarget)}

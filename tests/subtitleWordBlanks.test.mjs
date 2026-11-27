@@ -307,7 +307,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     });
     const compiled = await build({ stdin: { contents: source + '\nexport { SubtitlePractice };', loader: 'jsx', resolveDir: root },
         bundle: true, platform: 'node', format: 'cjs', external: ['react'], write: false, logLevel: 'silent' });
-    const setup = () => {
+    const setup = (withDom=false) => {
         let cursor = 0, effects = []; const slots = []; const listeners=new Map();
         const eventTarget={addEventListener:(name,fn)=>listeners.set(name,fn),removeEventListener:name=>listeners.delete(name)};
         const memo = (fn, deps) => { const at = cursor++; if (!slots[at] || (!deps || deps.some((dep, i) => !Object.is(dep, slots[at].deps?.[i])))) slots[at] = { deps, value: fn() }; return slots[at].value; };
@@ -317,13 +317,28 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
             useEffect: (fn, deps) => memo(() => { effects.push(fn); }, deps), useCallback: (fn,deps) => memo(()=>fn,deps) };
         const module = { exports: {} };
         vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require: name => name === 'react' ? runtime : require(name), console, setTimeout, clearTimeout,window:eventTarget,document:{...eventTarget,visibilityState:'visible'} });
+        const frames=new Map(),domFields=[];let frameId=0;
+        const win={...eventTarget,requestAnimationFrame:fn=>{frames.set(++frameId,fn);return frameId;},cancelAnimationFrame:id=>frames.delete(id),getComputedStyle:()=>({font:'24px sans-serif'})};
+        const doc={...eventTarget,defaultView:win,visibilityState:'visible',activeElement:null,getSelection:()=>({toString:()=> 'native candidate selection'}),createElement:()=>({getContext:()=>({measureText:text=>({width:text.length*12})})})};
+        const container={ownerDocument:doc,contains:field=>domFields.includes(field),querySelectorAll:()=>domFields};
         const render = props => {
             cursor = 0; effects = [];
             const nodes = flatten(module.exports.SubtitlePractice.type(props));
             for (const node of nodes) if (node.props?.['aria-label'] === '完整字幕文字' && node.props.ref) node.props.ref.current = { textContent: '' };
+            if(withDom) {
+                const inputs=nodes.filter(node=>node.type==='input');
+                inputs.forEach((node,index)=>{
+                    const field=domFields[index] ||= {ownerDocument:doc,style:{},focus(){doc.activeElement=this;},closest(){return this;},hasAttribute:name=>name==='data-subtitle-blank'};
+                    field.dataset={subtitleBlank:node.props['data-subtitle-blank'],subtitlePartComplete:String(node.props['data-subtitle-part-complete'])};
+                    field.value=node.props.value;field.readOnly=node.props.readOnly;
+                });
+                for(const node of nodes)if(node.type==='div' && node.props.ref && !node.props['aria-label'])node.props.ref.current=container;
+                if(!doc.activeElement)doc.activeElement=domFields[0];
+            }
             effects.forEach(fn => fn()); return nodes;
         };
         render.flush=()=>listeners.get('yuban-review-flush')?.();
+        render.dom={fields:domFields,doc,flushFrames:()=>{for(const [id,fn] of [...frames]){frames.delete(id);fn();}}};
         return render;
     };
     const base = () => ({ subtitle: { text: "Hello, don't stop!" }, text: "Hello, don't stop!", language: 'en-US', blankMode: true,
@@ -358,6 +373,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         for(const sample of ['中文分詞需要清楚的界線。','นี่คือข้อความภาษาไทย','السَّلَامُ عَلَيْكُمْ']) {
             const other=setup()({...base(),subtitle:{text:sample},text:sample});
             assert.equal(other.filter(node=>node.props?.['data-subtitle-word-unit']!==undefined).length,fields(other).length);
+        }
+    });
+    test('IME commits advance after final input for multiple writing systems: '+file,()=>{
+        for(const [text,language] of [['小説を読む。','ja'],['中文學習很好。','zh-TW'],['한국어 공부','ko'],['السَّلَامُ عَلَيْكُمْ','ar'],['café résumé','fr']]) {
+            const render=setup(true),props={...base(),text,language,subtitle:{text}};
+            let inputs=fields(render(props));assert.ok(inputs.length>1,text);
+            const target=render.dom.fields[0],word=api.tokenizeSubtitlePractice(text,language).find(token=>token.kind==='word').parts[0].text;
+            target.value=word;
+            inputs[0].props.onCompositionStart({currentTarget:target});
+            inputs[0].props.onChange({target,nativeEvent:{isComposing:true}});
+            inputs=fields(render(props));render.dom.flushFrames();
+            assert.equal(render.dom.doc.activeElement,target,'do not move during candidate conversion');
+            inputs[0].props.onCompositionEnd({currentTarget:target});inputs=fields(render(props));
+            assert.equal(render.dom.doc.activeElement,target,'defer until commit events settle');
+            inputs[0].props.onChange({target,nativeEvent:{isComposing:true}});
+            inputs=fields(render(props));render.dom.flushFrames();
+            assert.equal(inputs[0].props['data-subtitle-part-complete'],true,text);
+            assert.equal(render.dom.doc.activeElement,render.dom.fields[1],text+' advances after a stale final composing flag');
         }
     });
     test('only recorded pending review blanks receive orange underlines, including corrected phrases: ' + file, () => {

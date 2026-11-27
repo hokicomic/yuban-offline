@@ -96,6 +96,26 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const before=event(blank,{type:'beforeinput',inputType:'insertText',data:' ',target});handler(before);
         assert.equal(before.prevented,true);assert.equal(calls,1,'beforeinput does not replay twice');
     });
+    test('idle IME blanks reserve Period and Space, active conversion keeps both keys: '+file,()=>{
+        let echoes=0,plays=0;
+        const handler=create(()=>({enabled:true,blankMode:true,toggleEcho:()=>echoes++,toggle:()=>plays++}));
+        const target={dataset:{subtitleComposing:'false'},closest:()=>blank};
+        const period=event(blank,{key:'。',code:'Period',keyCode:229,target});handler(period);
+        assert.equal(echoes,1);assert.equal(period.prevented,true);
+        const space=event(blank,{key:'Process',code:'Space',keyCode:229,target});handler(space);
+        assert.equal(plays,1);assert.equal(space.prevented,true);
+        const release=event(blank,{type:'keyup',target});handler(release);
+        const software=event(blank,{type:'beforeinput',inputType:'insertText',data:'。',target});handler(software);
+        assert.equal(echoes,2);assert.equal(software.prevented,true);
+        target.dataset.subtitleComposing='true';
+        for(const code of ['Period','Space']) {
+            const input=event(blank,{key:code==='Period'?'。':' ',code,keyCode:229,target});handler(input);
+            assert.equal(input.prevented,undefined);
+        }
+        target.dataset.subtitleComposing='false';target.dataset.subtitleCompositionEndedAt=String(Date.now());
+        const commit=event(blank,{key:'Process',code:'Space',keyCode:229,target});handler(commit);
+        assert.equal(commit.prevented,undefined);assert.equal(echoes,2);assert.equal(plays,1);
+    });
     test('typing spaces, composition, modified shortcuts and open overlays are left alone: ' + file, () => {
         let calls = 0; const state = { enabled: true, toggle: () => calls++ };
         const handler = create(() => state);
