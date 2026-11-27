@@ -68,7 +68,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         handler(event(blank, { type: 'beforeinput', inputType: 'insertText', data: '-', code: '' }));
         assert.equal(calls.at(-1), -1);
     });
-    test('period toggles echo only during dictation and deduplicates software keyboard input: ' + file, () => {
+    test('period toggles echo in reading and dictation modes and deduplicates software keyboard input: ' + file, () => {
         let toggles = 0;
         const state = { enabled: true, blankMode: true, toggleEcho() { toggles++; } };
         const handler = create(() => state);
@@ -82,10 +82,24 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         assert.equal(toggles, 2);
         state.blankMode = false;
         const full = event(null, {key:'.',code:'Period'}); handler(full);
-        assert.equal(full.prevented, undefined); assert.equal(toggles, 2);
+        assert.equal(full.prevented, true); assert.equal(toggles, 3);
         state.blankMode = true;
         const ordinaryEditor = event(editor, {key:'.',code:'Period'}); handler(ordinaryEditor);
-        assert.equal(ordinaryEditor.prevented, undefined); assert.equal(toggles, 2);
+        assert.equal(ordinaryEditor.prevented, undefined); assert.equal(toggles, 3);
+    });
+    test('a focused read-only caption supports echo entry and exit without affecting editable text: '+file,()=>{
+        let echo=false,toggles=0;
+        const state={enabled:true,blankMode:false,toggleEcho(){echo=!echo;toggles++;}};
+        const handler=create(()=>state);
+        const reading={hasAttribute:name=>name==='data-subtitle-reading'};
+        const target={dataset:{subtitleComposing:'false'},closest:()=>reading};
+        for(const key of ['.','。']){
+            const press=event(reading,{target,key,code:'Period',keyCode:key==='。'?229:190});handler(press);
+            assert.equal(press.prevented,true);handler(event(reading,{type:'keyup',target}));
+        }
+        assert.equal(toggles,2);assert.equal(echo,false,'the same key exits echo too');
+        const edit=event(editor,{key:'.',code:'Period'});handler(edit);
+        assert.equal(edit.prevented,undefined);assert.equal(toggles,2);
     });
     test('Space remains a playback shortcut inside a partially typed phrase answer: ' + file, () => {
         let calls=0;

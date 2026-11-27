@@ -26,7 +26,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.312 · ime-shortcuts-and-advance";
+const APP_VERSION = "v5.313 · reading-mode-echo-shortcut";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9780,21 +9780,23 @@ const createPlaybackShortcutHandler = getState => {
         if (beforeInput && event.inputType !== 'insertText') return;
         const editor = event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
         const practice=editor?.hasAttribute('data-subtitle-blank');
+        const reading=editor?.hasAttribute('data-subtitle-reading');
+        const shortcutSurface=practice || reading;
         const imeActive=event.isComposing || event.target?.dataset?.subtitleComposing==='true';
-        const idleTracked=practice && event.target?.dataset?.subtitleComposing==='false' &&
+        const idleTracked=shortcutSurface && event.target?.dataset?.subtitleComposing==='false' &&
             Date.now()-Number(event.target.dataset.subtitleCompositionEndedAt || 0)>50;
         let key = String((beforeInput ? event.data : event.key) || '').toLowerCase();
-        if(!imeActive && practice && ((!beforeInput && event.code==='Period') || (idleTracked && ['。','．'].includes(key))))key='.';
+        if(!imeActive && shortcutSurface && ((!beforeInput && event.code==='Period') || (idleTracked && ['。','．'].includes(key))))key='.';
         const space = [' ', 'spacebar'].includes(key) || (!beforeInput && event.code === 'Space');
         if (!space && !['-', '/', '.'].includes(key)) return;
         if (event.defaultPrevented || imeActive || (event.keyCode===229 && !(idleTracked && ['Period','Space'].includes(event.code))) ||
             event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
         const state = getState();
-        if (!state?.enabled || (key === '.' && !state.blankMode)) return;
+        if (!state?.enabled) return;
         // Punctuation is already printed around dictation blanks. Reserve these
         // keys there, while ordinary editors keep their normal characters.
-        if (editor && !editor.hasAttribute('data-subtitle-blank')) return;
-        if (beforeInput && !editor?.hasAttribute('data-subtitle-blank')) return;
+        if (editor && !shortcutSurface) return;
+        if (beforeInput && !shortcutSurface) return;
         event.preventDefault();
         event.stopPropagation();
         if (event.repeat) return;
@@ -10115,7 +10117,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             ) : (
                 <p className="w-fit max-w-full mx-auto select-text cursor-text">
                     <span ref={editorRef} contentEditable={false}
-                        role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
+                        role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" data-subtitle-reading="true" data-subtitle-composing="false" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
                         className="select-text outline-none" />
                     {subtitle && source.trim() && <button type="button" aria-label="複製全句" title="複製目前顯示的完整字幕"
                         onPointerDown={event=>event.preventDefault()} onClick={copySentence}
