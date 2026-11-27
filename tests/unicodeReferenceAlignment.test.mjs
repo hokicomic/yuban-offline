@@ -9,6 +9,15 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
     const helpers=source.slice(source.indexOf('const normalizeKnowledgeAlignmentText ='),source.indexOf('const MarkdownView ='));
     const api=vm.runInNewContext(marker+'\n'+sentenceHelpers+helpers+'\n({groupSubtitlesByReferenceSentences,createSubtitleReferenceResolver,buildKnowledgeOriginalSearchIndex,applySubtitleReferencePreference,findKnowledgePreciseSubtitleRanges,normalizeSubtitleUnicode})');
     const engine=book=>api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex('[原文]\n'+book));
+    test('long unchanged Japanese context locates a short factual ASR substitution for confirmation: '+file,()=>{
+        const reference='今年8月、ネパールと中国の国境の近くで、大きい土石流が起こってから、26日で3か月になりました。';
+        const raw=reference.replace('26日','今日');
+        const result=engine(reference).resolve({text:raw});
+        assert.equal(result.aligned,true);assert.equal(result.reviewDifferences.length,1);
+        assert.equal(result.reviewDifferences[0].edit.from,'今');assert.equal(result.reviewDifferences[0].edit.to,'26');
+        assert.equal(result.trusted,false);assert.equal(result.raw,raw);
+        assert.equal(engine(reference+'\n'+reference).resolve({text:raw}).reason,'ambiguous');
+    });
     test('Japanese user heading and long sentence ignore Markdown and typographic spacing: '+file,()=>{
         const title='第一回 小説家は寛容な人種なのか';
         const raw='* 第一回 *小説家は寛容な人種なのか?';

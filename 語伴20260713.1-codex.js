@@ -418,7 +418,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.317 · furigana-inline-reference";
+const APP_VERSION = "v5.318 · unicode-context-differences";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7863,6 +7863,31 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
             ranges.forEach(range=>range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end));
             candidates.push({ranges,cost:0,text:ranges.map(range=>range.text).join('\n')});
             if(candidates.length>128)return {reason:'ambiguous',candidateCount:candidates.length,candidates,candidatesTruncated:true};
+        }
+        // Strong unchanged context can locate a long Unicode sentence even
+        // when ASR substitutes a short span. Keep factual changes reviewable.
+        if(!candidates.length && query.length>=32 && !after.length && !before.length){
+            const nearby=[];
+            for(const [line,lineText] of lineTexts){
+                if(sequential && sourceLine>=0 && (line<sourceLine-1 || line>sourceLine+48))continue;
+                for(const match of lineText.matchAll(/[^。！？!?]+[。！？!?]*/gu)){
+                    const ref=match[0].trim(),norm=normalizeSubtitleUnicode(ref),key=norm.key;
+                    if(Math.abs(key.length-query.length)>4)continue;
+                    let prefix=0,suffix=0;
+                    while(prefix<Math.min(query.length,key.length) && query[prefix]===key[prefix])prefix++;
+                    while(suffix<Math.min(query.length,key.length)-prefix && query[query.length-1-suffix]===key[key.length-1-suffix])suffix++;
+                    const a=query.length-prefix-suffix,b=key.length-prefix-suffix;
+                    if(prefix<8 || suffix<8 || !a || !b || Math.max(a,b)>4 || (prefix+suffix)/Math.max(query.length,key.length)<.9)continue;
+                    const locate=(normalized,at)=>{let n=0;for(const unit of normalized.units){if(at<n+unit.key.length)return unit;n+=unit.key.length;}return null;};
+                    const rawNorm=normalizeSubtitleUnicode(raw),first=locate(rawNorm,prefix),last=locate(rawNorm,query.length-suffix-1),rf=locate(norm,prefix),rl=locate(norm,key.length-suffix-1);
+                    if(!first || !last || !rf || !rl)continue;
+                    const start=match.index+match[0].indexOf(ref),range={sourceLine:line,start,end:start+ref.length,text:ref};
+                    const edit={start:first.start,end:last.end,text:ref.slice(rf.start,rl.end),from:raw.slice(first.start,last.end),to:ref.slice(rf.start,rl.end),kind:'spelling'};
+                    nearby.push({text:raw,aligned:true,trusted:false,changed:false,edits:[],ranges:[range],referenceText:ref,boundaryOmissions:[],alignmentMethod:'unicode_anchored_difference',reviewDifferences:[{side:'difference',text:`${edit.from} → ${edit.to}`,signature:JSON.stringify(['unicode-context',range,edit]),edit}]});
+                }
+            }
+            if(nearby.length===1)return nearby[0];
+            if(nearby.length>1)return {reason:'ambiguous',candidateCount:nearby.length,candidates:nearby};
         }
         let best=candidates;
         if(best.length>1 && sourceLine>=0){const local=best.filter(item=>item.ranges.some(range=>Math.abs(range.sourceLine-sourceLine)<=4));if(local.length===1)best=local;}
