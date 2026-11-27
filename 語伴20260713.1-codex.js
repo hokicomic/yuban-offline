@@ -253,7 +253,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.310 · unicode-subtitle-alignment";
+const APP_VERSION = "v5.311 · visible-practice-units";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9906,7 +9906,7 @@ const updateSubtitlePracticeAnswer = (word, previous, partIndex, value, composin
     const revealed = !composing && /[?？]/u.test(value);
     return { values: revealed ? word.parts.filter(part => part.kind === 'letters').map(part => part.text) : values, revealed, composing: Boolean(composing), confirmedValues };
 };
-const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && word.parts
+const isSubtitlePracticeAnswerCorrect = (word, answer) => !answer?.revealed && !answer?.composing && word.parts
     .filter(part => part.kind === 'letters')
     .every(part => isSubtitlePracticePartAccepted(part, answer?.values?.[part.index],answer?.confirmedValues?.[part.index]));
 
@@ -10225,7 +10225,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 word.accepted.some(expected=>getSubtitlePracticePartOptions(part).includes(expected)));
         const value = answer?.values?.[part.index] || '';
         const confirmedShort = answer?.confirmedValues?.[part.index]!==undefined;
-        const correct = isSubtitlePracticePartAccepted(part, value,answer?.confirmedValues?.[part.index]);
+        const correct = !answer?.composing && isSubtitlePracticePartAccepted(part, value,answer?.confirmedValues?.[part.index]);
         const pendingLonger = !answer?.revealed && !answer?.composing && !correct && getSubtitlePracticePendingLongerOptions(part,value).length > 0;
         const color = answer?.revealed ? '#dc2626' : correct || pendingLonger ? '#2f7d57' : '#6b4c9a';
         const showGuide = Boolean(value) && !answer?.revealed && !correct && !answer?.composing;
@@ -10238,10 +10238,10 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                 <input type="text" value={value}
                     readOnly={Boolean(answers[token.index]?.revealed)}
                     data-subtitle-blank={`${token.index}:${part.index}`}
-                    data-subtitle-review-word={reviewWord || undefined} title={reviewWord?'錯題複習格':undefined}
+                    data-subtitle-review-word={reviewWord || undefined} title={reviewWord?'錯題複習格':'每格是一個分詞單位；底線間隔表示分界'}
                     data-subtitle-part-complete={Boolean(answers[token.index]?.revealed) || correct}
                     data-subtitle-longer-answer-pending={pendingLonger || undefined}
-                    aria-label={`第 ${token.index + 1} 字${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : correct ? '正確' : '填空'}`}
+                    aria-label={`第 ${token.index + 1} 格${token.parts.filter(item => item.kind === 'letters').length > 1 ? `第 ${part.index + 1} 部分` : ''}：${answers[token.index]?.revealed ? '已揭示' : correct ? '正確' : '填空'}`}
                     aria-description={showGuide ? `${pendingLonger ? '已符合短答案，可點擊採用目前答案，或繼續輸入較長答案。' : ''}字母位置提示：${guide}。底線代表尚未答出的字母。` : '雙擊：空白顯示答案，未答對清空，答對選取並複製'}
                     autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} enterKeyHint="next"
                     onChange={event => update(token, part, event.target.value, event.nativeEvent?.isComposing)}
@@ -10312,7 +10312,8 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
             {blankMode && subtitle ? (
                 <div ref={containerRef}>
                     {displayTokens.map((token, index) => token.kind === 'deletion' ? renderDeletion(token,index) : token.kind === 'literal' ? <span key={index} data-subtitle-visible-name={token.name || undefined}>{token.text}</span> : (
-                        <span key={index} className="inline-block whitespace-nowrap align-baseline max-w-full">
+                        <span key={index} data-subtitle-word-unit={token.index} className="inline-block whitespace-nowrap align-baseline max-w-full"
+                            style={{marginInline:'0.12em'}}>
                             {token.parts.map((part, partIndex) => part.kind === 'literal' ? <span key={partIndex}>{part.text}</span> : renderBlank(token, part, partIndex))}
                         </span>
                     ))}

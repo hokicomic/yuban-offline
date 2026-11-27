@@ -330,6 +330,36 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         fontSize: 24, textRef: { current: null }, editsRef: { current: new WeakMap() } });
     const fields = nodes => nodes.filter(node => node.type === 'input');
     const type = (field, value) => field.props.onChange({ target: { value }, nativeEvent: {} });
+    test('unspaced scripts have separate word blanks and Japanese IME commits a whole unit: '+file,()=>{
+        const render=setup(),text='小説について語ります。';
+        const props={...base(),subtitle:{text,start:1,end:5},text,language:'ja'};
+        let nodes=render(props),inputs=fields(nodes);
+        assert.ok(inputs.length>1,'a Japanese sentence must not be one input');
+        const expected=api.tokenizeSubtitlePractice(text,'ja').filter(token=>token.kind==='word');
+        assert.equal(expected[0].parts[0].text,'小説');
+        assert.equal(inputs.length,expected.length);
+        const units=nodes.filter(node=>node.props?.['data-subtitle-word-unit']!==undefined);
+        assert.equal(units.length,inputs.length);
+        for(const unit of units){assert.ok(parseFloat(unit.props.style.marginInline)>0);assert.equal(unit.props.style.flexGrow,undefined);}
+        type(inputs[0],'小');nodes=render(props);inputs=fields(nodes);
+        assert.equal(inputs[0].props['data-subtitle-part-complete'],false,'one kanji is not the whole 小説 unit');
+        inputs[0].props.onCompositionStart({currentTarget:{value:'小'}});
+        inputs[0].props.onChange({target:{value:'小説'},nativeEvent:{isComposing:true}});
+        inputs=fields(render(props));
+        assert.equal(inputs[0].props['data-subtitle-part-complete'],false,'do not complete or jump during IME candidate selection');
+        const composing=api.updateSubtitlePracticeAnswer(expected[0],null,0,'小説',true);
+        assert.equal(api.isSubtitlePracticeAnswerCorrect(expected[0],composing),false);
+        assert.equal(api.getSubtitlePracticeProgress([expected[0]],{0:composing}).done,false);
+        inputs[0].props.onCompositionEnd({currentTarget:{value:'小説'}});
+        inputs=fields(render(props));
+        assert.equal(inputs[0].props['data-subtitle-part-complete'],true);
+        assert.equal(inputs[1].props.value,'');
+        assert.match(inputs[0].props['aria-label'],/第 1 格/);
+        for(const sample of ['中文分詞需要清楚的界線。','นี่คือข้อความภาษาไทย','السَّلَامُ عَلَيْكُمْ']) {
+            const other=setup()({...base(),subtitle:{text:sample},text:sample});
+            assert.equal(other.filter(node=>node.props?.['data-subtitle-word-unit']!==undefined).length,fields(other).length);
+        }
+    });
     test('only recorded pending review blanks receive orange underlines, including corrected phrases: ' + file, () => {
         const render=setup(),props={...base(),subtitle:{text:'Hello world.',start:1,end:4},text:'Hello world.',
             reviewTarget:{originalText:'Hello world.',displayText:'Hello world.',start:1,mastered:false,
@@ -715,7 +745,7 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         let nodes=render(props),inputs=fields(nodes);
         assert.equal(nodes.find(node=>node.props?.['data-subtitle-visible-name']).props.children,'Gared');
         assert.equal(inputs.length,4,'said, I, d, return are exercise fields');
-        assert.equal(inputs[1].props['aria-label'],'第 2 字第 1 部分：填空');
+        assert.equal(inputs[1].props['aria-label'],'第 2 格第 1 部分：填空');
         const plain={...props,contextNameHints:[]};nodes=render(plain);inputs=fields(nodes);
         assert.equal(inputs.length,5,'a different context cannot inherit stale name exemptions');
         assert.equal(inputs[0].props.value,'');assert.equal(props.subtitle.text,text);
