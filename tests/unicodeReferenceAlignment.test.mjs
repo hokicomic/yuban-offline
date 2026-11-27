@@ -18,6 +18,14 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
         assert.equal(result.trusted,false);assert.equal(result.raw,raw);
         assert.equal(engine(reference+'\n'+reference).resolve({text:raw}).reason,'ambiguous');
     });
+    test('actual NHK subtitle has both a date error and a kana counter difference: '+file,()=>{
+        const ref='今年8月、ネパールと中国の国境の近くで、大きい土石流が起こってから、26日で3か月になりました。';
+        const raw='今年8月 、ネパールと中国の国境の近くで 、大きい土石流が起こってから 、今日で3ヶ月になりました 。';
+        const resolver=engine(ref),cue={text:raw},result=resolver.resolveWithNeighbours(cue,null,{text:'ネパールと中国で今までに1500人以上が亡くなりました。'});
+        assert.equal(result.aligned,true,JSON.stringify(result));assert.equal(result.reviewDifferences.length,2);
+        let corrected=raw;for(const item of [...result.reviewDifferences].sort((a,b)=>b.edit.start-a.edit.start))corrected=corrected.slice(0,item.edit.start)+item.edit.text+corrected.slice(item.edit.end);
+        assert.equal(api.normalizeSubtitleUnicode(corrected).key,api.normalizeSubtitleUnicode(ref).key);
+    });
     test('Japanese user heading and long sentence ignore Markdown and typographic spacing: '+file,()=>{
         const title='第一回 小説家は寛容な人種なのか';
         const raw='* 第一回 *小説家は寛容な人種なのか?';

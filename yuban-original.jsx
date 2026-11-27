@@ -28,7 +28,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.318 · unicode-context-differences";
+const APP_VERSION = "v5.319 · unicode-multiple-differences";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7480,24 +7480,34 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         }
         // Strong unchanged context can locate a long Unicode sentence even
         // when ASR substitutes a short span. Keep factual changes reviewable.
-        if(!candidates.length && query.length>=32 && !after.length && !before.length){
+        if(!candidates.length && query.length>=32){
             const nearby=[];
             for(const [line,lineText] of lineTexts){
                 if(sequential && sourceLine>=0 && (line<sourceLine-1 || line>sourceLine+48))continue;
                 for(const match of lineText.matchAll(/[^。！？!?]+[。！？!?]*/gu)){
                     const ref=match[0].trim(),norm=normalizeSubtitleUnicode(ref),key=norm.key;
                     if(Math.abs(key.length-query.length)>4)continue;
+                    const qa=Array.from(query),kb=Array.from(key);if(qa.length*kb.length>300000)continue;
                     let prefix=0,suffix=0;
-                    while(prefix<Math.min(query.length,key.length) && query[prefix]===key[prefix])prefix++;
-                    while(suffix<Math.min(query.length,key.length)-prefix && query[query.length-1-suffix]===key[key.length-1-suffix])suffix++;
-                    const a=query.length-prefix-suffix,b=key.length-prefix-suffix;
-                    if(prefix<8 || suffix<8 || !a || !b || Math.max(a,b)>4 || (prefix+suffix)/Math.max(query.length,key.length)<.9)continue;
+                    while(prefix<Math.min(qa.length,kb.length) && qa[prefix]===kb[prefix])prefix++;
+                    while(suffix<Math.min(qa.length,kb.length)-prefix && qa[qa.length-1-suffix]===kb[kb.length-1-suffix])suffix++;
+                    if(prefix<8 || suffix<4)continue;
+                    const width=kb.length+1,dp=new Uint16Array((qa.length+1)*width);
+                    for(let i=0;i<=qa.length;i++)dp[i*width]=i;for(let j=0;j<=kb.length;j++)dp[j]=j;
+                    for(let i=1;i<=qa.length;i++)for(let j=1;j<=kb.length;j++)dp[i*width+j]=Math.min(dp[(i-1)*width+j]+1,dp[i*width+j-1]+1,dp[(i-1)*width+j-1]+(qa[i-1]===kb[j-1]?0:1));
+                    const cost=dp[qa.length*width+kb.length];if(!cost || cost>Math.min(6,Math.floor(Math.max(qa.length,kb.length)*.08)))continue;
                     const locate=(normalized,at)=>{let n=0;for(const unit of normalized.units){if(at<n+unit.key.length)return unit;n+=unit.key.length;}return null;};
-                    const rawNorm=normalizeSubtitleUnicode(raw),first=locate(rawNorm,prefix),last=locate(rawNorm,query.length-suffix-1),rf=locate(norm,prefix),rl=locate(norm,key.length-suffix-1);
-                    if(!first || !last || !rf || !rl)continue;
+                    const rawNorm=normalizeSubtitleUnicode(raw),ops=[];let i=qa.length,j=kb.length;
+                    while(i || j){if(i && j && dp[i*width+j]===dp[(i-1)*width+j-1]+(qa[i-1]===kb[j-1]?0:1)){ops.push({equal:qa[i-1]===kb[j-1],a:--i,b:--j});}else if(i && dp[i*width+j]===dp[(i-1)*width+j]+1)ops.push({a:--i,b:j,remove:true});else ops.push({a:i,b:--j,insert:true});}
+                    ops.reverse();const edits=[];let group=[];
+                    const flush=()=>{if(!group.length)return;const first=group[0],last=group.at(-1),ai=qa.slice(0,first.a).join('').length,ae=qa.slice(0,last.a+(last.insert?0:1)).join('').length,bi=kb.slice(0,first.b).join('').length,be=kb.slice(0,last.b+(last.remove?0:1)).join('').length;
+                        const start=locate(rawNorm,ai)?.start ?? raw.length,end=ae>ai?locate(rawNorm,ae-1)?.end:start,rs=locate(norm,bi)?.start ?? ref.length,re=be>bi?locate(norm,be-1)?.end:rs;
+                        const replacement=ref.slice(rs,re);edits.push({start,end,text:replacement,from:raw.slice(start,end),to:replacement,kind:'spelling'});group=[];};
+                    for(const op of ops){if(op.equal)flush();else group.push(op);}flush();
                     const start=match.index+match[0].indexOf(ref),range={sourceLine:line,start,end:start+ref.length,text:ref};
-                    const edit={start:first.start,end:last.end,text:ref.slice(rf.start,rl.end),from:raw.slice(first.start,last.end),to:ref.slice(rf.start,rl.end),kind:'spelling'};
-                    nearby.push({text:raw,aligned:true,trusted:false,changed:false,edits:[],ranges:[range],referenceText:ref,boundaryOmissions:[],alignmentMethod:'unicode_anchored_difference',reviewDifferences:[{side:'difference',text:`${edit.from} → ${edit.to}`,signature:JSON.stringify(['unicode-context',range,edit]),edit}]});
+                    const globalStart=offsets.findIndex(item=>item && item.sourceLine===line && item.start>=start);
+                    if((after.length && globalStart!==afterIndex) || (before.length && globalStart+key.length!==beforeIndex))continue;
+                    nearby.push({text:raw,aligned:true,trusted:false,changed:false,edits:[],ranges:[range],referenceText:ref,boundaryOmissions:[],alignmentMethod:'unicode_anchored_difference',reviewDifferences:edits.map(edit=>({side:'difference',text:`${edit.from} → ${edit.to}`,signature:JSON.stringify(['unicode-context',range,edit]),edit}))});
                 }
             }
             if(nearby.length===1)return nearby[0];
