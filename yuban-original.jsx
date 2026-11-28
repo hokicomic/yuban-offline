@@ -28,7 +28,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.321 · aligned-furigana";
+const APP_VERSION = "v5.322 · precise-subtitle-colors";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7953,7 +7953,11 @@ const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
 // Word/punctuation diff keeps correction offsets valid without turning a whole
 // sentence into one giant blank. Offsets always refer to the untouched subtitle.
 const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
-    const split=text=>Array.from(text.matchAll(/[\p{L}\p{M}\p{N}]+|\s+|[^\s]/gu),match=>({text:match[0],key:match[0].normalize('NFKC').toLowerCase(),weight:/[\p{L}\p{N}]/u.test(match[0])?4:1,start:match.index,end:match.index+match[0].length}));
+    // Treat scripts commonly written without spaces as individual base
+    // characters with their combining marks. Keep other words as units.
+    const unspaced=String.raw`[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]`;
+    const units=new RegExp(`${unspaced}\\p{M}*|(?:(?!${unspaced})[\\p{L}\\p{M}\\p{N}])+|\\s+|[^\\s]`,'gu');
+    const split=text=>Array.from(text.matchAll(units),match=>({text:match[0],key:match[0].normalize('NFKC').toLowerCase(),weight:/[\p{L}\p{N}]/u.test(match[0])?4:1,start:match.index,end:match.index+match[0].length}));
     const a=split(raw),b=split(reference),width=b.length+1;
     const scores=new Uint16Array((a.length+1)*width);
     for(let i=a.length-1;i>=0;i--)for(let j=b.length-1;j>=0;j--)

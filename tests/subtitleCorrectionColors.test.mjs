@@ -16,7 +16,29 @@ const flatten=node=>[node,...node.children.flatMap(flatten)];
 for (const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
  const source=fs.readFileSync(new URL('../'+file,import.meta.url),'utf8');
  const code=source.slice(source.indexOf('const getSubtitleCorrectionDisplayRanges ='),source.indexOf('const tokenizeSubtitlePractice ='));
- const api=vm.runInNewContext(code+'\n({getSubtitleCorrectionDisplayRanges,getSubtitleCorrectionDeletionMarkers,paintSubtitleReferenceCorrections})');
+ const diff=source.slice(source.indexOf('const buildSubtitleReferenceDisplayEdits ='),source.indexOf('const applySubtitleReferenceOriginalText ='));
+ const api=vm.runInNewContext(diff+code+'\n({buildSubtitleReferenceDisplayEdits,getSubtitleCorrectionDisplayRanges,getSubtitleCorrectionDeletionMarkers,paintSubtitleReferenceCorrections})');
+ test('comma deletion and spacing in the NHK cue never color unchanged words: '+file,()=>{
+  const text='5人の日本人など5000人以上がどこにいるかわかっていません。';
+  for(const raw of [text.replace('など','など、'),text.replace('など','など、 ').replace('。',' 。')]){
+   const edits=api.buildSubtitleReferenceDisplayEdits(raw,text);
+   assert.equal(edits.map(edit=>edit.from).join('').replace(/\s/g,''),'、');
+   const projection={raw,text,changed:true,edits};
+   assert.equal(api.getSubtitleCorrectionDisplayRanges(projection).length,0);
+   assert.equal(api.getSubtitleCorrectionDeletionMarkers(projection).length,0);
+   const editor=makeDocument().createElement('span');
+   api.paintSubtitleReferenceCorrections(editor,text,projection);
+   assert.equal(editor.textContent,text);
+   assert.ok(!flatten(editor).some(node=>node.style.color));
+  }
+ });
+ test('punctuation-only insertions color the symbol, not adjacent unspaced words: '+file,()=>{
+  for(const [raw,text,symbol] of [['日本語を勉強します。','日本語を、勉強します。','、'],['中文句子。','中文，句子。','，'],['ภาษาไทย','ภาษา、ไทย','、']]){
+   const edits=api.buildSubtitleReferenceDisplayEdits(raw,text);
+   const ranges=api.getSubtitleCorrectionDisplayRanges({raw,text,changed:true,edits});
+   assert.equal(ranges.map(range=>text.slice(range.start,range.end)).join(''),symbol);
+  }
+ });
  test('corrected words alone are readable blue, without altering text or escaping it as HTML: '+file,()=>{
   const raw='The member member joins the block.';
   const projection={raw,text:'The member joins the bloc.',changed:true,edits:[
