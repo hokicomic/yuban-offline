@@ -73,3 +73,32 @@ test('ambiguous whole entries without a contextual selection do not borrow an un
   {surface_form:'一日',word_position:1,reading:'',unresolvedCompound:true}];
  assert.equal(api.buildFuriganaReadings(text,document,{tokenize:()=>tokens}).length,0);
 });
+
+test('mixed NHK subtitle keeps positional ruby for both months and skips the retained 日 in 今日',()=>{
+ const doc=api.parseRubyDocument('見出し\n\n今年8｜月《がつ》、ネパールと｜中国《ちゅうごく》の｜国境《こっきょう》の｜近《ちか》くで、｜大《おお》きい｜土石流《どせきりゅう》が｜起《お》こってから、26｜日《にち》で3か｜月《げつ》になりました。');
+ const ref=doc.text.split('\n')[2],text=ref.replaceAll('、',' 、').replace('26日','今日');
+ const ranges=[{sourceLine:2,start:0,end:ref.length,text:ref}];
+ const projected=api.projectAlignedRuby(text,doc,ranges);
+ const result=api.buildFuriganaReadings(text,{text,projectedAnnotations:projected,libraryAnnotations:doc.annotations},analyze(text));
+ assert.deepEqual(Array.from(result.filter(x=>x.base==='月'),x=>[x.reading,x.origin]),[['がつ','aligned'],['げつ','aligned']]);
+ for(const [base,reading] of [['近','ちか'],['大','おお'],['起','お']])assert.equal(result.find(x=>x.base===base)?.reading,reading);
+ assert.equal(result.find(x=>x.base==='今日')?.reading,'きょう');
+ assert.ok(!projected.some(x=>x.base==='日'));
+ assert.equal(api.projectAlignedRuby(ref.replace('3か月','3ヶ月'),doc,ranges).filter(x=>x.base==='月').at(-1)?.reading,'げつ');
+});
+
+test('dictionary ruby trims matching outer kana while retaining the exact kanji position',()=>{
+ const text='近くで大きい木が起きます。お茶を飲みます。';
+ const result=readings(text);
+ for(const [base,reading] of [['近','ちか'],['大','おお'],['起','お'],['飲','の']]){
+  const item=result.find(x=>x.base===base);assert.equal(item?.reading,reading);
+  assert.equal(text.slice(item.start,item.end),base);
+ }
+});
+
+test('selected source range wins over another occurrence of the same text',()=>{
+ const doc=api.parseRubyDocument('｜一日《いちにち》です。\n｜一日《ついたち》です。');
+ const text='一日です。',ranges=[{sourceLine:1,start:0,end:text.length,text}];
+ assert.equal(api.projectAlignedRuby(text,doc,ranges)[0]?.reading,'ついたち');
+ assert.equal(api.projectAlignedRuby(text,doc,[{...ranges[0],sourceLine:9}]).length,0);
+});

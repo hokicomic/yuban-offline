@@ -38,6 +38,7 @@ function parseRubyDocument(value) {
 // Position-bound annotations only. A bare word occurring elsewhere is not
 // proof that this cue is aligned to that occurrence.
 function originalReadingsForText(text,document) {
+ if(document?.projectedAnnotations)return document.projectedAnnotations;
  if(!document?.annotations?.length || !text)return [];
  const first=document.text.indexOf(text);
  if(first<0 || (text!==document.text && Array.from(text).length<8))return [];
@@ -52,8 +53,77 @@ function originalReadingsForText(text,document) {
  }
  return result;
 }
+// Transfer ruby from the subtitle resolver's selected ranges. Track exact
+// character matches across all minimum-cost alignments and skip ambiguous ones.
+const projectedRubyCache=new WeakMap();
+function projectAlignedRuby(text, document, ranges) {
+ if (!ranges?.length) return [];
+ const cached=projectedRubyCache.get(ranges);
+ if(cached?.document===document && cached.text===text)return cached.readings;
+ const readings=mapAlignedRuby(text,document,ranges);
+ projectedRubyCache.set(ranges,{document,text,readings});
+ return readings;
+}
+
+function mapAlignedRuby(text, document, ranges) {
+ if (!document?.annotations?.length || !ranges?.length) return [];
+ const lines=document.text.split('\n'),starts=[0],raw=[];
+ for (const line of lines) starts.push(starts.at(-1)+line.length+1);
+ for (const range of ranges) {
+  const line=lines[range.sourceLine];
+  if (line?.slice(range.start,range.end)!==range.text) return [];
+  let offset=starts[range.sourceLine]+range.start;
+  for (const ch of range.text) {raw.push({ch,offset});offset+=ch.length;}
+ }
+ const a=raw.filter(({ch})=>/[\p{L}\p{M}\p{N}]/u.test(ch)),b=[];
+ let offset=0;
+ for (const ch of text) {if (/[\p{L}\p{M}\p{N}]/u.test(ch)) b.push({ch,offset});offset+=ch.length;}
+ const n=a.length,m=b.length,w=m+1;
+ if (!n || !m || (n+1)*w>400000) return [];
+ for(const item of [...a,...b])item.key=item.ch.normalize('NFKC');
+ const equal=(i,j)=>a[i].key===b[j].key;
+ const pre=new Uint16Array((n+1)*w),post=new Uint16Array((n+1)*w);
+ for(let i=0;i<=n;i++) for(let j=0;j<=m;j++) pre[i*w+j]=i&&j?Math.min(pre[(i-1)*w+j]+1,pre[i*w+j-1]+1,pre[(i-1)*w+j-1]+(equal(i-1,j-1)?0:1)):i+j;
+ for(let i=n;i>=0;i--) for(let j=m;j>=0;j--) post[i*w+j]=i<n&&j<m?Math.min(post[(i+1)*w+j]+1,post[i*w+j+1]+1,post[(i+1)*w+j+1]+(equal(i,j)?0:1)):n-i+m-j;
+ const cost=pre[n*w+m],mapping=new Map();
+ for(let i=0;i<n;i++){
+  let match=null,ambiguous=false;
+  for(let j=0;j<=m;j++){
+   const budget=cost-pre[i*w+j];
+   if(1+post[(i+1)*w+j]===budget){ambiguous=true;break;}
+   if(j===m)continue;
+   const same=equal(i,j);
+   if((same?0:1)+post[(i+1)*w+j+1]!==budget)continue;
+   if(!same || match!==null){ambiguous=true;break;}
+   match=j;
+  }
+  if(!ambiguous && match!==null)mapping.set(a[i].offset,b[match].offset);
+ }
+ const quantityPrefix=(value,start)=>value.slice(0,start).match(/[0-9０-９]+[かカヶケ箇]?$/u)?.[0].normalize('NFKC').replace(/[かカヶケ箇]$/u,'') || '';
+ return document.annotations.flatMap(item=>{
+  const start=mapping.get(item.start);
+  if(start===undefined || text.slice(start,start+item.base.length)!==item.base) return [];
+  let delta=0;
+  for(const ch of item.base){if(mapping.get(item.start+delta)!==start+delta)return [];delta+=ch.length;}
+  // A retained counter kanji may now belong to a different word (26日 → 今日).
+  if(quantityPrefix(document.text,item.start)!==quantityPrefix(text,start))return [];
+  return [{...item,start,end:start+item.base.length,source:'original',origin:'aligned'}];
+ });
+}
+
+function trimDictionaryOkurigana(item) {
+ const kana=/^[\p{Script=Hiragana}\p{Script=Katakana}ー]+/u;
+ const trailing=/[\p{Script=Hiragana}\p{Script=Katakana}ー]+$/u;
+ const lead=item.base.match(kana)?.[0] || '',tail=item.base.match(trailing)?.[0] || '';
+ if(!lead && !tail) return item;
+ const prefix=toHiragana(lead),suffix=toHiragana(tail);
+ if(!item.reading.startsWith(prefix) || !item.reading.endsWith(suffix) || item.reading.length<=prefix.length+suffix.length) return item;
+ return {...item,start:item.start+lead.length,end:item.end-tail.length,
+  base:item.base.slice(lead.length,item.base.length-tail.length),reading:item.reading.slice(prefix.length,item.reading.length-suffix.length)};
+}
+
 function buildFuriganaReadings(text,document,tokenizer,overrides={}) {
- const result=originalReadingsForText(text,document),tokens=tokenizer?tokenizer.tokenize(text):[];
+ const result=[...originalReadingsForText(text,document)],tokens=tokenizer?tokenizer.tokenize(text):[];
  const overlaps=(a,b)=>a.start<b.end && a.end>b.start;
  const covered=item=>result.some(other=>overlaps(item,other));
  const span=token=>({start:Number(token.word_position)-1,end:Number(token.word_position)-1+String(token.surface_form || '').length,base:token.surface_form,reading:toHiragana(token.reading || ''),source:'dictionary'});
@@ -86,7 +156,7 @@ function buildFuriganaReadings(text,document,tokenizer,overrides={}) {
  const add=items=>{for(const item of items.sort((a,b)=>(b.end-b.start)-(a.end-a.start) || a.start-b.start))if(!covered(item))result.push(item);};
  add(borrowed);
  const whole=tokens.filter(t=>validToken(t) && Array.from(t.surface_form).length>1).map(span);
- add(whole.filter(item=>!blocked.some(other=>overlaps(item,other))));
+ add(whole.filter(item=>!blocked.some(other=>overlaps(item,other))).map(trimDictionaryOkurigana));
  // Only after whole-word sources are exhausted may a single-character ruby
  // transfer across positions, and only as an independent word, not a compound.
  const independent=token=>token.surface_form?.length===1 && token.pos_detail_1!=='数' && token.pos_detail_2!=='助数詞';
@@ -128,11 +198,16 @@ function loadJapaneseTokenizer() {
 }
 
 const rubyKey=text=>{let hash=2166136261;for(const ch of text)hash=Math.imul(hash^ch.codePointAt(0),16777619);return (hash>>>0).toString(16)+':'+text.length;};
-const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0,renderText=(value)=>value}) => {
+const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0, referenceRanges=null,renderText=(value)=>value}) => {
  const source=String(text || ''),originalDocument=settings?.document || {text:'',annotations:[]};
- const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,libraryAnnotations:originalDocument.annotations,annotations:originalReadingsForText(contextText,originalDocument)
-    .filter(item=>item.start>=contextOffset && item.end<=contextOffset+source.length)
-    .map(item=>({...item,start:item.start-contextOffset,end:item.end-contextOffset}))},[originalDocument,source,contextText,contextOffset]);
+ const documentData=useMemo(()=>{
+  if(!referenceRanges?.length && contextText===null)return originalDocument;
+  const context=contextText ?? source,start=contextText===null?0:contextOffset;
+  const annotations=referenceRanges?.length?projectAlignedRuby(context,originalDocument,referenceRanges):originalReadingsForText(context,originalDocument);
+  return {text:source,libraryAnnotations:originalDocument.annotations,projectedAnnotations:annotations
+    .filter(item=>item.start>=start && item.end<=start+source.length)
+    .map(item=>({...item,start:item.start-start,end:item.end-start}))};
+ },[originalDocument,source,contextText,contextOffset,referenceRanges]);
  const enabled=Boolean(settings?.enabled),host=useRef(null),editingRef=useRef(null),composingEdit=useRef(false);
  const [revealed,setRevealed]=useState(false),[visible,setVisible]=useState(false),[tokenizer,setTokenizer]=useState(null),[error,setError]=useState(''),[revision,setRevision]=useState(0),[editing,setEditing]=useState(null),[editValue,setEditValue]=useState(''),[editorSide,setEditorSide]=useState('left');
  const context=contextText ?? source,documentAt=originalDocument.text.indexOf(context);
@@ -192,7 +267,7 @@ const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset
  const nodes=[];let cursor=0;
  for(const item of [...readings,...unknownItems].sort((a,b)=>a.start-b.start)){
   if(item.start>cursor)nodes.push(renderText(source.slice(cursor,item.start),cursor));
-  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over'}}>{renderText(item.base,item.start)}<rt style={{fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{readingControl(item)}</rt></ruby>);cursor=item.end;
+  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over',rubyAlign:'center'}}><span style={{display:'ruby-base'}}>{renderText(item.base,item.start)}</span><rt style={{textAlign:'center',fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{readingControl(item)}</rt></ruby>);cursor=item.end;
  }
  if(cursor<source.length)nodes.push(renderText(source.slice(cursor),cursor));
  return <span ref={host} data-furigana-view style={{lineHeight:1.9}}>
@@ -443,7 +518,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.320 · furigana-word-priority";
+const APP_VERSION = "v5.321 · aligned-furigana";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -10280,7 +10355,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null, furiganaSettings = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null, furiganaSettings = null, furiganaReferenceRanges = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -10558,7 +10633,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             isSubtitlePracticePartCorrect(token.correctedText,value,language) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
                     </span>
                 )}
-                {/^ja/i.test(language || '') && /\p{Script=Han}/u.test(part.text) && <span className="absolute left-1/2 -translate-x-1/2" style={{top:'-1.05em',lineHeight:1}}><FuriganaView key={`${source}:${token.index}:${part.index}`} text={part.text} settings={furiganaSettings} contextText={source} contextOffset={furiganaPartOffsets[`${token.index}:${part.index}`]} hidden /></span>}
+                {/^ja/i.test(language || '') && /\p{Script=Han}/u.test(part.text) && <span className="absolute left-1/2 -translate-x-1/2" style={{top:'-1.05em',lineHeight:1}}><FuriganaView key={`${source}:${token.index}:${part.index}`} text={part.text} settings={furiganaSettings} referenceRanges={furiganaReferenceRanges} contextText={source} contextOffset={furiganaPartOffsets[`${token.index}:${part.index}`]} hidden /></span>}
                 {pendingLonger && <button type="button" data-subtitle-confirm-short
                     className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded border border-amber-400 bg-amber-50 px-2 py-1 text-amber-800 whitespace-nowrap"
                     style={{fontSize:'0.5em',lineHeight:'1.2'}}
@@ -10598,7 +10673,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     <span ref={editorRef} contentEditable={false}
                         role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" data-subtitle-reading="true" data-subtitle-composing="false" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
                         className="select-text outline-none" style={/^ja/i.test(language || '') && furiganaSettings?.enabled?{display:'none'}:undefined} />
-                    {!blankMode && /^ja/i.test(language || '') && furiganaSettings?.enabled && <FuriganaView text={source} settings={furiganaSettings} renderText={renderRubyCaptionText} />}
+                    {!blankMode && /^ja/i.test(language || '') && furiganaSettings?.enabled && <FuriganaView text={source} settings={furiganaSettings} referenceRanges={furiganaReferenceRanges} renderText={renderRubyCaptionText} />}
                     {subtitle && source.trim() && <button type="button" aria-label="複製全句" title="複製目前顯示的完整字幕"
                         onPointerDown={event=>event.preventDefault()} onClick={copySentence}
                         className="inline-flex align-middle ml-1 rounded p-1 select-none text-slate-500 hover:text-blue-600 hover:bg-blue-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
@@ -24446,6 +24521,7 @@ ${userQ}`;
                                 )}
                                 <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.id===selectedReviewId && findReviewCue([subtitles[currentIndex]].filter(Boolean),entry)===0) || reviewSession?.document.entries.find(entry=>!entry.mastered && (entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05 || subtitles[currentIndex]?.sourceCues?.some(cue=>cue.text===entry.originalText && Math.abs(cue.start-entry.start)<.05)))} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     furiganaSettings={furiganaSettings}
+                                    furiganaReferenceRanges={currentSubtitlePresentation?.aligned ? currentSubtitlePresentation.ranges : null}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}

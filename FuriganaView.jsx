@@ -1,11 +1,16 @@
 import React, {useState,useEffect,useRef,useMemo} from 'react';
-import {buildFuriganaReadings,originalReadingsForText,loadJapaneseTokenizer,rubyReadingValid,toHiragana} from './furigana.js';
+import {buildFuriganaReadings,originalReadingsForText,projectAlignedRuby,loadJapaneseTokenizer,rubyReadingValid,toHiragana} from './furigana.js';
 const rubyKey=text=>{let hash=2166136261;for(const ch of text)hash=Math.imul(hash^ch.codePointAt(0),16777619);return (hash>>>0).toString(16)+':'+text.length;};
-export const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0,renderText=(value)=>value}) => {
+export const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0, referenceRanges=null,renderText=(value)=>value}) => {
  const source=String(text || ''),originalDocument=settings?.document || {text:'',annotations:[]};
- const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,libraryAnnotations:originalDocument.annotations,annotations:originalReadingsForText(contextText,originalDocument)
-    .filter(item=>item.start>=contextOffset && item.end<=contextOffset+source.length)
-    .map(item=>({...item,start:item.start-contextOffset,end:item.end-contextOffset}))},[originalDocument,source,contextText,contextOffset]);
+ const documentData=useMemo(()=>{
+  if(!referenceRanges?.length && contextText===null)return originalDocument;
+  const context=contextText ?? source,start=contextText===null?0:contextOffset;
+  const annotations=referenceRanges?.length?projectAlignedRuby(context,originalDocument,referenceRanges):originalReadingsForText(context,originalDocument);
+  return {text:source,libraryAnnotations:originalDocument.annotations,projectedAnnotations:annotations
+    .filter(item=>item.start>=start && item.end<=start+source.length)
+    .map(item=>({...item,start:item.start-start,end:item.end-start}))};
+ },[originalDocument,source,contextText,contextOffset,referenceRanges]);
  const enabled=Boolean(settings?.enabled),host=useRef(null),editingRef=useRef(null),composingEdit=useRef(false);
  const [revealed,setRevealed]=useState(false),[visible,setVisible]=useState(false),[tokenizer,setTokenizer]=useState(null),[error,setError]=useState(''),[revision,setRevision]=useState(0),[editing,setEditing]=useState(null),[editValue,setEditValue]=useState(''),[editorSide,setEditorSide]=useState('left');
  const context=contextText ?? source,documentAt=originalDocument.text.indexOf(context);
@@ -65,7 +70,7 @@ export const FuriganaView = ({text,settings,hidden=false,contextText=null,contex
  const nodes=[];let cursor=0;
  for(const item of [...readings,...unknownItems].sort((a,b)=>a.start-b.start)){
   if(item.start>cursor)nodes.push(renderText(source.slice(cursor,item.start),cursor));
-  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over'}}>{renderText(item.base,item.start)}<rt style={{fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{readingControl(item)}</rt></ruby>);cursor=item.end;
+  nodes.push(<ruby key={item.start} data-furigana-source={item.source} style={{rubyPosition:'over',rubyAlign:'center'}}><span style={{display:'ruby-base'}}>{renderText(item.base,item.start)}</span><rt style={{textAlign:'center',fontSize:'0.5em',fontWeight:400,lineHeight:1.15}}>{readingControl(item)}</rt></ruby>);cursor=item.end;
  }
  if(cursor<source.length)nodes.push(renderText(source.slice(cursor),cursor));
  return <span ref={host} data-furigana-view style={{lineHeight:1.9}}>

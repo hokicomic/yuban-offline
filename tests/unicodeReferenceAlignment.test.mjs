@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
+const rubyApi=await import('data:text/javascript;base64,'+Buffer.from(readFileSync(new URL('../furigana.js',import.meta.url),'utf8')).toString('base64'));
 for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
     const source=readFileSync(new URL('../'+file,import.meta.url),'utf8');
     const marker=source.split('\n').find(line=>line.startsWith('const KNOWLEDGE_ORIGINAL_MARKER_RE ='));
@@ -25,6 +26,18 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
         assert.equal(result.aligned,true,JSON.stringify(result));assert.equal(result.reviewDifferences.length,2);
         let corrected=raw;for(const item of [...result.reviewDifferences].sort((a,b)=>b.edit.start-a.edit.start))corrected=corrected.slice(0,item.edit.start)+item.edit.text+corrected.slice(item.edit.end);
         assert.equal(api.normalizeSubtitleUnicode(corrected).key,api.normalizeSubtitleUnicode(ref).key);
+    });
+    test('mixed correction choices retain positional NHK month ruby through the subtitle resolver: '+file,()=>{
+        const doc=rubyApi.parseRubyDocument('[原文]\n今年8｜月《がつ》、ネパールと中国の国境の近くで、大きい土石流が起こってから、26｜日《にち》で3か｜月《げつ》になりました。');
+        const resolver=api.createSubtitleReferenceResolver(api.buildKnowledgeOriginalSearchIndex(doc.text));
+        const raw=doc.text.split('\n')[1].replaceAll('、',' 、').replace('26日','今日').replace('3か月','3ヶ月');
+        const aligned=resolver.resolveWithNeighbours({text:raw},null,null);
+        const date=aligned.reviewDifferences.find(item=>item.edit.to.includes('26'));
+        assert.ok(date);
+        const display=api.applySubtitleReferencePreference(aligned,null,new Set([date.signature]));
+        assert.match(display.text,/今日で3か月/);
+        const result=rubyApi.projectAlignedRuby(display.text,doc,display.ranges);
+        assert.deepEqual(result.map(item=>[item.base,item.reading]),[['月','がつ'],['月','げつ']]);
     });
     test('Japanese user heading and long sentence ignore Markdown and typographic spacing: '+file,()=>{
         const title='第一回 小説家は寛容な人種なのか';

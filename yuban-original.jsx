@@ -28,7 +28,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.320 · furigana-word-priority";
+const APP_VERSION = "v5.321 · aligned-furigana";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9869,7 +9869,7 @@ const createPlaybackShortcutHandler = getState => {
 };
 
 
-const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null, furiganaSettings = null }) => {
+const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, fontSize, textRef, autoFocusEnabled = true, correction = null, contextNameHints = null, reviewContext = null, onReviewRecord = null, reviewTarget = null, furiganaSettings = null, furiganaReferenceRanges = null }) => {
     const answerCache = useRef(new WeakMap());
     const advanceFocusRef = useRef(null);
     const composingBlankRef = useRef(null);
@@ -10147,7 +10147,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                             isSubtitlePracticePartCorrect(token.correctedText,value,language) ? `原字幕：${token.originalText || '缺字'}` : `文本：${token.correctedText}`}
                     </span>
                 )}
-                {/^ja/i.test(language || '') && /\p{Script=Han}/u.test(part.text) && <span className="absolute left-1/2 -translate-x-1/2" style={{top:'-1.05em',lineHeight:1}}><FuriganaView key={`${source}:${token.index}:${part.index}`} text={part.text} settings={furiganaSettings} contextText={source} contextOffset={furiganaPartOffsets[`${token.index}:${part.index}`]} hidden /></span>}
+                {/^ja/i.test(language || '') && /\p{Script=Han}/u.test(part.text) && <span className="absolute left-1/2 -translate-x-1/2" style={{top:'-1.05em',lineHeight:1}}><FuriganaView key={`${source}:${token.index}:${part.index}`} text={part.text} settings={furiganaSettings} referenceRanges={furiganaReferenceRanges} contextText={source} contextOffset={furiganaPartOffsets[`${token.index}:${part.index}`]} hidden /></span>}
                 {pendingLonger && <button type="button" data-subtitle-confirm-short
                     className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded border border-amber-400 bg-amber-50 px-2 py-1 text-amber-800 whitespace-nowrap"
                     style={{fontSize:'0.5em',lineHeight:'1.2'}}
@@ -10187,7 +10187,7 @@ const SubtitlePractice = React.memo(({ subtitle, text, language, blankMode, font
                     <span ref={editorRef} contentEditable={false}
                         role={subtitle ? 'textbox' : undefined} aria-label="完整字幕文字" data-subtitle-reading="true" data-subtitle-composing="false" aria-multiline="true" aria-readonly="true" tabIndex={subtitle ? 0 : -1}
                         className="select-text outline-none" style={/^ja/i.test(language || '') && furiganaSettings?.enabled?{display:'none'}:undefined} />
-                    {!blankMode && /^ja/i.test(language || '') && furiganaSettings?.enabled && <FuriganaView text={source} settings={furiganaSettings} renderText={renderRubyCaptionText} />}
+                    {!blankMode && /^ja/i.test(language || '') && furiganaSettings?.enabled && <FuriganaView text={source} settings={furiganaSettings} referenceRanges={furiganaReferenceRanges} renderText={renderRubyCaptionText} />}
                     {subtitle && source.trim() && <button type="button" aria-label="複製全句" title="複製目前顯示的完整字幕"
                         onPointerDown={event=>event.preventDefault()} onClick={copySentence}
                         className="inline-flex align-middle ml-1 rounded p-1 select-none text-slate-500 hover:text-blue-600 hover:bg-blue-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
@@ -24040,6 +24040,7 @@ ${userQ}`;
                                 )}
                                 <SubtitlePractice key={reviewPracticeKey} reviewTarget={reviewSession?.document.entries.find(entry=>entry.id===selectedReviewId && findReviewCue([subtitles[currentIndex]].filter(Boolean),entry)===0) || reviewSession?.document.entries.find(entry=>!entry.mastered && (entry.originalText===subtitles[currentIndex]?.text && Math.abs(entry.start-Number(subtitles[currentIndex]?.start))<.05 || subtitles[currentIndex]?.sourceCues?.some(cue=>cue.text===entry.originalText && Math.abs(cue.start-entry.start)<.05)))} reviewContext={reviewSession} onReviewRecord={onReviewRecord} subtitle={subtitles[currentIndex]} text={subtitleDisplayText} language={trackLanguage}
                                     furiganaSettings={furiganaSettings}
+                                    furiganaReferenceRanges={currentSubtitlePresentation?.aligned ? currentSubtitlePresentation.ranges : null}
                                     contextNameHints={subtitlePracticeNameHints}
                                     correction={referenceSubtitleCorrectionEnabled ? currentSubtitlePresentation : null}
                                     blankMode={isSubtitleBlankMode} fontSize={fittedSubtitleFontSize}

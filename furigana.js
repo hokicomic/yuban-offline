@@ -23,6 +23,7 @@ export function parseRubyDocument(value) {
 // Position-bound annotations only. A bare word occurring elsewhere is not
 // proof that this cue is aligned to that occurrence.
 export function originalReadingsForText(text,document) {
+ if(document?.projectedAnnotations)return document.projectedAnnotations;
  if(!document?.annotations?.length || !text)return [];
  const first=document.text.indexOf(text);
  if(first<0 || (text!==document.text && Array.from(text).length<8))return [];
@@ -37,8 +38,77 @@ export function originalReadingsForText(text,document) {
  }
  return result;
 }
+// Transfer ruby from the subtitle resolver's selected ranges. Track exact
+// character matches across all minimum-cost alignments and skip ambiguous ones.
+const projectedRubyCache=new WeakMap();
+export function projectAlignedRuby(text, document, ranges) {
+ if (!ranges?.length) return [];
+ const cached=projectedRubyCache.get(ranges);
+ if(cached?.document===document && cached.text===text)return cached.readings;
+ const readings=mapAlignedRuby(text,document,ranges);
+ projectedRubyCache.set(ranges,{document,text,readings});
+ return readings;
+}
+
+function mapAlignedRuby(text, document, ranges) {
+ if (!document?.annotations?.length || !ranges?.length) return [];
+ const lines=document.text.split('\n'),starts=[0],raw=[];
+ for (const line of lines) starts.push(starts.at(-1)+line.length+1);
+ for (const range of ranges) {
+  const line=lines[range.sourceLine];
+  if (line?.slice(range.start,range.end)!==range.text) return [];
+  let offset=starts[range.sourceLine]+range.start;
+  for (const ch of range.text) {raw.push({ch,offset});offset+=ch.length;}
+ }
+ const a=raw.filter(({ch})=>/[\p{L}\p{M}\p{N}]/u.test(ch)),b=[];
+ let offset=0;
+ for (const ch of text) {if (/[\p{L}\p{M}\p{N}]/u.test(ch)) b.push({ch,offset});offset+=ch.length;}
+ const n=a.length,m=b.length,w=m+1;
+ if (!n || !m || (n+1)*w>400000) return [];
+ for(const item of [...a,...b])item.key=item.ch.normalize('NFKC');
+ const equal=(i,j)=>a[i].key===b[j].key;
+ const pre=new Uint16Array((n+1)*w),post=new Uint16Array((n+1)*w);
+ for(let i=0;i<=n;i++) for(let j=0;j<=m;j++) pre[i*w+j]=i&&j?Math.min(pre[(i-1)*w+j]+1,pre[i*w+j-1]+1,pre[(i-1)*w+j-1]+(equal(i-1,j-1)?0:1)):i+j;
+ for(let i=n;i>=0;i--) for(let j=m;j>=0;j--) post[i*w+j]=i<n&&j<m?Math.min(post[(i+1)*w+j]+1,post[i*w+j+1]+1,post[(i+1)*w+j+1]+(equal(i,j)?0:1)):n-i+m-j;
+ const cost=pre[n*w+m],mapping=new Map();
+ for(let i=0;i<n;i++){
+  let match=null,ambiguous=false;
+  for(let j=0;j<=m;j++){
+   const budget=cost-pre[i*w+j];
+   if(1+post[(i+1)*w+j]===budget){ambiguous=true;break;}
+   if(j===m)continue;
+   const same=equal(i,j);
+   if((same?0:1)+post[(i+1)*w+j+1]!==budget)continue;
+   if(!same || match!==null){ambiguous=true;break;}
+   match=j;
+  }
+  if(!ambiguous && match!==null)mapping.set(a[i].offset,b[match].offset);
+ }
+ const quantityPrefix=(value,start)=>value.slice(0,start).match(/[0-9０-９]+[かカヶケ箇]?$/u)?.[0].normalize('NFKC').replace(/[かカヶケ箇]$/u,'') || '';
+ return document.annotations.flatMap(item=>{
+  const start=mapping.get(item.start);
+  if(start===undefined || text.slice(start,start+item.base.length)!==item.base) return [];
+  let delta=0;
+  for(const ch of item.base){if(mapping.get(item.start+delta)!==start+delta)return [];delta+=ch.length;}
+  // A retained counter kanji may now belong to a different word (26日 → 今日).
+  if(quantityPrefix(document.text,item.start)!==quantityPrefix(text,start))return [];
+  return [{...item,start,end:start+item.base.length,source:'original',origin:'aligned'}];
+ });
+}
+
+function trimDictionaryOkurigana(item) {
+ const kana=/^[\p{Script=Hiragana}\p{Script=Katakana}ー]+/u;
+ const trailing=/[\p{Script=Hiragana}\p{Script=Katakana}ー]+$/u;
+ const lead=item.base.match(kana)?.[0] || '',tail=item.base.match(trailing)?.[0] || '';
+ if(!lead && !tail) return item;
+ const prefix=toHiragana(lead),suffix=toHiragana(tail);
+ if(!item.reading.startsWith(prefix) || !item.reading.endsWith(suffix) || item.reading.length<=prefix.length+suffix.length) return item;
+ return {...item,start:item.start+lead.length,end:item.end-tail.length,
+  base:item.base.slice(lead.length,item.base.length-tail.length),reading:item.reading.slice(prefix.length,item.reading.length-suffix.length)};
+}
+
 export function buildFuriganaReadings(text,document,tokenizer,overrides={}) {
- const result=originalReadingsForText(text,document),tokens=tokenizer?tokenizer.tokenize(text):[];
+ const result=[...originalReadingsForText(text,document)],tokens=tokenizer?tokenizer.tokenize(text):[];
  const overlaps=(a,b)=>a.start<b.end && a.end>b.start;
  const covered=item=>result.some(other=>overlaps(item,other));
  const span=token=>({start:Number(token.word_position)-1,end:Number(token.word_position)-1+String(token.surface_form || '').length,base:token.surface_form,reading:toHiragana(token.reading || ''),source:'dictionary'});
@@ -71,7 +141,7 @@ export function buildFuriganaReadings(text,document,tokenizer,overrides={}) {
  const add=items=>{for(const item of items.sort((a,b)=>(b.end-b.start)-(a.end-a.start) || a.start-b.start))if(!covered(item))result.push(item);};
  add(borrowed);
  const whole=tokens.filter(t=>validToken(t) && Array.from(t.surface_form).length>1).map(span);
- add(whole.filter(item=>!blocked.some(other=>overlaps(item,other))));
+ add(whole.filter(item=>!blocked.some(other=>overlaps(item,other))).map(trimDictionaryOkurigana));
  // Only after whole-word sources are exhausted may a single-character ruby
  // transfer across positions, and only as an independent word, not a compound.
  const independent=token=>token.surface_form?.length===1 && token.pos_detail_1!=='数' && token.pos_detail_2!=='助数詞';
