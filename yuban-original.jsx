@@ -28,7 +28,7 @@ import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, 
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.324 · multilingual-reference-alignment";
+const APP_VERSION = "v5.325 · multilingual-subtitle-practice";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -9539,58 +9539,116 @@ const paintSubtitleReferenceCorrections = (editor, text, projection, onDeletionI
 const tokenizeSubtitlePractice = (text, language = 'en', nameHints = []) => {
     const source = String(text || '');
     let segmenter;
-    try { segmenter = new Intl.Segmenter(language, { granularity: 'word' }); } catch (_) {}
-    // SRT/LRC stage directions are visible context, never dictation answers.
-    // Keep the complete bracketed span, including its original whitespace.
+    if (typeof Intl.Segmenter === 'function') {
+        try { segmenter = new Intl.Segmenter(language || undefined, { granularity: 'word' }); }
+        catch (_) { segmenter = new Intl.Segmenter(undefined, { granularity: 'word' }); }
+    }
+    // Without a word segmenter, keep numbers and spaced words together and
+    // give scripts that generally omit spaces one blank per grapheme.
+    const unspaced = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+    const hasLetters = value => /[\p{L}\p{N}]/u.test(value);
     const pieces = source.split(/(\[[^\]]*\]|［[^］]*］)/u).flatMap(chunk => {
+        // SRT/LRC stage directions are visible context, never dictation answers.
         if (/^(?:\[[^\]]*\]|［[^］]*］)$/u.test(chunk)) return [{ text: chunk, word: false }];
         if (segmenter) return Array.from(segmenter.segment(chunk), item => ({ text: item.segment, word: item.isWordLike }));
-        return (chunk.match(/[\p{L}\p{M}\p{N}]+(?:['’ʼ][\p{L}\p{M}\p{N}]+)*|[^\p{L}\p{M}\p{N}]+/gu) || [])
-            .map(text => ({ text, word: /[\p{L}\p{N}]/u.test(text) }));
+        const runs = chunk.match(/[\p{L}\p{M}\p{N}\u200c\u200d]+(?:['’ʼ][\p{L}\p{M}\p{N}\u200c\u200d]+)*|[\s\S]/gu) || [];
+        return runs.flatMap(run => {
+            if (!unspaced.test(run)) return [{ text:run, word:hasLetters(run) }];
+            const units = [];
+            for (const grapheme of splitSubtitlePracticeGraphemes(run)) {
+                if (unspaced.test(grapheme) || !units.length || unspaced.test(units.at(-1))) units.push(grapheme);
+                else units[units.length - 1] += grapheme;
+            }
+            return units.map(text => ({ text, word:hasLetters(text) }));
+        });
     });
-    const nameRanges = findSubtitlePracticeNameRanges(source, nameHints);
+    const nameRanges = /^en(?:-|$)/iu.test(language) ? findSubtitlePracticeNameRanges(source, nameHints) : [];
     let wordIndex = 0, sourceOffset = 0;
     return pieces.map(piece => {
         const start = sourceOffset; sourceOffset += piece.text.length;
         const name = piece.word && nameRanges.some(range => start >= range.start && sourceOffset <= range.end);
         if (!piece.word || name) return { kind: 'literal', text: piece.text, ...(name ? {name:true} : {}) };
         let partIndex = 0;
-        const parts = (piece.text.match(/[\p{L}\p{M}\p{N}]+|[^\p{L}\p{M}\p{N}]+/gu) || [])
-            .map(text => /[\p{L}\p{N}]/u.test(text)
+        const parts = (piece.text.match(/[\p{L}\p{M}\p{N}\u200c\u200d]+|[^\p{L}\p{M}\p{N}\u200c\u200d]+/gu) || [])
+            .map(text => hasLetters(text)
                 ? { kind: 'letters', text, language, index: partIndex++ } : { kind: 'literal', text });
         return { kind: 'word', index: wordIndex++, parts };
     });
 };
-// Map correction offsets onto exercise words, preserving the immutable cue.
-// Changed phrases with different word counts form one dual-answer blank.
+// Map edits from raw caption offsets to displayed words. Expand partial
+// edits to whole blanks and reconstruct the raw alternative with its context.
 const buildSubtitlePracticeDualTokens = (source, language, nameHints, projection) => {
     const tokens = tokenizeSubtitlePractice(source, language, nameHints);
     if (projection?.referenceTextApplied || !projection?.changed || projection.text !== source) return tokens;
-    let cursor = 0;
-    const positioned = tokens.map(token => { const start = cursor; cursor += token.kind === 'literal' ? token.text.length : token.parts.map(part => part.text).join('').length; return {...token, start, end: cursor}; });
-    const ranges = []; let offset = 0;
-    for (const edit of [...projection.edits].sort((a,b) => a.start-b.start || a.end-b.end)) {
-        if (edit.text?.trim()) {
-            const leading = edit.text.length - edit.text.trimStart().length;
-            ranges.push({start:edit.start+offset+leading,end:edit.start+offset+edit.text.trimEnd().length,
-                original:String(edit.from ?? projection.raw.slice(edit.start,edit.end)).trim()});
-        }
+    const position = items => {
+        let cursor = 0;
+        return items.map(token => {
+            const start = cursor;
+            cursor += token.kind === 'literal' ? token.text.length : token.parts.map(part => part.text).join('').length;
+            return {...token, start, end: cursor};
+        });
+    };
+    const positioned = position(tokens);
+    const rawWords = position(tokenizeSubtitlePractice(projection.raw, language, nameHints)).filter(token => token.kind === 'word');
+    let offset = 0;
+    const edits = [...projection.edits].sort((a,b) => a.start-b.start || a.end-b.end).map(edit => {
+        const start = edit.start + offset;
+        const end = start + edit.text.length;
         offset += edit.text.length - (edit.end-edit.start);
+        return {edit,start,end};
+    });
+    const displayOffset = (rawOffset, atEnd) => {
+        const next = edits.find(({edit}) => edit.end > rawOffset);
+        if (!next) return rawOffset+offset;
+        if (rawOffset <= next.edit.start) return next.start-(next.edit.start-rawOffset);
+        return atEnd ? next.end : next.start;
+    };
+    const groups = [];
+    for (const {edit,start,end} of edits) {
+        const raw = projection.raw.slice(edit.start,edit.end);
+        if (!/[\p{L}\p{N}\p{M}]/u.test(edit.text+raw) || edit.kind === 'duplicate') continue;
+        const rawStart = rawWords.find(word => word.start < edit.start && word.end > edit.start)?.start ?? edit.start;
+        const rawEnd = rawWords.find(word => word.start < edit.end && word.end > edit.end)?.end ?? edit.end;
+        // The unchanged edge of a raw word can become a separate token on
+        // the reference side (e.g. 今日 → 26日).
+        const spanStart = rawStart < edit.start ? displayOffset(rawStart,false) : start;
+        const spanEnd = rawEnd > edit.end ? displayOffset(rawEnd,true) : end;
+        const first = positioned.findIndex(token => token.kind === 'word' && token.start < spanEnd && token.end > spanStart);
+        if (first < 0) continue;
+        let last = first;
+        while (last+1<positioned.length && positioned[last+1].start<spanEnd && !positioned[last+1].name) last++;
+        while (positioned[last].kind !== 'word') last--;
+        const blankStart = positioned[first].start, blankEnd = positioned[last].end;
+        if (start < blankStart && /[\p{L}\p{N}]/u.test(source.slice(start,blankStart))) continue;
+        if (end > blankEnd && /[\p{L}\p{N}]/u.test(source.slice(blankEnd,end))) continue;
+        const change = {start:Math.max(start,blankStart),end:Math.min(end,blankEnd),
+            raw:edit.from ?? raw};
+        const previous = groups.at(-1);
+        if (previous && first <= previous.last) {
+            previous.last = Math.max(last,previous.last);
+            previous.changes.push(change);
+        } else groups.push({first,last,changes:[change]});
     }
-    const result = []; let index = 0;
+    if (!groups.length) return tokens;
+    const result = []; let index = 0, groupIndex = 0;
     for (let i=0;i<positioned.length;i++) {
         const token = positioned[i];
-        const range = ranges.find(range => token.kind === 'word' && token.start < range.end && token.end > range.start);
-        if (!range) { result.push(token.kind === 'word' ? {...token,index:index++} : token); continue; }
-        let last=i;
-        while(last+1<positioned.length && positioned[last+1].end<=range.end && !positioned[last+1].name) last++;
-        const corrected=source.slice(token.start,positioned[last].end);
-        const original=range.original;
-        // No answer is exposed until the learner completes or requests a hint.
-        const accepted=[corrected,original].filter(Boolean);
+        const group = groups[groupIndex];
+        if (group?.first !== i) {
+            result.push(token.kind === 'word' ? {...token,index:index++} : token);
+            continue;
+        }
+        const corrected = source.slice(token.start,positioned[group.last].end);
+        let original = corrected;
+        for (const change of [...group.changes].reverse()) {
+            original = original.slice(0,change.start-token.start)+change.raw+original.slice(change.end-token.start);
+        }
+        original = original.trim();
+        const accepted = [...new Set([corrected,original].filter(Boolean))];
         result.push({kind:'word',index:index++,corrected:true,correctedText:corrected,originalText:original,
-            parts:[{kind:'letters',index:0,text:corrected,language,accepted:[...new Set(accepted)]}]});
-        i=last;
+            parts:[{kind:'letters',index:0,text:corrected,language,accepted}]});
+        i = group.last;
+        groupIndex++;
     }
     return result;
 };
@@ -9627,11 +9685,22 @@ const getSubtitlePracticePartOptions = part => part.accepted || [part.text];
 // English loanwords may be typed without Latin diacritics. Keep source
 // spelling and answer text intact; other learning languages remain strict.
 const foldSubtitlePracticeLetters = (value,language) => {
-    const text=String(value || '').normalize('NFC').toLowerCase();
+    // Fold only width variants, without making unrelated compatibility
+    // characters (such as circled numbers) equivalent.
+    let text=String(value || '').replace(/[\u3000\uff01-\uff60\uff61-\uff9f\uffe0-\uffe6]+/gu,
+        run=>run.normalize('NFKC')).normalize('NFC');
+    try { text=language ? text.toLocaleLowerCase(language) : text.toLowerCase(); }
+    catch (_) { text=text.toLowerCase(); }
     if(!/^en(?:-|$)/iu.test(String(language || '')))return text;
     return text.normalize('NFD').replace(/(\p{Script=Latin})\p{M}+/gu,'$1').normalize('NFC');
 };
-const normalizeSubtitlePracticeOption = (value,language) => foldSubtitlePracticeLetters(value,language).replace(/[\s'’ʼ‐‑–—-]/gu,'');
+const normalizeSubtitlePracticeOption = (value,language) => {
+    const text = foldSubtitlePracticeLetters(value,language).replace(/\s/gu,'');
+    if (language && !/^en(?:-|$)/iu.test(language)) return text;
+    // The English shortcut permits omitted marks inside words, while signs
+    // and other punctuation still distinguish numeric answers.
+    return text.replace(/(\p{L})['’ʼ‐‑–—-](?=\p{L})/gu,'$1');
+};
 const getSubtitlePracticeMatchedOption = (part,value) => getSubtitlePracticePartOptions(part).find(expected=>
     part.accepted ? normalizeSubtitlePracticeOption(expected,part.language)===normalizeSubtitlePracticeOption(value,part.language) : isSubtitlePracticePartCorrect(expected,value,part.language));
 const getSubtitlePracticePendingLongerOptions = (part,value) => {
@@ -9764,7 +9833,7 @@ const isSubtitlePracticePartCorrect = (expected, value, language) => foldSubtitl
 const splitSubtitlePracticeGraphemes = value => {
     const text = String(value || '');
     try { return Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text), item => item.segment); }
-    catch (_) { return text.match(/\P{M}\p{M}*|\p{M}+/gu) || []; }
+    catch (_) { return text.match(/[^\p{M}\uff9e\uff9f][\p{M}\uff9e\uff9f]*|[\p{M}\uff9e\uff9f]+/gu) || []; }
 };
 // Align an ordered subsequence, without reusing repeated letters or changing
 // the draft. On ties keep the earliest available answer position.

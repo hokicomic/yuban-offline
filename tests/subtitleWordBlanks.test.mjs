@@ -45,6 +45,62 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const french=api.tokenizeSubtitlePractice('café','fr-FR')[0];
         assert.equal(api.isSubtitlePracticeAnswerCorrect(french,api.updateSubtitlePracticeAnswer(french,null,0,'café')),true);
     });
+    test('unspaced fallback retains marks, digit runs and literal context: ' + file, () => {
+        const fallback=vm.runInNewContext(code+'\ntokenizeSubtitlePractice',{Intl:{}});
+        for(const [text,language,expected] of [
+            ['［音楽］日本語26日。','ja',['日','本','語','26','日']],
+            ['你好，世界！','zh',['你','好','世','界']],
+            ['ก้ไป','th',['ก้','ไ','ป']],
+            ['カ\u3099かな','ja',['カ\u3099','か','な']]
+        ]) {
+            const parts=fallback(text,language);
+            assert.equal(join(parts),text);
+            assert.deepEqual(Array.from(parts.filter(part=>part.kind==='word'),part=>part.parts[0].text),expected);
+        }
+        const text='日本語を勉強します。';
+        assert.equal(JSON.stringify(api.tokenizeSubtitlePractice(text,'invalid_locale')).replaceAll('invalid_locale','ja'),
+            JSON.stringify(api.tokenizeSubtitlePractice(text,'ja')));
+    });
+    test('answers respect locale, join controls and Japanese width variants: ' + file, () => {
+        for(const [language,expected,accepted,rejected] of [
+            ['ja','ガ','ｶﾞ','カ'],['ja','26','２６','②⑥'],['ja','きょう','きょう','きよう'],
+            ['tr','ışık','IŞIK','İŞİK'],['fa','می‌روم','می‌روم','میروم'],
+            ['hi','क्‍ष','क्‍ष','कष'],['th','ก้าว','ก้าว','กาว']
+        ]) {
+            const word=api.tokenizeSubtitlePractice(expected,language)[0];
+            assert.equal(word.parts.length,1);
+            assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,accepted)),true);
+            assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,rejected)),false);
+        }
+        const german=api.tokenizeSubtitlePractice('Sie liest ein Buch.','de');
+        assert.ok(german.some(word=>word.parts?.[0]?.text==='Buch'));
+        const aligned=api.getSubtitlePracticeDualAlignment({text:'ガ',language:'ja'},'ｶﾞ');
+        assert.equal(aligned.matchedCount,1);
+        for(const [language,options,rejected] of [
+            ['en',['−26','26'],'-26'],['en',['-26','25'],'26'],['fr',["l’été",'été'],'lété'],
+            ['fa',['می‌روم','رفتم'],'میروم']
+        ]) {
+            const word={parts:[{kind:'letters',index:0,text:options[0],language,accepted:options}]};
+            assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,rejected)),false);
+        }
+    });
+    test('partial corrections keep whole alternatives in both writing directions: ' + file, () => {
+        for(const [language,raw,text,edits,alternatives] of [
+            ['ja','今日です。','26日です。',[{start:0,end:1,text:'26'}],['26日','今日']],
+            ['ja','26日です。','今日です。',[{start:0,end:2,text:'今'}],['今日','26日']],
+            ['en','The hat is here.','The cats are here.',[
+                {start:4,end:5,text:'c'},{start:7,end:7,text:'s'},{start:8,end:10,text:'are'}
+            ],['cats','hat']],
+            ['th','เราไม่ไป','เราไม่มา',[{start:6,end:8,text:'มา'}],['มา','ไป']]
+        ]) {
+            const parts=api.buildSubtitlePracticeDualTokens(text,language,[],{raw,text,edits,changed:true});
+            assert.equal(join(parts),text);
+            const word=parts.find(part=>part.corrected);
+            assert.deepEqual(Array.from(word.parts[0].accepted),alternatives);
+            for(const value of alternatives)
+                assert.equal(api.isSubtitlePracticeAnswerCorrect(word,api.updateSubtitlePracticeAnswer(word,null,0,value)),true);
+        }
+    });
     test('letter hints align noncontiguous ordered letters without changing what was typed: ' + file, () => {
         const runs = (answer, typed) => Array.from(api.getSubtitlePracticeLetterHints(answer, typed), run => ({ text: run.text, matched: run.matched }));
         assert.deepEqual(runs('afternoon', 'aftex'), [{ text: 'afte', matched: true }, { text: 'x', matched: false }]);
