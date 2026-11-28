@@ -518,7 +518,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.322 · precise-subtitle-colors";
+const APP_VERSION = "v5.323 · multilingual-formatting-diff";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -8439,6 +8439,45 @@ const applySubtitleReferenceBoundaryAcceptance = (projection, accepted) => {
 // Word/punctuation diff keeps correction offsets valid without turning a whole
 // sentence into one giant blank. Offsets always refer to the untouched subtitle.
 const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
+    // Compare punctuation and spacing between identical text units first.
+    // This works even when removing punctuation joins two words in the diff.
+    const isFormatting = char => /[\p{P}\s]/u.test(char);
+    const splitFormatting = text => {
+        const anchors = [], gaps = [];
+        let offset = 0, gapStart = 0;
+        for (const char of text) {
+            if (!isFormatting(char)) {
+                gaps.push({start:gapStart,end:offset,text:text.slice(gapStart,offset)});
+                anchors.push(char);
+                gapStart = offset + char.length;
+            }
+            offset += char.length;
+        }
+        gaps.push({start:gapStart,end:offset,text:text.slice(gapStart)});
+        return {anchors,gaps};
+    };
+    const original = splitFormatting(raw), revised = splitFormatting(reference);
+    if (original.anchors.length === revised.anchors.length &&
+        original.anchors.every((char,index)=>char===revised.anchors[index])) {
+        return original.gaps.flatMap((gap,index)=>{
+            let from = gap.text, to = revised.gaps[index].text;
+            if (from === to) return [];
+            let start = gap.start;
+            // Retain shared punctuation when only adjacent spacing changed.
+            for (const char of gap.text) {
+                if (!to.startsWith(char)) break;
+                from = from.slice(char.length);
+                to = to.slice(char.length);
+                start += char.length;
+            }
+            for (const char of Array.from(from).reverse()) {
+                if (!to.endsWith(char)) break;
+                from = from.slice(0,-char.length);
+                to = to.slice(0,-char.length);
+            }
+            return [{start,end:start+from.length,text:to,from,to,kind:'reference'}];
+        });
+    }
     // Treat scripts commonly written without spaces as individual base
     // characters with their combining marks. Keep other words as units.
     const unspaced=String.raw`[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]`;

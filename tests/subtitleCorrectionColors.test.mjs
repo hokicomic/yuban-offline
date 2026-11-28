@@ -39,6 +39,27 @@ for (const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
    assert.equal(ranges.map(range=>text.slice(range.start,range.end)).join(''),symbol);
   }
  });
+ test('shared punctuation diff protects English, combining marks, RTL and mixed text: '+file,()=>{
+  for (const [before,after] of [
+   ['English','word'], ['العَرَبِيَّة','جميلة'], ['עברית','יפה'],
+   ['cafe\u0301','crème'], ['한국어','한국말'], ['हिन्दी','पाठ'], ['日本語😀','English']
+  ]) {
+   const raw=before+'،'+after, text=before+after;
+   const edits=api.buildSubtitleReferenceDisplayEdits(raw,text);
+   assert.equal(edits.length,1);
+   assert.equal(edits[0].start,before.length);
+   assert.equal(edits[0].from,'،');
+   assert.equal(api.getSubtitleCorrectionDisplayRanges({raw,text,changed:true,edits}).length,0);
+   const ins=api.buildSubtitleReferenceDisplayEdits(text,raw);
+   assert.equal(ins[0].text,'،');
+   assert.equal(ins[0].start,before.length);
+  }
+  const raw='The wind was cold.', text='The wind was cool.';
+  const edits=api.buildSubtitleReferenceDisplayEdits(raw,text);
+  assert.equal(edits.length,1);
+  assert.equal(edits[0].from,'cold');
+  assert.equal(edits[0].text,'cool');
+ });
  test('corrected words alone are readable blue, without altering text or escaping it as HTML: '+file,()=>{
   const raw='The member member joins the block.';
   const projection={raw,text:'The member joins the bloc.',changed:true,edits:[
