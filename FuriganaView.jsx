@@ -3,7 +3,7 @@ import {buildFuriganaReadings,originalReadingsForText,loadJapaneseTokenizer,ruby
 const rubyKey=text=>{let hash=2166136261;for(const ch of text)hash=Math.imul(hash^ch.codePointAt(0),16777619);return (hash>>>0).toString(16)+':'+text.length;};
 export const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0,renderText=(value)=>value}) => {
  const source=String(text || ''),originalDocument=settings?.document || {text:'',annotations:[]};
- const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,annotations:originalReadingsForText(contextText,originalDocument)
+ const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,libraryAnnotations:originalDocument.annotations,annotations:originalReadingsForText(contextText,originalDocument)
     .filter(item=>item.start>=contextOffset && item.end<=contextOffset+source.length)
     .map(item=>({...item,start:item.start-contextOffset,end:item.end-contextOffset}))},[originalDocument,source,contextText,contextOffset]);
  const enabled=Boolean(settings?.enabled),host=useRef(null),editingRef=useRef(null),composingEdit=useRef(false);
@@ -24,8 +24,8 @@ export const FuriganaView = ({text,settings,hidden=false,contextText=null,contex
  const needsDictionary=Array.from(source.matchAll(/\p{Script=Han}/gu)).some(match=>!originals.some(item=>match.index>=item.start && match.index<item.end));
  useEffect(()=>{
   if(!active || !visible || !needsDictionary)return;
-  let cancelled=false;loadJapaneseTokenizer().then(value=>value.tokenize(source)).then(tokens=>{if(!cancelled)setTokenizer({tokenize:()=>tokens});}).catch(reason=>{if(!cancelled)setError(reason.message);});return ()=>{cancelled=true;};
- },[active,visible,needsDictionary,source]);
+  let cancelled=false;loadJapaneseTokenizer().then(value=>value.tokenize(contextText ?? source)).then(tokens=>{if(!cancelled){const start=contextText===null?0:contextOffset,end=start+source.length;const projected=tokens.flatMap(token=>{const at=token.word_position-1,last=at+token.surface_form.length;if(token.unresolvedCompound && at<end && last>start){const a=Math.max(start,at),b=Math.min(end,last);return [{...token,surface_form:source.slice(a-start,b-start),word_position:a-start+1}];}return at>=start && last<=end?[{...token,word_position:at-start+1}]:[];});setTokenizer({tokenize:()=>projected});}}).catch(reason=>{if(!cancelled)setError(reason.message);});return ()=>{cancelled=true;};
+ },[active,visible,needsDictionary,source,contextText,contextOffset]);
  useEffect(()=>{
   const changed=event=>{if(event.detail===storageKey)setRevision(n=>n+1);};window.addEventListener('yuban-furigana-changed',changed);return ()=>window.removeEventListener('yuban-furigana-changed',changed);
  },[storageKey]);
@@ -60,7 +60,7 @@ export const FuriganaView = ({text,settings,hidden=false,contextText=null,contex
    <button type="button" onClick={()=>saveEdit()}>保存</button><button type="button" onClick={()=>saveEdit('')}>恢復來源</button><button type="button" onClick={cancelEdit}>取消</button>
    {error && <span role="status" style={{whiteSpace:'normal',minWidth:80,maxWidth:160}}>{error}</span>}
   </span>
- </span>:<button type="button" data-furigana-reading aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?'原文':item.source==='manual'?'手動更正':'離線字典推測'}；點擊原位編輯`}
+ </span>:<button type="button" data-furigana-reading aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?(item.origin==='same-word'?'原文同詞（其他位置）':'原文對應位置'):item.source==='manual'?'手動更正':'離線字典推測'}；點擊原位編輯`}
   onClick={event=>{event.stopPropagation();edit(item);}} style={{font:'inherit',color:'inherit',lineHeight:'inherit',padding:0,border:0,background:'transparent',cursor:'text'}}>{item.reading || '補讀音'}</button>;
  const nodes=[];let cursor=0;
  for(const item of [...readings,...unknownItems].sort((a,b)=>a.start-b.start)){

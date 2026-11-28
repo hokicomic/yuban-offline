@@ -35,41 +35,66 @@ function parseRubyDocument(value) {
  }
  text+=source.slice(cursor);return {text,annotations};
 }
+// Position-bound annotations only. A bare word occurring elsewhere is not
+// proof that this cue is aligned to that occurrence.
 function originalReadingsForText(text,document) {
- if(!document?.annotations?.length)return [];
- const first=document.text.indexOf(text),unique=first>=0 && document.text.indexOf(text,first+1)<0;
+ if(!document?.annotations?.length || !text)return [];
+ const first=document.text.indexOf(text);
+ if(first<0 || (text!==document.text && Array.from(text).length<8))return [];
+ const positions=[];
+ for(let at=first;at>=0;at=document.text.indexOf(text,at+1))positions.push(at);
  const result=[];
- for(const annotation of document.annotations) {
-  for(let at=text.indexOf(annotation.base);at>=0;at=text.indexOf(annotation.base,at+1)) {
-   const candidates=document.annotations.filter(item=>item.base===annotation.base);
-   let selected;
-   if(unique)selected=candidates.find(item=>item.start===first+at);
-   else if(new Set(candidates.map(item=>item.reading)).size===1)selected=annotation;
-   else {
-    const score=item=>{
-     let n=0;
-     for(let k=1;k<=12;k++){if(at-k<0 || item.start-k<0 || text[at-k]!==document.text[item.start-k])break;n++;}
-     for(let k=0;k<12;k++){if(at+annotation.base.length+k>=text.length || item.end+k>=document.text.length || text[at+annotation.base.length+k]!==document.text[item.end+k])break;n++;}
-     return n;
-    };
-    const ranked=candidates.map(item=>({item,score:score(item)})).sort((a,b)=>b.score-a.score);
-    if(ranked[0]?.score>=3 && (!ranked[1] || ranked[0].score>ranked[1].score))selected=ranked[0].item;
-   }
-   if(selected && !result.some(item=>item.start===at && item.end===at+annotation.base.length))result.push({...selected,start:at,end:at+annotation.base.length});
-  }
+ for(const item of document.annotations){
+  const start=item.start-first,end=item.end-first;
+  if(start<0 || end>text.length || text.slice(start,end)!==item.base)continue;
+  if(positions.every(at=>document.annotations.some(other=>other.start===at+start && other.end===at+end && other.reading===item.reading)))
+   result.push({...item,start,end,source:'original',origin:'aligned'});
  }
  return result;
 }
 function buildFuriganaReadings(text,document,tokenizer,overrides={}) {
- const result=originalReadingsForText(text,document);
- const covered=(start,end)=>result.some(item=>start<item.end && end>item.start);
- if(tokenizer)for(const token of tokenizer.tokenize(text)) {
-  const base=token.surface_form,start=Number(token.word_position)-1,end=start+base.length;
-  if(text.slice(start,end)!==base || !/\p{Script=Han}/u.test(base) || !rubyReadingValid(token.reading || '') || covered(start,end))continue;
-  result.push({start,end,base,reading:toHiragana(token.reading),source:'dictionary'});
+ const result=originalReadingsForText(text,document),tokens=tokenizer?tokenizer.tokenize(text):[];
+ const overlaps=(a,b)=>a.start<b.end && a.end>b.start;
+ const covered=item=>result.some(other=>overlaps(item,other));
+ const span=token=>({start:Number(token.word_position)-1,end:Number(token.word_position)-1+String(token.surface_form || '').length,base:token.surface_form,reading:toHiragana(token.reading || ''),source:'dictionary'});
+ const validToken=token=>{const item=span(token);return text.slice(item.start,item.end)===item.base && /\p{Script=Han}/u.test(item.base) && rubyReadingValid(item.reading);};
+ const blocked=tokens.filter(t=>t.unresolvedCompound).map(span);
+ const bounds=new Set([0,text.length]);
+ if(tokens.length)for(const token of tokens.filter(t=>!t.wholeCandidate && !t.unresolvedCompound)){const item=span(token);bounds.add(item.start);bounds.add(item.end);}
+ else {try{for(const word of new Intl.Segmenter('ja',{granularity:'word'}).segment(text)){bounds.add(word.index);bounds.add(word.index+word.segment.length);}}catch(_){}}
+ const library=document?.libraryAnnotations || document?.annotations || [];
+ const groups=new Map();
+ for(const item of library){const set=groups.get(item.base) || new Set();set.add(item.reading);groups.set(item.base,set);}
+ const borrowed=[];
+ for(const [base,choices] of tokenizer?groups:[]){
+  if(choices.size!==1 || Array.from(base).length<2)continue;
+  const reading=[...choices][0];
+  for(let at=text.indexOf(base);at>=0;at=text.indexOf(base,at+1)){
+   const item={start:at,end:at+base.length,base,reading,source:'original',origin:'same-word'};
+   if(!bounds.has(item.start) || !bounds.has(item.end) || blocked.some(other=>overlaps(item,other) && (item.start!==other.start || item.end!==other.end)))continue;
+   // A polyphonic dictionary entry must follow this sentence's analysis,
+   // rather than borrowing the only reading seen elsewhere in a book.
+   const contextToken=tokens.find(t=>!t.wholeCandidate && span(t).start===item.start && span(t).end===item.end);
+   const lexical=tokens.find(t=>t.wholeCandidate && span(t).start===item.start && span(t).end===item.end);
+   const alternatives=contextToken?.dictionaryReadings || lexical?.dictionaryReadings || [];
+   if(alternatives.length>1 && (!contextToken || toHiragana(contextToken.reading)!==reading))continue;
+   if(contextToken?.pos_detail_1==='固有名詞' && toHiragana(contextToken.reading)!==reading)continue;
+   if(lexical?.numericCompound && alternatives.length && !alternatives.map(toHiragana).includes(reading))continue;
+   borrowed.push(item);
+  }
  }
- // Explicit user edits have highest priority, scoped to the displayed sentence
- // and occurrence, so correcting a name cannot alter another reading elsewhere.
+ const add=items=>{for(const item of items.sort((a,b)=>(b.end-b.start)-(a.end-a.start) || a.start-b.start))if(!covered(item))result.push(item);};
+ add(borrowed);
+ const whole=tokens.filter(t=>validToken(t) && Array.from(t.surface_form).length>1).map(span);
+ add(whole.filter(item=>!blocked.some(other=>overlaps(item,other))));
+ // Only after whole-word sources are exhausted may a single-character ruby
+ // transfer across positions, and only as an independent word, not a compound.
+ const independent=token=>token.surface_form?.length===1 && token.pos_detail_1!=='数' && token.pos_detail_2!=='助数詞';
+ for(const token of tokens.filter(independent)){
+  const item=span(token),choices=groups.get(item.base);
+  if(choices?.size===1 && (!rubyReadingValid(item.reading) || item.reading===[...choices][0]) && !blocked.some(other=>overlaps(item,other)))add([{...item,reading:[...choices][0],source:'original',origin:'same-word'}]);
+ }
+ add(tokens.filter(t=>validToken(t) && Array.from(t.surface_form).length===1).map(span).filter(item=>!blocked.some(other=>overlaps(item,other))));
  for(const [key,value] of Object.entries(overrides)) {
   const at=key.indexOf(':');if(at<0)continue;
   const start=Number(key.slice(0,at)),base=key.slice(at+1),end=start+base.length;
@@ -89,7 +114,7 @@ function loadJapaneseTokenizer() {
   if(location.protocol!=='file:' && navigator.serviceWorker) {
    try {const registration=await navigator.serviceWorker.register('./furigana-sw.js');await new Promise(resolve=>{if(registration.active)return resolve();const timer=setTimeout(resolve,10000);const worker=registration.installing || registration.waiting;if(!worker){clearTimeout(timer);return resolve();}worker.addEventListener('statechange',()=>{if(worker.state==='activated' || worker.state==='redundant'){clearTimeout(timer);resolve();}});});}catch(_){}
   }
-  const worker=new Worker(new URL('./furigana-worker.js',document.baseURI).href);
+  const worker=new Worker(new URL('./furigana-worker.js?v=whole-word-2',document.baseURI).href);
   let nextId=0;const pending=new Map();
   const fail=error=>{for(const task of pending.values()){clearTimeout(task.timer);task.reject(error);}pending.clear();worker.terminate();tokenizerPromise=null;};
   worker.onerror=()=>fail(Error('離線字典工作程序載入失敗；原文讀音仍可使用'));
@@ -105,7 +130,7 @@ function loadJapaneseTokenizer() {
 const rubyKey=text=>{let hash=2166136261;for(const ch of text)hash=Math.imul(hash^ch.codePointAt(0),16777619);return (hash>>>0).toString(16)+':'+text.length;};
 const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset=0,renderText=(value)=>value}) => {
  const source=String(text || ''),originalDocument=settings?.document || {text:'',annotations:[]};
- const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,annotations:originalReadingsForText(contextText,originalDocument)
+ const documentData=useMemo(()=>contextText===null?originalDocument:{text:source,libraryAnnotations:originalDocument.annotations,annotations:originalReadingsForText(contextText,originalDocument)
     .filter(item=>item.start>=contextOffset && item.end<=contextOffset+source.length)
     .map(item=>({...item,start:item.start-contextOffset,end:item.end-contextOffset}))},[originalDocument,source,contextText,contextOffset]);
  const enabled=Boolean(settings?.enabled),host=useRef(null),editingRef=useRef(null),composingEdit=useRef(false);
@@ -126,8 +151,8 @@ const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset
  const needsDictionary=Array.from(source.matchAll(/\p{Script=Han}/gu)).some(match=>!originals.some(item=>match.index>=item.start && match.index<item.end));
  useEffect(()=>{
   if(!active || !visible || !needsDictionary)return;
-  let cancelled=false;loadJapaneseTokenizer().then(value=>value.tokenize(source)).then(tokens=>{if(!cancelled)setTokenizer({tokenize:()=>tokens});}).catch(reason=>{if(!cancelled)setError(reason.message);});return ()=>{cancelled=true;};
- },[active,visible,needsDictionary,source]);
+  let cancelled=false;loadJapaneseTokenizer().then(value=>value.tokenize(contextText ?? source)).then(tokens=>{if(!cancelled){const start=contextText===null?0:contextOffset,end=start+source.length;const projected=tokens.flatMap(token=>{const at=token.word_position-1,last=at+token.surface_form.length;if(token.unresolvedCompound && at<end && last>start){const a=Math.max(start,at),b=Math.min(end,last);return [{...token,surface_form:source.slice(a-start,b-start),word_position:a-start+1}];}return at>=start && last<=end?[{...token,word_position:at-start+1}]:[];});setTokenizer({tokenize:()=>projected});}}).catch(reason=>{if(!cancelled)setError(reason.message);});return ()=>{cancelled=true;};
+ },[active,visible,needsDictionary,source,contextText,contextOffset]);
  useEffect(()=>{
   const changed=event=>{if(event.detail===storageKey)setRevision(n=>n+1);};window.addEventListener('yuban-furigana-changed',changed);return ()=>window.removeEventListener('yuban-furigana-changed',changed);
  },[storageKey]);
@@ -162,7 +187,7 @@ const FuriganaView = ({text,settings,hidden=false,contextText=null,contextOffset
    <button type="button" onClick={()=>saveEdit()}>保存</button><button type="button" onClick={()=>saveEdit('')}>恢復來源</button><button type="button" onClick={cancelEdit}>取消</button>
    {error && <span role="status" style={{whiteSpace:'normal',minWidth:80,maxWidth:160}}>{error}</span>}
   </span>
- </span>:<button type="button" data-furigana-reading aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?'原文':item.source==='manual'?'手動更正':'離線字典推測'}；點擊原位編輯`}
+ </span>:<button type="button" data-furigana-reading aria-label={`更正${item.base}讀音`} title={`讀音來源：${item.source==='original'?(item.origin==='same-word'?'原文同詞（其他位置）':'原文對應位置'):item.source==='manual'?'手動更正':'離線字典推測'}；點擊原位編輯`}
   onClick={event=>{event.stopPropagation();edit(item);}} style={{font:'inherit',color:'inherit',lineHeight:'inherit',padding:0,border:0,background:'transparent',cursor:'text'}}>{item.reading || '補讀音'}</button>;
  const nodes=[];let cursor=0;
  for(const item of [...readings,...unknownItems].sort((a,b)=>a.start-b.start)){
@@ -418,7 +443,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.319 · unicode-multiple-differences";
+const APP_VERSION = "v5.320 · furigana-word-priority";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
