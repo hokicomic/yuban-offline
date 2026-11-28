@@ -560,7 +560,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.326 · persistent-reference-decisions";
+const APP_VERSION = "v5.327 · reading-aware-reference-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7983,13 +7983,79 @@ const groupUnicodeSubtitlesByReferenceSentences = (cues,index) => {
     return changed?result:cues;
 };
 
+// Optional comparison channels consume position-bound evidence supplied by a
+// language provider. The common resolver never invents pronunciations or aliases.
+const normalizeSubtitleReading = (text,readings=[],fold=value=>value) => {
+    let expanded='',cursor=0;const positions=[];
+    const append=(value,start,end,fixed=false)=>{
+        let at=start;
+        for(const char of value){const normalized=fold(char);expanded+=normalized;for(let i=0;i<normalized.length;i++)positions.push({start:fixed?start:at,end:fixed?end:at+char.length});if(!fixed)at+=char.length;}
+    };
+    for(const span of [...readings].sort((a,b)=>a.start-b.start || b.end-a.end)) {
+        if(span.start<cursor || span.end<=span.start || text.slice(span.start,span.end)!==span.base || !span.reading || /\p{N}/u.test(span.base+span.reading))continue;
+        append(text.slice(cursor,span.start),cursor,span.start);
+        append(span.reading,span.start,span.end,true);cursor=span.end;
+    }
+    append(text.slice(cursor),cursor,text.length);
+    const result=normalizeSubtitleUnicode(expanded);
+    return {key:result.key,units:result.units.map(unit=>({...unit,start:positions[unit.start]?.start ?? text.length,end:positions[unit.end-1]?.end ?? text.length}))};
+};
+const getSubtitleSpanDifferences = (raw,reference) => {
+    const index=text=>{const normalized=normalizeSubtitleUnicode(text),chars=[],positions=[];for(const unit of normalized.units)for(const char of unit.key){chars.push(char);positions.push(unit);}return {chars,positions};};
+    const a=index(raw),b=index(reference),n=a.chars.length,m=b.chars.length,w=m+1;
+    if(!n || !m || (n+1)*w>600000)return null;
+    const dp=new Uint16Array((n+1)*w);
+    for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)dp[i*w+j]=a.chars[i]===b.chars[j]?1+dp[(i+1)*w+j+1]:Math.max(dp[(i+1)*w+j],dp[i*w+j+1]);
+    const edits=[];let i=0,j=0,first=null;
+    const flush=()=>{
+        if(!first)return;
+        const [ai,bj]=first,start=a.positions[ai]?.start ?? raw.length,end=i>ai?a.positions[i-1].end:start;
+        const rs=b.positions[bj]?.start ?? reference.length,re=j>bj?b.positions[j-1].end:rs;
+        if((ai>0 && a.positions[ai-1].end>start)||(i<n && a.positions[i].start<end)||(bj>0 && b.positions[bj-1].end>rs)||(j<m && b.positions[j].start<re))throw Error('split-comparison-unit');
+        const text=reference.slice(rs,re);edits.push({start,end,text,from:raw.slice(start,end),to:text,kind:'spelling'});first=null;
+    };
+    try {while(i<n || j<m){if(i<n && j<m && a.chars[i]===b.chars[j]){flush();i++;j++;continue;}first ||= [i,j];if(j<m && (i===n || dp[i*w+j+1]>=dp[(i+1)*w+j]))j++;else i++;}flush();}catch(_){return null;}
+    return {edits,agreement:dp[0]/Math.max(n,m)};
+};
+// Japanese is one provider, backed by the existing offline dictionary and the
+// document's original ruby. Other scripts keep their literal comparison path.
+const addJapaneseIterationEvidence = (text,readings) => readings.map(item=>{
+    // Prefer dictionary whole words (e.g. voiced iteration) when available.
+    // An uncovered iteration sign may propose repeating a known reading;
+    // the entire surrounding utterance must still match, and edits need review.
+    if(text[item.end]==='々' && /^[\p{Script=Han}]+$/u.test(item.base) && !readings.some(other=>other.start<=item.end && other.end>item.end))
+        return {...item,end:item.end+1,base:item.base+'々',reading:item.reading+item.reading,source:'iteration-candidate'};
+    return item;
+});
+const prepareSubtitleReadingProfile = async (index,document,cues,tokenizer,sourceLine=-1) => {
+    let entries=index.entries || [];
+    if(entries.reduce((sum,entry)=>sum+entry.raw.length,0)>60000) {
+        const grams=new Set(cues.flatMap(cue=>{const key=normalizeSubtitleUnicode(cue.text || '').key;return Array.from({length:Math.max(0,key.length-4)},(_,i)=>key.slice(i,i+5));}));
+        const ranked=entries.map(entry=>({line:entry.sourceLine,score:[...grams].reduce((sum,gram)=>sum+Number(entry.raw.includes(gram)),0)})).filter(item=>item.score>=2).sort((a,b)=>b.score-a.score).slice(0,3).map(item=>item.line);
+        if(sourceLine>=0)ranked.push(sourceLine);
+        entries=entries.filter(entry=>ranked.some(line=>Math.abs(entry.sourceLine-line)<=8));
+    }
+    if(!entries.length)return null;
+    const starts=[0];for(const line of document.text.split('\n'))starts.push(starts.at(-1)+line.length+1);
+    const annotations=[],rows=[];let text='';
+    for(const entry of entries){const at=text.length;rows.push({...entry,at});text+=entry.raw+'\n';for(const item of document.annotations || [])if(item.start>=starts[entry.sourceLine] && item.end<=starts[entry.sourceLine]+entry.raw.length)annotations.push({...item,start:at+item.start-starts[entry.sourceLine],end:at+item.end-starts[entry.sourceLine]});}
+    const tokens=await tokenizer.tokenize(text);
+    const reference=addJapaneseIterationEvidence(text,buildFuriganaReadings(text,{text,annotations}, {tokenize:()=>tokens}));
+    const referenceReadings=new Map(rows.map(row=>[row.sourceLine,reference.filter(item=>item.start>=row.at && item.end<=row.at+row.raw.length).map(item=>({...item,start:item.start-row.at,end:item.end-row.at}))]));
+    const cueReadings=new Map();
+    for(const cue of cues){const raw=cue?.text || '';if(!raw || cueReadings.has(raw) || raw.length>3000)continue;const tokens=await tokenizer.tokenize(raw);cueReadings.set(raw,addJapaneseIterationEvidence(raw,buildFuriganaReadings(raw,{text:'',annotations:[],libraryAnnotations:document.annotations},{tokenize:()=>tokens})));}
+    return {referenceReadings,cueReadings,fold:value=>value.normalize('NFC').replace(/[ァ-ヶ]/gu,char=>String.fromCharCode(char.charCodeAt(0)-0x60))};
+};
+
 const createUnicodeSubtitleReferenceResolver = searchIndex => {
+    const profile=searchIndex.readingProfile;
+    const normalize=(text,readings)=>profile?normalizeSubtitleReading(text,readings,profile.fold):normalizeSubtitleUnicode(text);
     const lineTexts=new Map(),offsets=[],pieces=[];
     let length=0,previousLine=-10,previousKey='';
     const unspaced=/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
     for(const entry of searchIndex?.entries || []) {
         lineTexts.set(entry.sourceLine,entry.raw);
-        const normalized=normalizeSubtitleUnicode(entry.raw);
+        const normalized=normalize(entry.raw,profile?.referenceReadings.get(entry.sourceLine));
         if(!normalized.key)continue;
         if(length) {
             const separator=entry.sourceLine-previousLine>4?'\0':unspaced.test(previousKey.at(-1)+normalized.key[0])?'':' ';
@@ -8005,7 +8071,7 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         return offsets.findIndex(item=>item && item.sourceLine===range.sourceLine && (last?item.end===range.end:item.start===range.start));
     };
     return (raw,{sourceLine=-1,sequential=false,after=[],before=[],exactOnly=false}={})=>{
-        const query=normalizeSubtitleUnicode(raw).key;
+        const query=normalize(raw,profile?.cueReadings.get(raw)).key;
         if(!query || (Array.from(query).length<4 && !after.length && !before.length))return {reason:'short_without_adjacent_context'};
         let afterIndex=after.length?boundary(after.at(-1),true):-1,beforeIndex=before.length?boundary(before[0],false):-1;
         if((after.length && afterIndex<0)||(before.length && beforeIndex<0))return {reason:'invalid_adjacent_boundary'};
@@ -8037,7 +8103,30 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         }
         // Strong unchanged context can locate a long Unicode sentence even
         // when ASR substitutes a short span. Keep factual changes reviewable.
-        if(!exactOnly && !candidates.length && query.length>=32){
+        // A small ASR error may remain inside an otherwise matching reading
+        // span. Bound it with long exact ends and keep every change reviewable.
+        if(profile && !exactOnly && !candidates.length && query.length>=48) {
+            const head=query.slice(0,12),tail=query.slice(-12),slack=Math.max(6,Math.ceil(query.length*.06));
+            for(let start=sequence.indexOf(head);start>=0;start=sequence.indexOf(head,start+1)) {
+                const low=start+query.length-slack,high=start+query.length+slack;
+                for(let at=sequence.indexOf(tail,Math.max(start+12,low-12));at>=0 && at+12<=high;at=sequence.indexOf(tail,at+1)) {
+                    const end=at+12,key=sequence.slice(start,end);if(key.includes('\0'))continue;
+                    const numbers=value=>value.match(/[+−-]?\p{N}+(?:[.,:*/٫٬]\p{N}+)*(?:[%٪‰])?/gu) || [];
+                    if(JSON.stringify(numbers(query))!==JSON.stringify(numbers(key)))continue;
+                    const difference=getSubtitleSpanDifferences(query,key);
+                    if(!difference || difference.agreement<.93 || difference.edits.length>3 || difference.edits.reduce((sum,edit)=>sum+Math.max(edit.from.length,edit.to.length),0)>slack)continue;
+                    const first=offsets[start],last=offsets[end-1];if(!first || !last)continue;
+                    if((after.length && start!==afterIndex)||(before.length && end!==beforeIndex))continue;
+                    if(offsets[start-1]?.sourceLine===first.sourceLine && offsets[start-1]?.start===first.start || offsets[end]?.sourceLine===last.sourceLine && offsets[end]?.end===last.end)continue;
+                    if(sequential && sourceLine>=0 && (first.sourceLine<sourceLine-1 || first.sourceLine>sourceLine+48))continue;
+                    const ranges=[];for(let i=start;i<end;i++){const unit=offsets[i];if(!unit)continue;const range=ranges.at(-1);if(range?.sourceLine===unit.sourceLine)range.end=unit.end;else ranges.push({sourceLine:unit.sourceLine,start:unit.start,end:unit.end});}
+                    ranges.forEach(range=>range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end));
+                    candidates.push({ranges,cost:1,text:ranges.map(range=>range.text).join('\n')});
+                    if(candidates.length>128)return {reason:'ambiguous',candidateCount:candidates.length,candidates,candidatesTruncated:true};
+                }
+            }
+        }
+        if(!profile && !exactOnly && !candidates.length && query.length>=32){
             const nearby=[];
             for(const [line,lineText] of lineTexts){
                 if(sequential && sourceLine>=0 && (line<sourceLine-1 || line>sourceLine+48))continue;
@@ -8104,6 +8193,13 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         if(best.length!==1)return best.length?{reason:'ambiguous',candidateCount:best.length,candidates:best}:{reason:'no_unicode_alignment'};
         const selected=best[0];
         const reference=cleanSubtitleMarkdown(getSubtitleReferenceSentenceText(selected.ranges,lineTexts));
+        if(profile) {
+            const differences=getSubtitleSpanDifferences(raw,reference);
+            if(!differences || differences.agreement<0.65 || query.length<12)return {reason:'insufficient_reading_context'};
+            const reviewDifferences=differences.edits.map(edit=>({side:'difference',text:`${edit.from || '缺字'} → ${edit.to || '刪除'}`,signature:JSON.stringify(['reading-context',selected.ranges,edit]),edit}));
+            return {text:raw,aligned:true,trusted:!reviewDifferences.length,changed:false,edits:[],ranges:selected.ranges,referenceText:reference,
+                alignmentMethod:'reading_context',reviewDifferences,boundaryOmissions:[]};
+        }
         // Only exact normalized content can authorize display cleanup; never
         // borrow a word outside the matched span or convert a translation.
         const text=normalizeSubtitleUnicode(reference).key===query?reference:cleanSubtitleMarkdown(selected.text);
@@ -8112,8 +8208,95 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
     };
 };
 
+// Split a uniquely mapped caption span at book sentence boundaries. Original
+// caption objects stay intact; missing time boundaries are explicitly estimates.
+const splitSubtitleByReferenceSentences = (cue,projection,index,profile=null) => {
+    if(!projection?.aligned || !projection.ranges?.length || cue.referenceSentenceSplit)return null;
+    const lineTexts=new Map(index.entries.map(entry=>[entry.sourceLine,entry.raw]));
+    const first=projection.ranges[0],last=projection.ranges.at(-1),positions=[],lineStarts=new Map();let reference='';
+    for(let line=first.sourceLine;line<=last.sourceLine;line++) {
+        const source=lineTexts.get(line) || '';let start=line===first.sourceLine?first.start:0;
+        if(line===first.sourceLine){const opening=source.slice(0,start).match(/[\p{Ps}\p{Pi}]+$/u)?.[0];if(opening)start-=opening.length;}
+        let end=line===last.sourceLine?last.end:source.length;
+        if(line===last.sourceLine)end+=(source.slice(end).match(/^\p{P}*/u)?.[0].length || 0);
+        lineStarts.set(line,reference.length-start);
+        for(let at=start;at<end;at++){reference+=source[at];positions.push({sourceLine:line,start:at,end:at+1});}
+        if(line<last.sourceLine){reference+='\n';positions.push(null);}
+    }
+    const sentences=getUnicodeReferenceSentences(reference).map(part=>{const lead=part.text.length-part.text.trimStart().length;return {text:cleanSubtitleMarkdown(part.text.trim()),start:part.index+lead,end:part.index+part.text.trimEnd().length};}).filter(part=>normalizeSubtitleUnicode(part.text).key);
+    if(sentences.length<2)return null;
+    const referenceReadings=[];
+    if(profile)for(const [line,readings] of profile.referenceReadings)if(lineStarts.has(line))for(const reading of readings){const offset=lineStarts.get(line);if(reading.start+offset>=0 && reading.end+offset<=reference.length)referenceReadings.push({...reading,start:reading.start+offset,end:reading.end+offset});}
+    const raw=String(cue.text || ''),rawNorm=profile?normalizeSubtitleReading(raw,profile.cueReadings.get(raw),profile.fold):normalizeSubtitleUnicode(raw);
+    const refNorm=profile?normalizeSubtitleReading(reference,referenceReadings,profile.fold):normalizeSubtitleUnicode(reference);
+    if(!rawNorm.key.length)return null;
+    const mapped=new Map();
+    if(rawNorm.key===refNorm.key){for(let i=0;i<refNorm.key.length;i++)mapped.set(i,i);}
+    else {
+        if(projection.alignmentMethod!=='reading_context' || (rawNorm.key.length+1)*(refNorm.key.length+1)>600000)return null;
+        const a=rawNorm.key,b=refNorm.key,w=b.length+1,dp=new Uint16Array((a.length+1)*w);
+        for(let i=a.length-1;i>=0;i--)for(let j=b.length-1;j>=0;j--)dp[i*w+j]=a[i]===b[j]?1+dp[(i+1)*w+j+1]:Math.max(dp[(i+1)*w+j],dp[i*w+j+1]);
+        let i=0,j=0;while(i<a.length && j<b.length){if(a[i]===b[j]){mapped.set(j,i);i++;j++;}else if(dp[(i+1)*w+j]>=dp[i*w+j+1])i++;else j++;}
+    }
+    const offsets=[];for(const unit of rawNorm.units)for(let i=0;i<unit.key.length;i++)offsets.push(unit);
+    let keyEnd=0,unitIndex=0;const cuts=[{key:0,at:0,time:Number(cue.start),exact:true}];
+    for(const sentence of sentences.slice(0,-1)){
+        while(unitIndex<refNorm.units.length && refNorm.units[unitIndex].end<=sentence.end)keyEnd+=refNorm.units[unitIndex++].key.length;
+        let rawKeyEnd=mapped.get(keyEnd);
+        if(rawKeyEnd===undefined){
+            // A small recognition error can touch a sentence boundary. Use a unique
+            // original separator between surrounding verified units, never guess
+            // a cut inside a word or its pronunciation expansion.
+            let before=keyEnd-1,after=keyEnd;
+            while(before>=0 && !mapped.has(before))before--;
+            while(after<refNorm.key.length && !mapped.has(after))after++;
+            const low=offsets[mapped.get(before)]?.end,high=offsets[mapped.get(after)]?.start;
+            if(low===undefined || high===undefined || high-low>16)return null;
+            const separatorStart=Math.max(0,low-4);
+            const separators=[...raw.slice(separatorStart,high).matchAll(/\s+/gu)];
+            if(separators.length!==1)return null;
+            const at=separatorStart+separators[0].index+separators[0][0].length;
+            rawKeyEnd=offsets.findIndex(unit=>unit.start>=at);
+            if(rawKeyEnd<0)return null;
+        }
+        const left=offsets[rawKeyEnd-1],right=offsets[rawKeyEnd];
+        if(!left || !right || left.end>right.start)return null;
+        cuts.push({key:rawKeyEnd,at:right.start});
+    }
+    cuts.push({key:rawNorm.key.length,at:raw.length,time:Number(cue.end),exact:true});
+    if(!Number.isFinite(cuts[0].time) || !Number.isFinite(cuts.at(-1).time) || cuts.at(-1).time<=cuts[0].time)return null;
+    const originals=cue.sourceCues || [cue],joined=originals.map(part=>part.text).join(' ');
+    if(originals.length>1 && normalizeSubtitleUnicode(joined).key===normalizeSubtitleUnicode(raw).key){
+        let prefix='';
+        for(const part of originals.slice(0,-1)){
+            prefix+=(prefix?' ':'')+part.text;
+            const key=normalizeSubtitleUnicode(prefix).key.length;
+            for(const cut of cuts.slice(1,-1))if(normalizeSubtitleUnicode(raw.slice(0,cut.at)).key.length===key){cut.time=Number(part.end);cut.exact=true;}
+        }
+    }
+    for(let i=1;i<cuts.length-1;i++)if(!cuts[i].exact){let next=i+1;while(!cuts[next].exact)next++;let previous=i-1;while(!cuts[previous].exact)previous--;cuts[i].time=cuts[previous].time+(cuts[next].time-cuts[previous].time)*(cuts[i].key-cuts[previous].key)/(cuts[next].key-cuts[previous].key);}
+    if(cuts.some((cut,i)=>i && cut.time<=cuts[i-1].time))return null;
+    const result=[];
+    for(let i=0;i<sentences.length;i++) {
+        const sentence=sentences[i],text=raw.slice(cuts[i].at,cuts[i+1].at).trim();if(!text)return null;
+        const ranges=[];
+        for(let at=sentence.start;at<sentence.end;at++){const point=positions[at];if(!point)continue;const range=ranges.at(-1);if(range?.sourceLine===point.sourceLine)range.end=point.end;else ranges.push({...point});}
+        ranges.forEach(range=>range.text=lineTexts.get(range.sourceLine).slice(range.start,range.end));
+        const differences=getSubtitleSpanDifferences(text,sentence.text);if(!differences)return null;
+        const reviewDifferences=differences.edits.map(edit=>({side:'difference',text:`${edit.from || '缺字'} → ${edit.to || '刪除'}`,signature:JSON.stringify(['sentence-context',ranges,edit]),edit}));
+        const saved={raw:text,text:reviewDifferences.length?text:sentence.text,aligned:true,trusted:!reviewDifferences.length,
+            changed:!reviewDifferences.length && text!==sentence.text,edits:reviewDifferences.length?[]:buildSubtitleReferenceDisplayEdits(text,sentence.text),ranges,
+            reviewDifferences,boundaryOmissions:[],referenceText:sentence.text,alignmentMethod:reviewDifferences.length?'reading_context':'unicode_exact'};
+        result.push({...cue,text,start:cuts[i].time,end:cuts[i+1].time,sourceCues:originals,
+            referenceSentenceGroup:true,referenceSentenceSplit:true,referenceSentenceText:sentence.text,
+            referenceTimingEstimated:!cuts[i].exact || !cuts[i+1].exact,
+            referenceSplitIndex:index,referenceSplitProjection:saved});
+    }
+    return result;
+};
+
 const createSubtitleReferenceResolver = searchIndex => {
-    let unicodeResolver=null;
+    let unicodeResolver=null,readingResolver=null;
     const tokens = [], postings = new Map(), lineTexts = new Map(), lineStarts = new Map(), lineEnds = new Map();
     for (const entry of searchIndex?.entries || []) {
         lineTexts.set(entry.sourceLine, entry.raw);
@@ -8207,9 +8390,15 @@ const createSubtitleReferenceResolver = searchIndex => {
             else { if (textCache.size >= 64) textCache.delete(textCache.keys().next().value); textCache.set(raw, cache); }
             return record;
         };
+        if(cue?.referenceSentenceSplit && cue.referenceSplitIndex===(searchIndex.baseIndex || searchIndex) && cue.referenceSplitProjection?.raw===raw &&
+            cue.referenceSplitProjection.ranges.every(range=>lineTexts.get(range.sourceLine)?.slice(range.start,range.end)===range.text))return remember(cue.referenceSplitProjection);
         const resolveUnicode = options => {
-            unicodeResolver ||= createUnicodeSubtitleReferenceResolver(searchIndex);
-            return unicodeResolver(raw,{sourceLine,sequential,after,before,...options});
+            unicodeResolver ||= createUnicodeSubtitleReferenceResolver({...searchIndex,readingProfile:null});
+            const literal=unicodeResolver(raw,{sourceLine,sequential,after,before,...options});
+            if(literal.aligned || !searchIndex.readingProfile || !searchIndex.readingProfile.cueReadings.has(raw))return literal;
+            readingResolver ||= createUnicodeSubtitleReferenceResolver(searchIndex);
+            const reading=readingResolver(raw,{sourceLine,sequential,after,before,exactOnly:false});
+            return reading.aligned || reading.candidates?.length ? reading : literal;
         };
         if(requiresUnicodeSubtitleComparison(raw))return remember(resolveUnicode());
         if(/\*/u.test(raw)) {
@@ -8619,6 +8808,7 @@ const buildSubtitleReferenceDisplayEdits = (raw, reference) => {
 const applySubtitleReferenceOriginalText = projection => {
     if (!projection?.aligned || !projection.trusted || !projection.referenceText ||
         projection.reviewDifferences?.length || projection.boundaryOmissions?.length) return projection;
+    if(projection.alignmentMethod==='reading_context'){const text=projection.referenceText;return {...projection,text,changed:text!==projection.raw,edits:buildSubtitleReferenceDisplayEdits(projection.raw,text),referenceTextApplied:true,referenceNames:[]};}
     if(projection.alignmentMethod==='unicode_exact')return {...projection,referenceTextApplied:true,referenceNames:[]};
     let reference=projection.referenceText;
     // Preserve reliable caption word boundaries when the book has joined the
@@ -11035,9 +11225,12 @@ export default function App() {
     const practiceReferenceIndex = useMemo(() => buildKnowledgeOriginalSearchIndex(embeddedKnowledgeText, {
         allowWholeDocumentFallback: !/(?:知識點|knowledge\s*point|lrc)/i.test(embeddedKnowledgeFileInfo?.filename || '')
     }), [embeddedKnowledgeText, embeddedKnowledgeFileInfo?.filename]);
-    const subtitles = useMemo(() => useReferenceSentences && referenceSubtitleCorrectionEnabled && !embeddedKnowledgeLoading && !embeddedKnowledgeError
-        ? groupSubtitlesByReferenceSentences(subtitleSegments, practiceReferenceIndex) : subtitleSegments,
-    [subtitleSegments, practiceReferenceIndex, useReferenceSentences, referenceSubtitleCorrectionEnabled, embeddedKnowledgeLoading, embeddedKnowledgeError]);
+    const [referenceSentenceSplitState,setReferenceSentenceSplitState]=useState(null);
+    const subtitles = useMemo(() => {
+        if(!useReferenceSentences || !referenceSubtitleCorrectionEnabled || embeddedKnowledgeLoading || embeddedKnowledgeError)return subtitleSegments;
+        const grouped=groupSubtitlesByReferenceSentences(subtitleSegments,practiceReferenceIndex);
+        return referenceSentenceSplitState?.document===embeddedRubyDocument && referenceSentenceSplitState.segments===subtitleSegments?grouped.flatMap(cue=>referenceSentenceSplitState.splits.get(JSON.stringify([cue.start,cue.end,cue.text])) || [cue]):grouped;
+    },[subtitleSegments,practiceReferenceIndex,useReferenceSentences,referenceSubtitleCorrectionEnabled,embeddedKnowledgeLoading,embeddedKnowledgeError,referenceSentenceSplitState,embeddedRubyDocument]);
     const previousPracticeSubtitlesRef = useRef(subtitles);
     const previousPracticeSegmentsRef = useRef(subtitleSegments);
     useEffect(() => {
@@ -21683,7 +21876,31 @@ ${userQ}`;
         return `${String(embeddedKnowledgeFileInfo?.filename || "")}::${embeddedKnowledgeText.length}`;
     }, [embeddedKnowledgeFileInfo?.filename, embeddedKnowledgeText.length]);
     const subtitlePracticeNameHints = useMemo(() => buildSubtitlePracticeNameContext(subtitles, embeddedKnowledgeAlignmentIndex.entries), [subtitles, embeddedKnowledgeAlignmentIndex]);
-    const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
+    const subtitleLiteralResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
+    const subtitleReadingCues = useMemo(()=>[subtitles[currentIndex-1],subtitles[currentIndex],subtitles[currentIndex+1]].filter(Boolean),[subtitles,currentIndex]);
+    const subtitleReadingKey=JSON.stringify(subtitleReadingCues.map(cue=>cue.text));
+    const [subtitleReadingState,setSubtitleReadingState]=useState(null);
+    const subtitleReadingCache=useRef({document:null,profiles:new Map()});
+    useEffect(()=>{
+        let live=true;
+        const cue=subtitles[currentIndex];
+        if(topPanelMode!=='document' || isVideoMasked || !cue || !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(cue.text) || !embeddedKnowledgeText || embeddedKnowledgeLoading || embeddedKnowledgeError)return;
+        if(subtitleLiteralResolver.resolveWithNeighbours(cue,subtitles[currentIndex-1],subtitles[currentIndex+1]).aligned)return;
+        if(subtitleReadingCache.current.document!==embeddedRubyDocument)subtitleReadingCache.current={document:embeddedRubyDocument,profiles:new Map()};
+        const cache=subtitleReadingCache.current.profiles;
+        if(cache.has(subtitleReadingKey)){setSubtitleReadingState({document:embeddedRubyDocument,key:subtitleReadingKey,profile:cache.get(subtitleReadingKey)});return;}
+        setSubtitleReadingState({document:embeddedRubyDocument,key:subtitleReadingKey,pending:true});
+        loadJapaneseTokenizer().then(tokenizer=>prepareSubtitleReadingProfile(embeddedKnowledgeAlignmentIndex,embeddedRubyDocument,subtitleReadingCues,tokenizer,
+            embeddedKnowledgePlaybackProgressRef.current.documentText===embeddedKnowledgeText?embeddedKnowledgePlaybackProgressRef.current.maxSourceLine:-1)).then(profile=>{
+                if(!live)return;
+                if(cache.size>=8)cache.delete(cache.keys().next().value);cache.set(subtitleReadingKey,profile);
+                setSubtitleReadingState({document:embeddedRubyDocument,key:subtitleReadingKey,profile});
+            }).catch(()=>{if(live)setSubtitleReadingState({document:embeddedRubyDocument,key:subtitleReadingKey,profile:null});});
+        return ()=>{live=false;};
+    },[subtitleLiteralResolver,subtitleReadingKey,embeddedRubyDocument,topPanelMode,isVideoMasked,embeddedKnowledgeLoading,embeddedKnowledgeError]);
+    const subtitleReferenceResolver = useMemo(() => subtitleReadingState?.document===embeddedRubyDocument && subtitleReadingState.key===subtitleReadingKey && subtitleReadingState.profile
+        ? createSubtitleReferenceResolver({...embeddedKnowledgeAlignmentIndex,baseIndex:embeddedKnowledgeAlignmentIndex,readingProfile:subtitleReadingState.profile}) : subtitleLiteralResolver,
+    [subtitleLiteralResolver,subtitleReadingState,embeddedRubyDocument,subtitleReadingKey,embeddedKnowledgeAlignmentIndex]);
     const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText.trim()) && !embeddedKnowledgeLoading && !embeddedKnowledgeError;
     const referenceDecisionFileKey = useMemo(() => reviewHash(embeddedKnowledgeText.replace(/\r\n?/gu,'\n')), [embeddedKnowledgeText]);
     const savedReferenceDecisions = reviewSession?.document.referenceDecisions;
@@ -21710,6 +21927,18 @@ ${userQ}`;
         const {accepted,originals}=readReferenceChoices(currentSubtitleProjection,cue);
         return applyCompleteSentenceReferencePreference(currentSubtitleProjection,cue,accepted,originals);
     }, [currentSubtitleProjection,subtitles,currentIndex,referenceDecisionFileKey,reviewSession,savedReferenceDecisions,referenceBoundaryRevision]);
+    useEffect(()=>{
+        const cue=subtitles[currentIndex];
+        if(!useReferenceSentences || !referenceSubtitleActive || !cue || cue.referenceSentenceSplit || !currentSubtitleProjection?.aligned)return;
+        const profile=subtitleReadingState?.document===embeddedRubyDocument && subtitleReadingState.key===subtitleReadingKey?subtitleReadingState.profile:null;
+        const split=splitSubtitleByReferenceSentences(cue,currentSubtitleProjection,embeddedKnowledgeAlignmentIndex,profile);
+        if(!split)return;
+        setReferenceSentenceSplitState(previous=>{
+            const splits=new Map(previous?.document===embeddedRubyDocument && previous.segments===subtitleSegments?previous.splits:[]);
+            const key=JSON.stringify([cue.start,cue.end,cue.text]);if(splits.has(key))return previous;
+            splits.set(key,split);return {document:embeddedRubyDocument,segments:subtitleSegments,splits};
+        });
+    },[useReferenceSentences,referenceSubtitleActive,currentSubtitleProjection,subtitles,currentIndex,embeddedKnowledgeAlignmentIndex,embeddedRubyDocument,subtitleReadingState,subtitleReadingKey,subtitleSegments]);
     const saveReferenceChoices = (cue,choices) => {
         if (!cue || !choices.length) return;
         const key=getReferenceDecisionCueKey(referenceDecisionFileKey,cue);
@@ -24700,8 +24929,10 @@ ${userQ}`;
                                         <label className="inline-flex items-center gap-1 cursor-pointer" title="將可靠對齊且連續的字幕合成原文完整句，播放與填空共用整句時間範圍；無法完整對齊時保留原分段。">
                                             <input type="checkbox" checked={useReferenceSentences} onChange={event => setUseReferenceSentences(event.target.checked)} />原文完整句
                                         </label>
-                                        {subtitles[currentIndex]?.referenceSentenceGroup && <span>已合併 {subtitles[currentIndex].sourceCues.length} 段字幕</span>}
+                                        {subtitles[currentIndex]?.referenceSentenceGroup && !subtitles[currentIndex]?.referenceSentenceSplit && <span>已合併 {subtitles[currentIndex].sourceCues.length} 段字幕</span>}
                                         {currentSubtitlePresentation?.autoCompletedPrefix && <span>依完整句補回：{currentSubtitlePresentation.autoCompletedPrefix}</span>}
+                                        {subtitleReadingState?.pending && subtitleReadingState.document===embeddedRubyDocument && subtitleReadingState.key===subtitleReadingKey && !currentSubtitleProjection?.aligned && <span role="status">正在比對讀音與表記…</span>}
+                                        {subtitles[currentIndex]?.referenceTimingEstimated && <span role="status" title="原字幕只有整段時間；逐句起訖依文字比例估計，原段落與時間仍保留。">逐句時間為估計</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>{currentSubtitlePresentation.retainedCaptionWordBoundaries?'依原文標點・保留原字幕分詞':'依原文與標點'}</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.provisionalReviewCount > 0 &&
                                             <span role="status">已對齊，{currentSubtitlePresentation.provisionalReviewCount} 處文字差異待確認</span>}
