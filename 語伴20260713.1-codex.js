@@ -518,7 +518,7 @@ const { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, g
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.323 · multilingual-formatting-diff";
+const APP_VERSION = "v5.324 · multilingual-reference-alignment";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7759,7 +7759,12 @@ const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
 // can replace the existing segmentation; unmatched material stays as it was.
 const groupSubtitlesByReferenceSentences = (cues, index) => {
     if (!cues?.length || !index?.entries?.length) return cues;
-    if(cues.some(cue=>requiresUnicodeSubtitleComparison(cue.text)))return groupUnicodeSubtitlesByReferenceSentences(cues,index);
+    const grouped = groupWordStrategySubtitles(cues,index);
+    return groupUnicodeSubtitlesByReferenceSentences(grouped,index);
+};
+
+const groupWordStrategySubtitles = (cues,index) => {
+    if(!cues.some(cue=>!requiresUnicodeSubtitleComparison(cue.text)))return cues;
     const sentences=[];
     let paragraph='',lastLine=-2;
     const flush=()=>{
@@ -7781,13 +7786,14 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
     for(const entry of index.entries) {
         if(entry.sourceLine!==lastLine+1)flush();
         lastLine=entry.sourceLine;
-        if(isTitleLike(entry.raw.trim()) || /[぀-ヿ㐀-鿿가-힯]/u.test(entry.raw)){flush();continue;}
+        if(isTitleLike(entry.raw.trim())){flush();continue;}
         paragraph+=(paragraph?' ':'')+entry.raw.trim();
     }
     flush();
     const keys=text=>tokenizeSubtitleReferenceWords(text).map(word=>word.key);
     const heads=new Map();
     for(const text of new Set(sentences)) {
+        if(requiresUnicodeSubtitleComparison(text))continue;
         const words=keys(text);
         if(words.length<5 || words.length>120)continue;
         for(let skip=0;skip<=Math.min(3,words.length-12);skip++) {
@@ -7800,9 +7806,10 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
     const result=[];
     let changed=false;
     for(let i=0;i<cues.length;i++) {
+        if(requiresUnicodeSubtitleComparison(cues[i].text)){result.push(cues[i]);continue;}
         let leading=keys(cues[i].text);
         for(let k=i+1;leading.length<4 && k<Math.min(cues.length,i+4);k++) {
-            if(cues[k].start-cues[k-1].end>1)break;
+            if(requiresUnicodeSubtitleComparison(cues[k].text) || cues[k].start-cues[k-1].end>1)break;
             leading.push(...keys(cues[k].text));
         }
         const candidates=heads.get(leading.slice(0,4).join(' ')) || [];
@@ -7814,6 +7821,7 @@ const groupSubtitlesByReferenceSentences = (cues, index) => {
             const tail=candidate.words.slice(-4).join(' ');
             let raw='';
             for(let j=i;j<Math.min(cues.length,i+16);j++) {
+                if(requiresUnicodeSubtitleComparison(cues[j].text))break;
                 if(j>i && (cues[j].start-cues[j-1].end>1 || cues[j].start<cues[j-1].start))break;
                 if(cues[j].end-cues[i].start>120)break;
                 raw+=(raw?' ':'')+cues[j].text;
@@ -7858,7 +7866,7 @@ const normalizeSubtitleUnicode = text => {
         const value=match[0].normalize('NFKC').toLowerCase();
         if(/^\s+$/u.test(value)){pendingSpace=true;continue;}
         const start=match.index,end=start+match[0].length;
-        const numericPunctuation=/^[.,:*/]$/u.test(value) && /\p{N}$/u.test(text.slice(0,start)) && /^\p{N}/u.test(text.slice(end));
+        const numericPunctuation=/^[.,:*/٫٬]$/u.test(value) && /\p{N}$/u.test(text.slice(0,start)) && /^\p{N}/u.test(text.slice(end));
         const signed=/^[+−-]$/u.test(value) && /^\p{N}/u.test(text.slice(end));
         if(!/[\p{L}\p{M}\p{N}\u200c\u200d]/u.test(value) && !numericPunctuation && !signed && !/^[%٪‰]$/u.test(value))continue;
         const previous=units.at(-1);
@@ -7871,17 +7879,30 @@ const normalizeSubtitleUnicode = text => {
 const requiresUnicodeSubtitleComparison = text => [...String(text || '')].some(char=>/[\p{L}\p{M}]/u.test(char) && !/[A-Za-z]/u.test(char));
 const cleanSubtitleMarkdown = text => String(text || '').replace(/\*+/gu,(mark,offset,source)=>
     mark==='*' && /\p{N}$/u.test(source.slice(0,offset)) && /^\p{N}/u.test(source.slice(offset+1)) ? mark : '').replace(/\\(?=[*_`])/gu,'');
+// Sentence terminals include danda, Arabic question marks and other Unicode
+// sentence punctuation. Keep UTF-16 offsets for matches against the book.
+const getUnicodeReferenceSentences = text => {
+    const segmenter = typeof Intl?.Segmenter==='function' ? new Intl.Segmenter(undefined,{granularity:'sentence'}) : null;
+    const pieces = segmenter ? Array.from(segmenter.segment(text), part=>({text:part.segment,index:part.index})) :
+        Array.from(text.matchAll(/[^\p{Sentence_Terminal}]+(?:\p{Sentence_Terminal}+[\p{Pe}\p{Pf}"']*)?/gu), match=>({text:match[0],index:match.index}));
+    const sentences=[];
+    for(const piece of pieces){
+        const previous=sentences.at(-1);
+        if(previous && isAbbreviation(previous.text.trim()))previous.text+=piece.text;
+        else sentences.push(piece);
+    }
+    return sentences;
+};
+
 // Exact sentence grouping for all scripts; language-specific spelling repair
 // remains a separate operation. A failed merge leaves the original cues intact.
 const groupUnicodeSubtitlesByReferenceSentences = (cues,index) => {
     const heads=new Map();
-    const segmenter=typeof Intl?.Segmenter==='function'?new Intl.Segmenter(undefined,{granularity:'sentence'}):null;
     let paragraph='',lastLine=-2;
     const flush=()=>{
-        const segments=segmenter ? [...segmenter.segment(paragraph)].map(item=>item.segment) : paragraph.match(/[^.!?。！？؟]+[.!?。！？؟]+/gu) || [];
-        for(const text of segments) {
+        for(const {text} of getUnicodeReferenceSentences(paragraph)) {
             const reference=text.trim(),key=normalizeSubtitleUnicode(reference).key;
-            if(key.length<8 || key.length>2000 || !/[.!?。！？؟][\p{Pe}\p{Pf}"']*$/u.test(reference))continue;
+            if(key.length<8 || key.length>2000 || !/\p{Sentence_Terminal}[\p{Pe}\p{Pf}"']*$/u.test(reference))continue;
             const head=key.slice(0,8),entries=heads.get(head) || [];
             entries.push({reference,key});heads.set(head,entries);
         }
@@ -7891,8 +7912,10 @@ const groupUnicodeSubtitlesByReferenceSentences = (cues,index) => {
     flush();
     const result=[];let changed=false;
     for(let i=0;i<cues.length;i++) {
+        if(cues[i].referenceSentenceGroup){result.push(cues[i]);continue;}
         let leading='';
         for(let j=i;j<Math.min(cues.length,i+4) && normalizeSubtitleUnicode(leading).key.length<8;j++) {
+            if(cues[j].referenceSentenceGroup)break;
             if(j>i && cues[j].start-cues[j-1].end>1)break;
             leading+=(leading?' ':'')+cues[j].text;
         }
@@ -7900,6 +7923,7 @@ const groupUnicodeSubtitlesByReferenceSentences = (cues,index) => {
         for(const candidate of candidates) {
             let raw='';
             for(let j=i;j<Math.min(cues.length,i+16);j++) {
+                if(cues[j].referenceSentenceGroup)break;
                 if(j>i && (cues[j].start-cues[j-1].end>1 || cues[j].start<cues[j-1].start))break;
                 if(cues[j].end-cues[i].start>120)break;
                 raw+=(raw?' ':'')+cues[j].text;
@@ -7938,7 +7962,7 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         if(!range)return -1;
         return offsets.findIndex(item=>item && item.sourceLine===range.sourceLine && (last?item.end===range.end:item.start===range.start));
     };
-    return (raw,{sourceLine=-1,sequential=false,after=[],before=[]}={})=>{
+    return (raw,{sourceLine=-1,sequential=false,after=[],before=[],exactOnly=false}={})=>{
         const query=normalizeSubtitleUnicode(raw).key;
         if(!query || (Array.from(query).length<4 && !after.length && !before.length))return {reason:'short_without_adjacent_context'};
         let afterIndex=after.length?boundary(after.at(-1),true):-1,beforeIndex=before.length?boundary(before[0],false):-1;
@@ -7946,9 +7970,14 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         if(afterIndex>=0){while(offsets[afterIndex+1]?.end===offsets[afterIndex]?.end && offsets[afterIndex+1]?.sourceLine===offsets[afterIndex]?.sourceLine)afterIndex++;afterIndex++;while(sequence[afterIndex]===' ')afterIndex++;}
         if(beforeIndex>=0)while(sequence[beforeIndex-1]===' ')beforeIndex--;
         const candidates=[];
+        const insideWord=(left,right)=>left && right && !unspaced.test(left+right) &&
+            /[\p{L}\p{M}\p{N}]$/u.test(left) && /^[\p{L}\p{M}\p{N}]/u.test(right);
+
         for(let start=sequence.indexOf(query);start>=0;start=sequence.indexOf(query,start+1)) {
             const end=start+query.length,first=offsets[start],last=offsets[end-1];
             if(!first || !last || (after.length && start!==afterIndex) || (before.length && end!==beforeIndex))continue;
+            if(insideWord(sequence[start-1],sequence[start]) && offsets[start-1]?.sourceLine===first.sourceLine && offsets[start-1]?.end===first.start)continue;
+            if(insideWord(sequence[end-1],sequence[end]) && offsets[end]?.sourceLine===last.sourceLine && last.end===offsets[end]?.start)continue;
             // Do not match only half a compatibility ligature or surrogate pair.
             if(offsets[start-1]?.sourceLine===first.sourceLine && offsets[start-1]?.start===first.start)continue;
             if(offsets[end]?.sourceLine===last.sourceLine && offsets[end]?.end===last.end)continue;
@@ -7966,12 +7995,12 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
         }
         // Strong unchanged context can locate a long Unicode sentence even
         // when ASR substitutes a short span. Keep factual changes reviewable.
-        if(!candidates.length && query.length>=32){
+        if(!exactOnly && !candidates.length && query.length>=32){
             const nearby=[];
             for(const [line,lineText] of lineTexts){
                 if(sequential && sourceLine>=0 && (line<sourceLine-1 || line>sourceLine+48))continue;
-                for(const match of lineText.matchAll(/[^。！？!?]+[。！？!?]*/gu)){
-                    const ref=match[0].trim(),norm=normalizeSubtitleUnicode(ref),key=norm.key;
+                for(const sentence of getUnicodeReferenceSentences(lineText)){
+                    const ref=sentence.text.trim(),norm=normalizeSubtitleUnicode(ref),key=norm.key;
                     if(Math.abs(key.length-query.length)>4)continue;
                     const qa=Array.from(query),kb=Array.from(key);if(qa.length*kb.length>300000)continue;
                     let prefix=0,suffix=0;
@@ -7985,12 +8014,41 @@ const createUnicodeSubtitleReferenceResolver = searchIndex => {
                     const locate=(normalized,at)=>{let n=0;for(const unit of normalized.units){if(at<n+unit.key.length)return unit;n+=unit.key.length;}return null;};
                     const rawNorm=normalizeSubtitleUnicode(raw),ops=[];let i=qa.length,j=kb.length;
                     while(i || j){if(i && j && dp[i*width+j]===dp[(i-1)*width+j-1]+(qa[i-1]===kb[j-1]?0:1)){ops.push({equal:qa[i-1]===kb[j-1],a:--i,b:--j});}else if(i && dp[i*width+j]===dp[(i-1)*width+j]+1)ops.push({a:--i,b:j,remove:true});else ops.push({a:i,b:--j,insert:true});}
-                    ops.reverse();const edits=[];let group=[];
-                    const flush=()=>{if(!group.length)return;const first=group[0],last=group.at(-1),ai=qa.slice(0,first.a).join('').length,ae=qa.slice(0,last.a+(last.insert?0:1)).join('').length,bi=kb.slice(0,first.b).join('').length,be=kb.slice(0,last.b+(last.remove?0:1)).join('').length;
-                        const start=locate(rawNorm,ai)?.start ?? raw.length,end=ae>ai?locate(rawNorm,ae-1)?.end:start,rs=locate(norm,bi)?.start ?? ref.length,re=be>bi?locate(norm,be-1)?.end:rs;
-                        const replacement=ref.slice(rs,re);edits.push({start,end,text:replacement,from:raw.slice(start,end),to:replacement,kind:'spelling'});group=[];};
+                    ops.reverse();const edits=[];let group=[],splitUnit=false;
+                    const isUnitBoundary=(normalized,at)=>at===0 || at===normalized.key.length ||
+                        locate(normalized,at-1)!==locate(normalized,at);
+                    // Expand edits to include matching code points that belong
+                    // to the same source unit (e.g. a Hindi vowel mark).
+                    const unitOffsets=chars=>{let offset=0;return chars.map(char=>{const start=offset;offset+=char.length;return start;});};
+                    const aOffsets=unitOffsets(qa),bOffsets=unitOffsets(kb);
+                    const units=op=>[op.insert?null:locate(rawNorm,aOffsets[op.a]),op.remove?null:locate(norm,bOffsets[op.b])].filter(Boolean);
+                    const changedUnits=new Set(ops.filter(op=>!op.equal).flatMap(units));
+                    let expanded;
+                    do {
+                        expanded=false;
+                        for(const op of ops)if(op.equal && units(op).some(unit=>changedUnits.has(unit))){
+                            op.equal=false;units(op).forEach(unit=>changedUnits.add(unit));expanded=true;
+                        }
+                    } while(expanded);
+                    const flush=()=>{
+                        if(!group.length)return;
+                        const first=group[0],last=group.at(-1);
+                        const ai=qa.slice(0,first.a).join('').length,ae=qa.slice(0,last.a+(last.insert?0:1)).join('').length;
+                        const bi=kb.slice(0,first.b).join('').length,be=kb.slice(0,last.b+(last.remove?0:1)).join('').length;
+                        // A difference cannot edit only part of a composed
+                        // character or a compatibility expansion.
+                        if(![ai,ae].every(at=>isUnitBoundary(rawNorm,at)) || ![bi,be].every(at=>isUnitBoundary(norm,at))){
+                            splitUnit=true;group=[];return;
+                        }
+                        const start=locate(rawNorm,ai)?.start ?? raw.length,end=ae>ai?locate(rawNorm,ae-1)?.end:start;
+                        const rs=locate(norm,bi)?.start ?? ref.length,re=be>bi?locate(norm,be-1)?.end:rs;
+                        const replacement=ref.slice(rs,re);
+                        edits.push({start,end,text:replacement,from:raw.slice(start,end),to:replacement,kind:'spelling'});
+                        group=[];
+                    };
                     for(const op of ops){if(op.equal)flush();else group.push(op);}flush();
-                    const start=match.index+match[0].indexOf(ref),range={sourceLine:line,start,end:start+ref.length,text:ref};
+                    if(splitUnit || !edits.length)continue;
+                    const start=sentence.index+sentence.text.indexOf(ref),range={sourceLine:line,start,end:start+ref.length,text:ref};
                     const globalStart=offsets.findIndex(item=>item && item.sourceLine===line && item.start>=start);
                     if((after.length && globalStart!==afterIndex) || (before.length && globalStart+key.length!==beforeIndex))continue;
                     nearby.push({text:raw,aligned:true,trusted:false,changed:false,edits:[],ranges:[range],referenceText:ref,boundaryOmissions:[],alignmentMethod:'unicode_anchored_difference',reviewDifferences:edits.map(edit=>({side:'difference',text:`${edit.from} → ${edit.to}`,signature:JSON.stringify(['unicode-context',range,edit]),edit}))});
@@ -8107,15 +8165,22 @@ const createSubtitleReferenceResolver = searchIndex => {
             else { if (textCache.size >= 64) textCache.delete(textCache.keys().next().value); textCache.set(raw, cache); }
             return record;
         };
-        if(requiresUnicodeSubtitleComparison(raw) || /\*/u.test(raw)) {
+        const resolveUnicode = options => {
             unicodeResolver ||= createUnicodeSubtitleReferenceResolver(searchIndex);
-            const universal=unicodeResolver(raw,{sourceLine,sequential,after,before});
-            if(universal.aligned || requiresUnicodeSubtitleComparison(raw))return remember(universal);
+            return unicodeResolver(raw,{sourceLine,sequential,after,before,...options});
+        };
+        if(requiresUnicodeSubtitleComparison(raw))return remember(resolveUnicode());
+        if(/\*/u.test(raw)) {
+            const unicode=resolveUnicode({exactOnly:true});
+            if(unicode.aligned)return remember(unicode);
         }
         const words = tokenizeSubtitleReferenceWords(raw);
-        if (!tokens.length || !words.length || words.length > 120 || /[぀-ヿ㐀-鿿가-힯]/u.test(raw)) return remember({ reason: 'unsupported_or_short' });
+        if (!tokens.length || !words.length || words.length > 120) return remember(resolveUnicode({exactOnly:true}));
         const beforeBoundary=before.length?getBeforeWordBoundary(before):-1;
-        if(before.length && beforeBoundary<0)return remember({reason:'invalid_adjacent_boundary'});
+        if(before.length && beforeBoundary<0) {
+            const unicode=resolveUnicode({exactOnly:true});
+            return remember(unicode.aligned ? unicode : {reason:'invalid_adjacent_boundary'});
+        }
         const following=!before.length && after.length && locateSubtitleReferenceFollowing(words,tokens,lineTexts,lineStarts,lineEnds,after,raw);
         if(following)return remember(following);
         if(words.length<2)return remember({reason:'short_without_adjacent_context'});
@@ -8312,7 +8377,10 @@ const createSubtitleReferenceResolver = searchIndex => {
             }).filter(item=>item.evidence>=Math.ceil(words.length*0.65)).sort((a,b)=>b.evidence-a.evidence).slice(0,128);
             if(ranked.length)candidates=verifyStarts(ranked.map(item=>item.start));
         }
-        if (!candidates.length) return remember({ reason: starts.size ? 'no_bounded_word_alignment' : 'no_unique_anchor' });
+        if (!candidates.length) {
+            const unicode=resolveUnicode({exactOnly:true});
+            return remember(unicode.aligned ? unicode : { reason: starts.size ? 'no_bounded_word_alignment' : 'no_unique_anchor' });
+        }
         // Multiple search anchors may verify the very same source span.
         // Count positions, not search paths, and keep the cheapest mapping.
         const positions = new Map();

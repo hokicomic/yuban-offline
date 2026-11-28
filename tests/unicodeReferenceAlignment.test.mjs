@@ -94,6 +94,50 @@ for(const file of ['yuban-original.jsx','語伴20260713.1-codex.js']) {
         assert.equal(api.groupSubtitlesByReferenceSentences([{...cues[0]},{...cues[1],start:18}],index).length,2,'a gap cannot be covered by invented audio');
         assert.equal(api.groupSubtitlesByReferenceSentences([{text:first.replace('話が',''),start:10,end:15},cues[1]],index).length,2,'missing content stays separate');
     });
+    test('mixed English and Japanese cues keep both sentence strategies and their own timestamps: '+file,()=>{
+        const first='Sleeves on, Vera nods at her reflection and marches to the kitchen';
+        const tail='where she gulps down a pint of room-temperature water.';
+        const jaFirst='ここから詳しく説明しますが、',jaLast='最初にこの文章を読んでください。';
+        const cues=[{text:first.slice(8),start:0,end:3},{text:tail,start:3,end:6},{text:jaFirst,start:6,end:8},{text:jaLast,start:8,end:12}];
+        const index=api.buildKnowledgeOriginalSearchIndex('[原文]\n'+first+' '+tail+' '+jaFirst+jaLast);
+        const grouped=api.groupSubtitlesByReferenceSentences(cues,index);
+        assert.equal(grouped.length,2);
+        assert.equal(grouped[0].referenceSentencePrefix,'Sleeves ');
+        assert.equal(grouped[0].sourceCues[0],cues[0]);
+        assert.equal(grouped[0].end,6);
+        assert.equal(grouped[1].sourceCues[0],cues[2]);
+        assert.equal(grouped[1].end,12);
+    });
+    test('Unicode grouping and correction share Arabic and Indic sentence boundaries: '+file,()=>{
+        const samples=[
+            ['هذه جملة طويلة من الكتاب لنختبر', 'مطابقة النص بشكل صحيح؟','مطابقة','مطابقه','ثم نقرأ الجملة التالية.'],
+            ['यह पुस्तक का एक लंबा वाक्य है', 'जिससे हम परिणाम की जाँच करेंगे।','परिणाम','परिनाम','इसके बाद अगला वाक्य है।'],
+            ['이것은 책에서 가져온 긴 문장이라서', '정확한 결과를 비교할 수 있습니다.','결과를','결과롤','다음 문장을 읽습니다.']
+        ];
+        for(const [first,tail,word,asr,next] of samples){
+            const reference=first+' '+tail;
+            const raw=reference.replace(word,asr);
+            const source=reference+' '+next;
+            const result=engine(source).resolve({text:raw});
+            assert.equal(result.aligned,true,JSON.stringify(result));
+            assert.equal(result.trusted,false);
+            assert.ok(result.reviewDifferences.length);
+            assert.equal(api.applySubtitleReferencePreference(result).text,reference);
+            const index=api.buildKnowledgeOriginalSearchIndex('[原文]\n'+source);
+            const grouped=api.groupSubtitlesByReferenceSentences([{text:first,start:1,end:4},{text:tail,start:4,end:8}],index);
+            assert.equal(grouped.length,1,source);
+            assert.equal(grouped[0].end,8);
+        }
+    });
+    test('cross-script reference lookup keeps content boundaries and numeric punctuation: '+file,()=>{
+        const ref='日本語の説明。 OpenAI Whisper is used here. 続きです。';
+        const found=engine(ref).resolve({text:'OpenAI Whisper is used here.'});
+        assert.equal(found.aligned,true);
+        assert.equal(found.ranges[0].text,'OpenAI Whisper is used here');
+        assert.notEqual(engine('La réponse commence par incompréhensible.').resolve({text:'compréhensible'}).aligned,true);
+        assert.notEqual(api.normalizeSubtitleUnicode('السعر ٣٫١٤').key,api.normalizeSubtitleUnicode('السعر ٣١٤').key);
+        assert.notEqual(api.normalizeSubtitleUnicode('عدد ١٬٠٠٠').key,api.normalizeSubtitleUnicode('عدد ١٠٠٠').key);
+    });
     test('repeated Unicode positions need real neighbour evidence and invalid semantics never auto-match: '+file,()=>{
         const title='第一回 小説家は寛容な人種なのか';
         const next='ここから小説について語ります。';
