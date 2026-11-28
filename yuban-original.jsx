@@ -21,14 +21,14 @@ import {
 } from 'lucide-react';
 import {parseRubyDocument} from './furigana.js';
 import {FuriganaView} from './FuriganaView.jsx';
-import { createReviewDocument, openReviewSession, findReviewCue, getReviewPlaybackIndices, stepReviewIndex, tickReviewPlayback } from './subtitleReview.js';
+import { createReviewDocument, openReviewSession, reviewHash, getReferenceDecisionCueKey, getReferenceDecisionChangeKey, getReferenceDecisionChoices, findReviewCue, getReviewPlaybackIndices, stepReviewIndex, tickReviewPlayback } from './subtitleReview.js';
 import { DEFAULT_FSRS_CONFIG, FSRS_SCHEMA_VERSION, applyFsrsRating, dueInLabel, getFsrsPreview, getFsrsStateLabel, getRetrievability, isDue, isFsrsScheduled, normalizeFsrsConfig } from './fsrsScheduler.js';
 
 // ============================================================================
 // [CONFIG] API KEY
 // ============================================================================
 const apiKey = "";
-const APP_VERSION = "v5.325 · multilingual-subtitle-practice";
+const APP_VERSION = "v5.326 · persistent-reference-decisions";
 let bridgeRuntimeStats = { tx: 0, rx: 0, echo: 0, lastType: "", lastKeys: "" };
 const AI_NOTES_CACHE_SCHEMA_VERSION = "20261008.1";
 const EXPLAIN_ENABLE_SECOND_PASS = false; // default: keep single-pass for stable quality
@@ -7243,9 +7243,9 @@ const getSubtitleReferenceStatus = ({loading,error,hasText,active,hasCue,enabled
         return {text:'本句未對到文本',tone:'text-amber-700'};
     }
     if (!enabled) return {text:'已對到文本・校正關閉',tone:'text-slate-500'};
-    if (projection.reviewDifferences?.length) return {text:'已對到文本・有差異待確認',tone:'text-amber-700'};
+    if ((projection.provisionalReviewCount ?? projection.reviewDifferences?.length) > 0) return {text:'已對到文本・有差異待確認',tone:'text-amber-700'};
     if (projection.boundaryOmissions?.length) return {text:'已對到文本・有漏字待確認',tone:'text-amber-700'};
-    return {text:projection.changed?'已對到文本・已校正':'已對到文本・無需校正',tone:'text-emerald-700'};
+    return {text:projection.changed?'已對到文本・已校正':projection.originalReviewCount?'已對到文本・依原字幕':'已對到文本・無需校正',tone:'text-emerald-700'};
 };
 
 const getSubtitleReferenceSentenceText = (ranges, lineTexts) => {
@@ -10496,8 +10496,7 @@ export default function GeminiPlayer() {
     const embeddedKnowledgeText=embeddedRubyDocument.text;
     const [showFurigana,setShowFurigana]=useState(false);
     const [referenceSubtitleCorrectionEnabled, setReferenceSubtitleCorrectionEnabled] = useState(true);
-    const referenceBoundaryAcceptancesRef = useRef(new WeakMap());
-    const referenceOriginalDifferencesRef = useRef(new WeakMap());
+    const transientReferenceDecisionsRef = useRef(new WeakMap());
     const [referenceBoundaryRevision, setReferenceBoundaryRevision] = useState(0);
     const [embeddedKnowledgeFileInfo, setEmbeddedKnowledgeFileInfo] = useState(null);
     const [embeddedKnowledgeLoading, setEmbeddedKnowledgeLoading] = useState(false);
@@ -11489,7 +11488,7 @@ export default function GeminiPlayer() {
             sidecar:selectedFolderFilesRef.current[filename.toLowerCase()],storage,
             notify:value=>{if(activeReviewRef.current===value)refreshReview(n=>n+1);}});
         reviewPlaybackRef.current.pending=null;activeReviewRef.current=session;setReviewSession(session);setReviewNotice('');setReviewImportedFiles([]);setSelectedReviewId(null);
-        void session.ready.then(()=>{if(activeReviewRef.current===session)refreshReview(n=>n+1);if(session.document.entries.length&&!session.blocked)void session.save();});
+        void session.ready.then(()=>{if(activeReviewRef.current===session)refreshReview(n=>n+1);if((session.document.entries.length||session.document.referenceDecisions?.length)&&!session.blocked)void session.save();});
     };
 
     const selectedFolderSessionRef = useRef(null);
@@ -21163,6 +21162,14 @@ ${userQ}`;
     const subtitlePracticeNameHints = useMemo(() => buildSubtitlePracticeNameContext(subtitles, embeddedKnowledgeAlignmentIndex.entries), [subtitles, embeddedKnowledgeAlignmentIndex]);
     const subtitleReferenceResolver = useMemo(() => createSubtitleReferenceResolver(embeddedKnowledgeAlignmentIndex), [embeddedKnowledgeAlignmentIndex]);
     const referenceSubtitleActive = topPanelMode === 'document' && !isVideoMasked && Boolean(embeddedKnowledgeText.trim()) && !embeddedKnowledgeLoading && !embeddedKnowledgeError;
+    const referenceDecisionFileKey = useMemo(() => reviewHash(embeddedKnowledgeText.replace(/\r\n?/gu,'\n')), [embeddedKnowledgeText]);
+    const savedReferenceDecisions = reviewSession?.document.referenceDecisions;
+    const readReferenceChoices = (projection,cue) => {
+        if (!cue) return {};
+        const key=getReferenceDecisionCueKey(referenceDecisionFileKey,cue);
+        const decisions=reviewSession ? savedReferenceDecisions : transientReferenceDecisionsRef.current.get(cue);
+        return getReferenceDecisionChoices(decisions,key,projection);
+    };
     const currentSubtitleProjection = useMemo(() => {
         if (!referenceSubtitleActive) return null;
         const progress = embeddedKnowledgePlaybackProgressRef.current;
@@ -21175,34 +21182,31 @@ ${userQ}`;
         });
     }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, currentIndex, embeddedKnowledgeText,
         embeddedKnowledgePlaybackProgressRef.current.maxSourceLine, embeddedKnowledgePlaybackProgressRef.current.anchorState, embeddedKnowledgePlaybackProgressRef.current.subtitleIndex]);
-    const currentSubtitlePresentation = useMemo(() => applyCompleteSentenceReferencePreference(currentSubtitleProjection,subtitles[currentIndex],
-        subtitles[currentIndex] && referenceBoundaryAcceptancesRef.current.get(subtitles[currentIndex]),
-        subtitles[currentIndex] && referenceOriginalDifferencesRef.current.get(subtitles[currentIndex])),
-    [currentSubtitleProjection, subtitles, currentIndex, referenceBoundaryRevision]);
-    const confirmReferenceBoundary = suggestion => {
-        const cue = subtitles[currentIndex];
-        if (!cue) return;
-        const accepted = referenceBoundaryAcceptancesRef.current.get(cue) || new Set();
-        accepted.add(suggestion.signature);
-        referenceOriginalDifferencesRef.current.get(cue)?.delete(suggestion.signature);
-        referenceBoundaryAcceptancesRef.current.set(cue, accepted);
-        setReferenceBoundaryRevision(revision => revision + 1);
+    const currentSubtitlePresentation = useMemo(() => {
+        const cue=subtitles[currentIndex];
+        const {accepted,originals}=readReferenceChoices(currentSubtitleProjection,cue);
+        return applyCompleteSentenceReferencePreference(currentSubtitleProjection,cue,accepted,originals);
+    }, [currentSubtitleProjection,subtitles,currentIndex,referenceDecisionFileKey,reviewSession,savedReferenceDecisions,referenceBoundaryRevision]);
+    const saveReferenceChoices = (cue,choices) => {
+        if (!cue || !choices.length) return;
+        const key=getReferenceDecisionCueKey(referenceDecisionFileKey,cue);
+        const changes=choices.map(([suggestion,choice])=>({change:getReferenceDecisionChangeKey(suggestion),choice}));
+        if (reviewSession) {
+            void reviewSession.recordReferenceDecisions(key,changes);
+        } else {
+            const previous=transientReferenceDecisionsRef.current.get(cue) || [];
+            transientReferenceDecisionsRef.current.set(cue,[...previous,...changes.map(change=>({...change,cue:key}))]);
+            setReferenceBoundaryRevision(revision=>revision+1);
+        }
     };
-    const useOriginalReferenceDifference = suggestion => {
-        const cue=subtitles[currentIndex];if (!cue) return;
-        const originals=referenceOriginalDifferencesRef.current.get(cue) || new Set();
-        originals.add(suggestion.signature);referenceOriginalDifferencesRef.current.set(cue,originals);
-        referenceBoundaryAcceptancesRef.current.get(cue)?.delete(suggestion.signature);
-        setReferenceBoundaryRevision(revision=>revision+1);
-    };
+    const confirmReferenceBoundary = suggestion => saveReferenceChoices(subtitles[currentIndex],[[suggestion,'text']]);
+    const useOriginalReferenceDifference = suggestion => saveReferenceChoices(subtitles[currentIndex],[[suggestion,'original']]);
     const undoReferenceConfirmations = () => {
-        const cue=subtitles[currentIndex];if (!cue) return;
-        const accepted=referenceBoundaryAcceptancesRef.current.get(cue);
-        const originals=referenceOriginalDifferencesRef.current.get(cue) || new Set();
-        for (const difference of currentSubtitleProjection?.reviewDifferences || []) if (accepted?.has(difference.signature)) originals.add(difference.signature);
-        referenceOriginalDifferencesRef.current.set(cue,originals);
-        referenceBoundaryAcceptancesRef.current.delete(cue);
-        setReferenceBoundaryRevision(revision=>revision+1);
+        const cue=subtitles[currentIndex];
+        const {accepted}=readReferenceChoices(currentSubtitleProjection,cue);
+        const suggestions=[...(currentSubtitleProjection?.boundaryOmissions || []),...(currentSubtitleProjection?.reviewDifferences || [])];
+        saveReferenceChoices(cue,suggestions.filter(item=>accepted?.has(item.signature))
+            .map(item=>[item,item.side==='difference'?'original':'reset']));
     };
     useEffect(() => {
         if (!referenceSubtitleActive) return;
@@ -21229,8 +21233,9 @@ ${userQ}`;
         const projection = subtitleReferenceResolver.resolveWithNeighbours(cue, subtitles[embeddedKnowledgeRenderIndex - 1], subtitles[embeddedKnowledgeRenderIndex + 1], {
             sourceLine: progress.documentText === embeddedKnowledgeText ? progress.maxSourceLine : -1
         });
-        return applyCompleteSentenceReferencePreference(projection, cue, cue && referenceBoundaryAcceptancesRef.current.get(cue), cue && referenceOriginalDifferencesRef.current.get(cue));
-    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceBoundaryRevision, currentIndex, currentSubtitlePresentation]);
+        const {accepted,originals}=readReferenceChoices(projection,cue);
+        return applyCompleteSentenceReferencePreference(projection,cue,accepted,originals);
+    }, [referenceSubtitleActive, subtitleReferenceResolver, subtitles, embeddedKnowledgeRenderIndex, embeddedKnowledgeText, referenceDecisionFileKey, reviewSession, savedReferenceDecisions, referenceBoundaryRevision, currentIndex, currentSubtitlePresentation]);
     const embeddedKnowledgeSubtitleMatches = useMemo(() => {
         const subtitleText = subtitles[embeddedKnowledgeRenderIndex]?.text || "";
         const manualAnchorKey = `${embeddedKnowledgeDocumentKey}:${embeddedKnowledgeRenderIndex}`;
@@ -24175,8 +24180,8 @@ ${userQ}`;
                                         {subtitles[currentIndex]?.referenceSentenceGroup && <span>已合併 {subtitles[currentIndex].sourceCues.length} 段字幕</span>}
                                         {currentSubtitlePresentation?.autoCompletedPrefix && <span>依完整句補回：{currentSubtitlePresentation.autoCompletedPrefix}</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.referenceTextApplied && <span>{currentSubtitlePresentation.retainedCaptionWordBoundaries?'依原文標點・保留原字幕分詞':'依原文與標點'}</span>}
-                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.reviewDifferences?.length > 0 &&
-                                            <span role="status">已對齊，{currentSubtitlePresentation.reviewDifferences.length} 處文字差異待確認</span>}
+                                        {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.provisionalReviewCount > 0 &&
+                                            <span role="status">已對齊，{currentSubtitlePresentation.provisionalReviewCount} 處文字差異待確認</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.originalReviewCount > 0 &&
                                             <span>依原字幕 {currentSubtitlePresentation.originalReviewCount} 處</span>}
                                         {referenceSubtitleCorrectionEnabled && currentSubtitlePresentation?.changed && <span aria-label="參照校正說明" title={`原字幕：${currentSubtitlePresentation.raw}\n${currentSubtitlePresentation.edits.map(edit => edit.kind === 'duplicate' ? `刪除重複：${edit.from}` : edit.kind === 'extra' ? `刪除多字：${edit.from}` : edit.kind === 'omission' ? `補回：${edit.to}` : `${edit.from} → ${edit.to}`).join('；')}`}>{currentSubtitlePresentation.provisionalReviewCount > 0 ? `暫依文本 ${currentSubtitlePresentation.provisionalReviewCount} 處` : `已校正 ${currentSubtitlePresentation.edits.length} 處`}</span>}

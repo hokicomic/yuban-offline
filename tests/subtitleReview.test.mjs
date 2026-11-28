@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createReviewDocument,validateReviewDocument,mergeReviewDocuments,recordReviewAttempt,findReviewCue,openReviewSession} from '../subtitleReview.js';
+import {createReviewDocument,validateReviewDocument,mergeReviewDocuments,recordReviewAttempt,findReviewCue,openReviewSession,
+    getReferenceDecisionCueKey,getReferenceDecisionChangeKey,getReferenceDecisionChoices} from '../subtitleReview.js';
 const base=()=>createReviewDocument('book.lrc','[00:01]Hello world.','book.mp3');
 const word={key:'1:0',text:'ghosted',typed:'ghost',accepted:['ghosted','ghost dude'],reason:'revealed-after-attempt'};
 const attempt=(id='one',words=[word])=>({attemptId:id,start:1,end:4,originalText:'Hello ghost dude.',displayText:'Hello ghosted.',words,completedWithoutHints:false});
@@ -52,6 +53,43 @@ test('folder writes replace the same named sidecar and merge records already on 
     assert.match(s.status,/已保存同目錄/);const stored=JSON.parse(folder.content);
     assert.equal(stored.entries.length,2);assert.equal(stored.entries[0].attempts.length,2);
     assert.ok(folder.events.filter(Array.isArray).every(([name])=>name==='book.lrc.review.json'));
+});
+test('both reference choices survive reopening and an equivalent alignment with new signatures',async()=>{
+    const folder=disk(), storage=memory(), s=openReviewSession({document:base(),folder,storage});
+    await s.ready;
+    const subtitle={start:1,end:4,text:'今日で3ヶ月'};
+    const cue=getReferenceDecisionCueKey('reference-version-a',subtitle);
+    const suggestions=[
+        {side:'difference',signature:'first alignment',edit:{start:0,end:1,text:'26'}},
+        {side:'difference',signature:'second alignment',edit:{start:4,end:5,text:'か'}}
+    ];
+    const changes=suggestions.map((item,i)=>({change:getReferenceDecisionChangeKey(item),choice:i?'original':'text'}));
+    await s.recordReferenceDecisions(cue,changes);
+    assert.equal(JSON.parse(folder.content).entries.length,0,'choices save even without wrong answers');
+    const reopened=openReviewSession({document:base(),folder,storage:memory()});await reopened.ready;
+    const mobile=openReviewSession({document:base(),storage});await mobile.ready;
+    const projection={reviewDifferences:suggestions.map((item,i)=>({...item,signature:'new path '+i}))};
+    for(const session of [reopened,mobile]){
+        const {accepted,originals}=getReferenceDecisionChoices(session.document.referenceDecisions,cue,projection);
+        assert.deepEqual([...accepted],['new path 0']);
+        assert.deepEqual([...originals],['new path 1']);
+        for(const other of [getReferenceDecisionCueKey('reference-version-b',subtitle),
+            getReferenceDecisionCueKey('reference-version-a',{...subtitle,start:2})]){
+            assert.equal(getReferenceDecisionChoices(session.document.referenceDecisions,other,projection).accepted.size,0);
+        }
+    }
+    await reopened.recordReferenceDecisions(cue,[{...changes[0],choice:'reset'}]);
+    await reopened.import(s.document);
+    assert.equal(getReferenceDecisionChoices(reopened.document.referenceDecisions,cue,projection).accepted.size,0,'import does not resurrect the reverted choice');
+});
+test('reference choices merge by timestamp and old JSON remains importable',()=>{
+    const choice={cue:'cue',change:'edit',choice:'text',updatedAt:'2026-11-26T12:00:00.000Z'};
+    const older={...base(),referenceDecisions:[choice]};
+    const newer={...base(),referenceDecisions:[{...choice,choice:'original',updatedAt:'2026-11-26T13:00:00.000Z'}]};
+    assert.deepEqual(mergeReviewDocuments(older,newer),mergeReviewDocuments(newer,older));
+    assert.deepEqual(mergeReviewDocuments(base(),newer),newer);
+    assert.deepEqual(mergeReviewDocuments(newer,base()),newer);
+    assert.throws(()=>validateReviewDocument({...base(),referenceDecisions:[{...choice,choice:'invalid'}]},base()),/無效校正決定/);
 });
 test('read-only folders keep browser records without creating files or requesting permission in background',async()=>{
     const folder=disk({permission:'prompt'}),s=openReviewSession({document:base(),folder,storage:memory()});

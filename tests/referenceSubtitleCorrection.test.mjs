@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { build } from 'esbuild';
+import {getReferenceDecisionCueKey,getReferenceDecisionChangeKey,getReferenceDecisionChoices} from '../subtitleReview.js';
 const require = createRequire(import.meta.url), root = fileURLToPath(new URL('../', import.meta.url));
 for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
     const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
@@ -954,9 +955,19 @@ for (const file of ['yuban-original.jsx', '語伴20260713.1-codex.js']) {
         const originals=new Set([signature]);
         const reverted=api.applySubtitleReferencePreference(base,null,originals);
         assert.equal(reverted.text,raw);assert.equal(reverted.provisionalReviewCount,0);assert.equal(reverted.originalReviewCount,1);
+        assert.match(api.getSubtitleReferenceStatus({active:true,hasText:true,hasCue:true,enabled:true,projection:reverted}).text,/依原字幕/);
         assert.equal(api.applySubtitleReferencePreference(base,null,originals).text,raw,'the original choice survives another render/replay');
         const confirmed=api.applySubtitleReferencePreference(base,new Set([signature]),originals);
         assert.equal(confirmed.text,ref);assert.equal(confirmed.reviewDifferences.length,0);assert.equal(confirmed.trusted,true);
+        const key=getReferenceDecisionCueKey('reference',{...cue,start:1,end:2});
+        const change=getReferenceDecisionChangeKey(base.reviewDifferences[0]);
+        for(const [choice,text] of [['original',raw],['text',ref]]) {
+            const saved=JSON.parse(JSON.stringify([{cue:key,change,choice}]));
+            const restored=getReferenceDecisionChoices(saved,key,base);
+            const presentation=api.applySubtitleReferencePreference(base,restored.accepted,restored.originals);
+            assert.equal(presentation.text,text);
+            assert.equal(presentation.provisionalReviewCount || 0,0);
+        }
         assert.equal(cue.text,raw);assert.equal(base.text,raw,'provisional preference never mutates raw cues or cached alignment');
         const original='The delegates examined all the evidence and then carefully reviewed the final document before signing the regional treaty yesterday.';
         const missing=original.replace('carefully reviewed ','');

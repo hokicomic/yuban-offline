@@ -21,7 +21,38 @@ export function validateReviewDocument(value,expected) {
             !Array.isArray(e.attempts)||e.attempts.length>10000||!e.attempts.every(a=>a&&typeof a.id==='string'&&typeof a.at==='string'&&Number.isFinite(Date.parse(a.at))&&validWords(a.words)))
             throw new Error('錯題 JSON 內含無效紀錄，未覆寫');
     }
+    if(value.referenceDecisions!==undefined && (!Array.isArray(value.referenceDecisions) ||
+        !value.referenceDecisions.every(item=>item && typeof item.cue==='string' && typeof item.change==='string' &&
+            ['text','original','reset'].includes(item.choice) && typeof item.updatedAt==='string' && Number.isFinite(Date.parse(item.updatedAt)))))
+        throw new Error('錯題 JSON 內含無效校正決定，未覆寫');
     return value;
+}
+function mergeReferenceDecisions(a,b) {
+    const decisions=new Map();
+    for(const item of [...a,...b]) {
+        const key=JSON.stringify([item.cue,item.change]),previous=decisions.get(key);
+        if(!previous || Date.parse(item.updatedAt)>Date.parse(previous.updatedAt) ||
+            (Date.parse(item.updatedAt)===Date.parse(previous.updatedAt) && item.choice<previous.choice))
+            decisions.set(key,item);
+    }
+    return [...decisions.values()].sort((a,b)=>a.cue.localeCompare(b.cue)||a.change.localeCompare(b.change));
+}
+export function getReferenceDecisionCueKey(referenceKey,cue) {
+    return JSON.stringify([referenceKey,cue.start,cue.end,reviewHash(cue.text)]);
+}
+export function getReferenceDecisionChangeKey({side,edit}) {
+    // A resolver may rediscover the same edit via a different alignment path.
+    return JSON.stringify([side,edit.start,edit.end,edit.text]);
+}
+export function getReferenceDecisionChoices(items,cue,projection) {
+    const decisions=new Map((items || []).filter(item=>item.cue===cue).map(item=>[item.change,item.choice]));
+    const accepted=new Set(),originals=new Set();
+    for(const suggestion of [...(projection?.boundaryOmissions || []),...(projection?.reviewDifferences || [])]) {
+        const choice=decisions.get(getReferenceDecisionChangeKey(suggestion));
+        if(choice==='text')accepted.add(suggestion.signature);
+        if(choice==='original')originals.add(suggestion.signature);
+    }
+    return {accepted,originals};
 }
 export function mergeReviewDocuments(a,b) {
     validateReviewDocument(b,a);
@@ -43,7 +74,9 @@ export function mergeReviewDocuments(a,b) {
         const words=[...new Map([...earlier.words,...latest.words].map(x=>[x.key,x])).values()].sort((x,y)=>x.key.localeCompare(y.key));
         entries.set(incoming.id,{...latest,attempts,words});
     }
-    return {...a,entries:[...entries.values()].sort((x,y)=>x.start-y.start||x.id.localeCompare(y.id))};
+    const referenceDecisions=mergeReferenceDecisions(a.referenceDecisions || [],b.referenceDecisions || []);
+    return {...a,entries:[...entries.values()].sort((x,y)=>x.start-y.start||x.id.localeCompare(y.id)),
+        ...(referenceDecisions.length?{referenceDecisions}:{})};
 }
 const nextReviewTime=doc=>new Date(Math.max(Date.now(),...doc.entries.map(e=>Date.parse(e.updatedAt)+1))).toISOString();
 export function recordReviewAttempt(doc,attempt,now=nextReviewTime(doc)) {
@@ -129,7 +162,7 @@ export function openReviewSession({document:initial,folder=null,sidecar=null,sto
         const cached=cache();
         let writable=false;
         try{writable=folder && (typeof folder.queryPermission!=='function' || await folder.queryPermission({mode:'readwrite'})==='granted');}catch(_){}
-        report(writable?'資料夾已授權讀寫；新增錯題將自動保存':cached?'已暫存此瀏覽器；可匯出 JSON':'僅本次記憶體；請匯出備份');
+        report(writable?'資料夾已授權讀寫；錯題與校正決定自動保存':cached?'已暫存此瀏覽器；可匯出 JSON':'僅本次記憶體；請匯出備份');
     })();
     session.save=()=>{
         const cached=cache();
@@ -153,6 +186,15 @@ export function openReviewSession({document:initial,folder=null,sidecar=null,sto
         writeQueue=writeQueue.then(work,work);return writeQueue;
     };
     session.record=attempt=>{session.document=recordReviewAttempt(session.document,attempt);notify(session);return session.save();};
+    session.recordReferenceDecisions=(cue,changes)=>{
+        if(!changes.length)return Promise.resolve();
+        const previous=session.document.referenceDecisions || [];
+        const latest=previous.reduce((time,item)=>Math.max(time,Date.parse(item.updatedAt)+1),Date.now());
+        const updatedAt=new Date(latest).toISOString();
+        const referenceDecisions=mergeReferenceDecisions(previous,changes.map(({change,choice})=>({cue,change,choice,updatedAt})));
+        session.document={...session.document,referenceDecisions};
+        notify(session);return session.save();
+    };
     session.importMany=async values=>{
         await session.ready;
         // Validate the whole selection before changing memory or disk.
